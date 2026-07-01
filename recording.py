@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Record ZED left RGB frames, depth maps, intrinsics, and timestamps for offline box-pose tests."
     )
-    parser.add_argument("--output-root", default="KETI/recordings", help="Directory where recording sessions are stored.")
+    parser.add_argument("--output-root", default="recordings", help="Directory where recording sessions are stored.")
     parser.add_argument("--session-name", help="Session directory name. Defaults to zed_YYYYMMDDTHHMMSSZ.")
     parser.add_argument("--fps", type=int, default=10, help="Requested ZED camera FPS.")
     parser.add_argument(

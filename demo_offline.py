@@ -15,8 +15,8 @@ from box_pose.visualization import draw_pixel_estimate
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Estimate yellow box pixel yaw from an offline image.")
-    parser.add_argument("--image", default="KETI/pallet_box.png", help="Input image path.")
-    parser.add_argument("--save-debug", nargs="?", const="KETI/pallet_box_debug.png", help="Save debug overlay image.")
+    parser.add_argument("--image", default="pallet_box.png", help="Input image path.")
+    parser.add_argument("--save-debug", nargs="?", const="pallet_box_debug.png", help="Save debug overlay image.")
     parser.add_argument("--mask-output", help="Optional path for the binary mask.")
     return parser.parse_args()
 

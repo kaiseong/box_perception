@@ -114,7 +114,7 @@ class BoxPoseTests(unittest.TestCase):
             safe_output_dict({"debug": {"command": {"target_t5_T_ee": np.eye(4).tolist()}}})
 
     def test_offline_pallet_image_segments_and_estimates_pixel_obb(self) -> None:
-        image = cv2.imread(str(Path("KETI/pallet_box.png")), cv2.IMREAD_COLOR)
+        image = cv2.imread(str(Path(__file__).resolve().parents[1] / "pallet_box.png"), cv2.IMREAD_COLOR)
         self.assertIsNotNone(image)
         mask, stats = segment_yellow_box(image)
         estimate = estimate_pixel_box(mask, stats)
