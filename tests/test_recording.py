@@ -21,6 +21,7 @@ from recording import (
     prepare_session,
     save_frame,
     should_continue,
+    zed_image_to_bgr,
 )
 
 
@@ -125,6 +126,42 @@ class RecordingTests(unittest.TestCase):
             self.assertEqual(index_record["rgb_path"], "rgb/frame_000000.png")
             self.assertEqual(index_record["depth_path"], "depth/frame_000000.depth.npz")
             self.assertEqual(index_record["depth_stats"]["valid_count"], 15)
+
+    def test_save_frame_supports_rgb_npy_for_pyzed_numpy2_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = prepare_session(tmp, "session_rgb_npy")
+            bgr = np.arange(24, dtype=np.uint8).reshape(2, 4, 3)
+            depth = np.ones((2, 4), dtype=np.float32)
+
+            record = save_frame(
+                paths,
+                frame_id=7,
+                bgr=bgr,
+                depth_m=depth,
+                rgb_format="npy",
+                depth_format="npz",
+                jpeg_quality=95,
+                wall_time="2026-07-01T00:00:00.000Z",
+                monotonic_time_sec=99.0,
+            )
+
+            rgb_path = paths.session_dir / record["rgb_path"]
+            self.assertEqual(record["rgb_path"], "rgb/frame_000007.npy")
+            np.testing.assert_array_equal(np.load(rgb_path), bgr)
+
+    def test_zed_bgra_image_conversion_drops_alpha_without_opencv(self) -> None:
+        bgra = np.zeros((2, 3, 4), dtype=np.uint8)
+        bgra[:, :, 0] = 10
+        bgra[:, :, 1] = 20
+        bgra[:, :, 2] = 30
+        bgra[:, :, 3] = 255
+
+        bgr = zed_image_to_bgr(bgra)
+
+        self.assertEqual(bgr.shape, (2, 3, 3))
+        self.assertTrue(np.all(bgr[:, :, 0] == 10))
+        self.assertTrue(np.all(bgr[:, :, 1] == 20))
+        self.assertTrue(np.all(bgr[:, :, 2] == 30))
 
     def test_depth_statistics_handles_empty_depth(self) -> None:
         stats = depth_statistics(np.zeros((3, 4), dtype=np.float32))

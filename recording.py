@@ -11,7 +11,6 @@ from pathlib import Path
 import time
 from typing import Any
 
-import cv2
 import numpy as np
 
 
@@ -66,7 +65,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int, help="Stop after this many saved frames.")
     parser.add_argument("--duration-sec", type=float, help="Stop after this many seconds.")
     parser.add_argument("--warmup-frames", type=int, default=10, help="ZED frames to grab before saving.")
-    parser.add_argument("--rgb-format", choices=("jpg", "png"), default="jpg", help="RGB frame image format.")
+    parser.add_argument(
+        "--rgb-format",
+        choices=("npy", "jpg", "png"),
+        default="npy",
+        help="RGB frame storage format. npy avoids OpenCV in pyzed/NumPy2 recording environments.",
+    )
     parser.add_argument("--depth-format", choices=("npz", "npy"), default="npz", help="Depth map storage format.")
     parser.add_argument("--jpeg-quality", type=int, default=95, help="JPEG quality when --rgb-format jpg is used.")
     parser.add_argument("--preview", action="store_true", help="Show a live preview window. Press q to stop.")
@@ -151,7 +155,7 @@ def build_manifest(
             "index": "index.jsonl",
             "rgb_dir": "rgb",
             "depth_dir": "depth",
-            "rgb_frame_pattern": "rgb/frame_000000.<jpg|png>",
+            "rgb_frame_pattern": "rgb/frame_000000.<npy|jpg|png>",
             "depth_frame_pattern": "depth/frame_000000.depth.<npz|npy>",
             "depth_units": "meter",
             "rgb_color_order": "BGR as saved by OpenCV",
@@ -183,14 +187,20 @@ def save_frame(
     image = require_bgr(bgr)
     depth = require_depth(depth_m)
 
-    if rgb_format == "jpg":
+    if rgb_format == "npy":
+        np.save(rgb_path, image)
+    elif rgb_format == "jpg":
+        cv2 = import_cv2_for_image_io()
         ok = cv2.imwrite(str(rgb_path), image, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
+        if not ok:
+            raise OSError(f"Failed to write RGB frame: {rgb_path}")
     elif rgb_format == "png":
+        cv2 = import_cv2_for_image_io()
         ok = cv2.imwrite(str(rgb_path), image)
+        if not ok:
+            raise OSError(f"Failed to write RGB frame: {rgb_path}")
     else:
         raise ValueError(f"Unsupported rgb_format: {rgb_format}")
-    if not ok:
-        raise OSError(f"Failed to write RGB frame: {rgb_path}")
 
     if depth_format == "npz":
         np.savez_compressed(depth_path, depth_m=depth.astype(np.float32, copy=False))
@@ -254,10 +264,21 @@ def zed_image_to_bgr(image_data: np.ndarray) -> np.ndarray:
     if image.ndim != 3:
         raise ValueError(f"ZED image data must have shape HxWxC, got {image.shape}")
     if image.shape[2] == 4:
-        return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        return image[:, :, :3].copy()
     if image.shape[2] == 3:
         return image.copy()
     raise ValueError(f"Unsupported ZED image channel count: {image.shape[2]}")
+
+
+def import_cv2_for_image_io() -> Any:
+    try:
+        import cv2  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise SystemExit(
+            "OpenCV is required only for --rgb-format jpg/png or --preview. "
+            "Use the default --rgb-format npy in a pyzed/NumPy2 recording environment."
+        ) from exc
+    return cv2
 
 
 def import_zed_sdk() -> Any:
@@ -375,6 +396,7 @@ def record_zed(config: RecordingConfig) -> Path:
                 print(f"Saved {frame_count} frames -> {paths.session_dir}")
 
             if config.preview:
+                cv2 = import_cv2_for_image_io()
                 cv2.imshow("KETI ZED recording", bgr)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
@@ -386,6 +408,7 @@ def record_zed(config: RecordingConfig) -> Path:
             camera.close()
         finally:
             if config.preview:
+                cv2 = import_cv2_for_image_io()
                 cv2.destroyAllWindows()
 
         if paths.manifest_path.exists():
