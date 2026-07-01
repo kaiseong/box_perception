@@ -15,6 +15,7 @@ import numpy as np
 
 
 FORMAT_VERSION = "box-perception-recording-v1"
+SUPPORTED_ZED_FPS = (0, 15, 30, 60, 100)
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-root", default="recordings", help="Directory where recording sessions are stored.")
     parser.add_argument("--session-name", help="Session directory name. Defaults to zed_YYYYMMDDTHHMMSSZ.")
-    parser.add_argument("--fps", type=int, default=10, help="Requested ZED camera FPS.")
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=15,
+        help="Requested ZED camera FPS. Use 0 to let the SDK choose; common supported values are 15, 30, 60, 100.",
+    )
     parser.add_argument(
         "--resolution",
         choices=("HD2K", "HD1080", "HD720", "VGA"),
@@ -81,8 +87,8 @@ def parse_args() -> argparse.Namespace:
 def config_from_args(args: argparse.Namespace) -> RecordingConfig:
     if args.max_frames is None and args.duration_sec is None:
         raise ValueError("Set at least one stop condition: --max-frames or --duration-sec.")
-    if args.fps <= 0:
-        raise ValueError("--fps must be positive.")
+    if args.fps not in SUPPORTED_ZED_FPS:
+        raise ValueError(f"--fps must be one of {SUPPORTED_ZED_FPS}. Use --fps 0 to let the ZED SDK choose.")
     if args.max_frames is not None and args.max_frames <= 0:
         raise ValueError("--max-frames must be positive.")
     if args.duration_sec is not None and args.duration_sec <= 0.0:
@@ -302,7 +308,8 @@ def enum_value(enum_container: Any, name: str) -> Any:
 def open_zed_camera(sl: Any, config: RecordingConfig) -> Any:
     init_params = sl.InitParameters()
     init_params.camera_resolution = enum_value(sl.RESOLUTION, config.resolution)
-    init_params.camera_fps = int(config.fps)
+    if config.fps > 0:
+        init_params.camera_fps = int(config.fps)
     init_params.depth_mode = enum_value(sl.DEPTH_MODE, config.depth_mode)
     init_params.coordinate_units = sl.UNIT.METER
     if config.serial_number is not None:
@@ -311,7 +318,12 @@ def open_zed_camera(sl: Any, config: RecordingConfig) -> Any:
     camera = sl.Camera()
     status = camera.open(init_params)
     if status != sl.ERROR_CODE.SUCCESS:
-        raise SystemExit(f"Failed to open ZED camera: {status}")
+        raise SystemExit(
+            f"Failed to open ZED camera: {status}. "
+            f"Tried resolution={config.resolution}, fps={config.fps}, depth_mode={config.depth_mode}. "
+            "If this is CAMERA STREAM FAILED TO START, try --fps 15 or --fps 0, run ZED_Diagnostic, "
+            "and check USB3/camera ownership."
+        )
     return camera
 
 

@@ -39,7 +39,7 @@ class RecordingTests(unittest.TestCase):
             {
                 "output_root": "recordings",
                 "session_name": None,
-                "fps": 10,
+                "fps": 15,
                 "resolution": "HD720",
                 "depth_mode": "ULTRA",
                 "max_frames": None,
@@ -54,6 +54,30 @@ class RecordingTests(unittest.TestCase):
         )()
 
         with self.assertRaises(ValueError):
+            config_from_args(args)
+
+    def test_config_rejects_unsupported_camera_fps(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "output_root": "recordings",
+                "session_name": None,
+                "fps": 10,
+                "resolution": "HD720",
+                "depth_mode": "ULTRA",
+                "max_frames": 1,
+                "duration_sec": None,
+                "warmup_frames": 10,
+                "rgb_format": "npy",
+                "depth_format": "npz",
+                "jpeg_quality": 95,
+                "preview": False,
+                "serial_number": None,
+            },
+        )()
+
+        with self.assertRaisesRegex(ValueError, "--fps must be one of"):
             config_from_args(args)
 
     def test_prepare_session_creates_expected_layout(self) -> None:
@@ -183,7 +207,7 @@ def sample_config(max_frames: int | None = 10, duration_sec: float | None = None
     return RecordingConfig(
         output_root="recordings",
         session_name="unit",
-        fps=10,
+        fps=15,
         resolution="HD720",
         depth_mode="ULTRA",
         max_frames=max_frames,
