@@ -59,6 +59,7 @@ box_perception/
   README.md
   demo_offline.py
   recording.py
+  replay_recording.py
   pallet_box.png
   pallet_box_mask.png
   pallet_box_debug.png
@@ -78,6 +79,7 @@ box_perception/
 - `box_pose/visualization.py`: OBB/center/axis debug overlay
 - `demo_offline.py`: `pallet_box.png` 같은 정적 이미지용 Phase 0 CLI
 - `recording.py`: ZED RGB/depth/intrinsics/timestamp recording CLI
+- `replay_recording.py`: 녹화 session을 다시 읽어 frame별 mask/center/yaw/metric estimate/debug image 생성
 - `tests/test_box_pose.py`: synthetic/unit/offline/metric/safety tests
 
 ## Jetson Orin AGX Installation
@@ -208,7 +210,7 @@ confidence.ok = true
 
 ```bash
 cd ~/box_perception
-python -m py_compile demo_offline.py recording.py box_pose/*.py tests/*.py
+python -m py_compile demo_offline.py recording.py replay_recording.py box_pose/*.py tests/*.py
 python -m unittest discover -s tests -v
 ```
 
@@ -1018,9 +1020,108 @@ python recording.py \
   --depth-format npy
 ```
 
-### 나중에 분석에 쓰는 방식
+### 녹화 결과 빠른 확인
 
-녹화 데이터는 나중에 다음 흐름으로 재사용합니다.
+녹화가 끝나면 먼저 session 구조와 depth 유효값을 확인합니다.
+
+```bash
+cd ~/box_perception
+
+find recordings/desk_a_box_static_001 -maxdepth 2 -type f | head -20
+python - <<'PY'
+import json
+from pathlib import Path
+import numpy as np
+
+session = Path("recordings/desk_a_box_static_001")
+manifest = json.loads((session / "manifest.json").read_text())
+lines = (session / "index.jsonl").read_text().splitlines()
+
+print("frames", len(lines))
+print("config", manifest["config"])
+print("camera", manifest.get("camera", {}))
+print("intrinsics", manifest.get("intrinsics", {}))
+
+first = json.loads(lines[0])
+rgb = np.load(session / first["rgb_path"])
+depth = np.load(session / first["depth_path"])["depth_m"]
+finite = np.isfinite(depth)
+
+print("first", first)
+print("rgb", rgb.shape, rgb.dtype, rgb.min(), rgb.max())
+print("depth", depth.shape, depth.dtype, "finite", int(finite.sum()))
+print("depth finite range", float(depth[finite].min()), float(depth[finite].max()))
+PY
+```
+
+해석:
+
+- `rgb (720, 1280, 3) uint8`이면 RGB 저장은 정상입니다.
+- `depth (720, 1280) float32`이고 `finite`가 충분히 크면 depth 저장은 정상입니다.
+- ZED depth에는 invalid value로 `inf` 또는 `-inf`가 들어올 수 있습니다. 분석 때는 `np.isfinite(depth)`로 걸러야 합니다.
+- 20초 녹화에서 frame 수가 요청 FPS보다 적으면 `.npz` 압축 저장 속도, USB bandwidth, depth computation 부하 중 하나가 병목일 수 있습니다. 더 높은 저장 FPS가 필요하면 `--depth-format npy`를 먼저 시도합니다.
+
+### 녹화 session replay 분석
+
+`replay_recording.py`는 녹화 session을 다시 읽어서 frame별 pixel/metric estimate를 생성합니다.
+
+출력 구조:
+
+```text
+recordings/<session_name>/analysis/
+  summary.json
+  frames.jsonl
+  debug/
+    frame_000000_debug.png
+    frame_000010_debug.png
+    ...
+  mask/                  # --save-mask를 켠 경우
+    frame_000000_mask.png
+    ...
+```
+
+실행:
+
+```bash
+cd ~/box_perception
+source ~/.venvs/keti-box-pose/bin/activate
+
+python replay_recording.py recordings/desk_a_box_static_001 \
+  --debug-every 10 \
+  --save-mask
+```
+
+중요: `replay_recording.py`는 OpenCV 기반 segmentation을 사용하므로 `cv2 + numpy==1.26.4` offline 분석 환경에서 실행합니다. `pyzed + numpy==2.x` recording venv에서 실행하면 Jetson OpenCV ABI 문제로 실패할 수 있습니다.
+
+빠르게 일부 frame만 보려면:
+
+```bash
+python replay_recording.py recordings/desk_a_box_static_001 \
+  --max-frames 20 \
+  --stride 2 \
+  --debug-every 5
+```
+
+metric depth 쪽을 잠시 끄고 색상 mask/yaw만 보고 싶으면:
+
+```bash
+python replay_recording.py recordings/desk_a_box_static_001 \
+  --no-metric \
+  --debug-every 10
+```
+
+`summary.json`의 주요 필드:
+
+- `frames_analyzed`: 분석한 frame 수
+- `pixel_ok_frames`, `pixel_ok_fraction`: 색상 mask + OBB가 성공한 frame 수/비율
+- `metric_ok_frames`, `metric_ok_fraction`: depth/intrinsics metric estimate가 성공한 frame 수/비율
+- `pixel_yaw_mod_180`: image-frame yaw 통계
+- `metric_center_camera_m_mean`: metric 성공 frame들의 평균 camera-frame 중심
+- `metric_still_frame_spread`: still frame에서 center/yaw가 안정적인지 보는 gate
+
+### Python에서 녹화 데이터를 직접 쓰는 방식
+
+녹화 데이터는 아래 흐름으로 직접 재사용할 수도 있습니다.
 
 ```python
 import json
@@ -1049,8 +1150,6 @@ mask, stats = segment_yellow_box(image)
 pixel_estimate = estimate_pixel_box(mask, stats)
 metric_estimate = estimate_metric_box(mask, depth, intr)
 ```
-
-아직 이 replay/visualization CLI는 만들지 않았습니다. 지금 `recording.py`는 좋은 RGB-D dataset을 남기는 첫 단계입니다.
 
 ## Python에서 직접 사용
 
@@ -1102,7 +1201,7 @@ else:
 현재 검증한 명령:
 
 ```bash
-python -m py_compile demo_offline.py recording.py box_pose/*.py tests/*.py
+python -m py_compile demo_offline.py recording.py replay_recording.py box_pose/*.py tests/*.py
 python -m unittest discover -s tests -v
 python demo_offline.py --image pallet_box.png --save-debug pallet_box_debug.png --mask-output pallet_box_mask.png
 ```
@@ -1110,7 +1209,7 @@ python demo_offline.py --image pallet_box.png --save-debug pallet_box_debug.png 
 결과:
 
 - `py_compile`: PASS
-- `unittest`: PASS, 31/31
+- `unittest`: PASS, 36/36
 - offline smoke: PASS, `confidence.ok=true`, `yaw_mod_180=0.36034980284148743`
 
 현재 활성 Python environment에는 `pytest`가 설치되어 있지 않아 아래 명령은 실행되지 않았습니다.
@@ -1129,7 +1228,7 @@ No module named pytest
 
 ## 테스트가 커버하는 것
 
-`tests/test_box_pose.py`는 다음 항목을 검증합니다.
+테스트 파일들은 다음 항목을 검증합니다.
 
 - HSV segmentation이 dominant yellow box를 유지하고 작은 yellow noise를 제거
 - synthetic rotated rectangle yaw가 +/-2도 이내
@@ -1150,6 +1249,8 @@ No module named pytest
 - `t5_T_box == t5_T_camera @ camera_T_box`
 - depth support 부족 실패
 - still-frame center/yaw spread gate
+- recording manifest/index/RGB/depth 저장 layout
+- replay session loader, frame stride/limit, yaw modulo-180 summary
 
 ## 왜 이 접근을 선택했나
 

@@ -97,6 +97,8 @@ class MetricBoxEstimate:
                 "grasp_axis_t5": None if self.grasp_axis_t5 is None else list(self.grasp_axis_t5),
                 "yaw_mod_180": self.yaw_mod_180,
                 "yaw_frame": self.yaw_frame,
+                "long_length_m": self.long_length_m,
+                "short_length_m": self.short_length_m,
                 "confidence": self.confidence.to_dict(),
                 "failure_reasons": list(self.failure_reasons),
             }
