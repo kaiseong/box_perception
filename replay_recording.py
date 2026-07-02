@@ -19,10 +19,12 @@ VIEW_ROTATIONS = ("none", "cw90", "ccw90", "180")
 class AnalysisDependencies:
     cv2: Any
     camera_intrinsics_cls: Any
+    estimate_known_size_box: Any
     estimate_metric_box: Any
     estimate_pixel_box: Any
     evaluate_still_frame_spread: Any
     segment_yellow_box: Any
+    draw_known_size_estimate: Any
     draw_pixel_estimate: Any
 
 
@@ -47,6 +49,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save-mask", action="store_true", help="Save binary masks next to debug overlays.")
     parser.add_argument("--no-metric", action="store_true", help="Skip depth/intrinsics metric estimation.")
+    parser.add_argument("--no-known-size", action="store_true", help="Skip fixed-size cropped-box fitting.")
+    parser.add_argument("--box-long-m", type=float, default=0.505, help="Known box long-side length in meters.")
+    parser.add_argument("--box-short-m", type=float, default=0.335, help="Known box short-side length in meters.")
+    parser.add_argument("--box-height-m", type=float, default=0.195, help="Known box height in meters.")
     parser.add_argument(
         "--view-rotation",
         choices=("auto",) + VIEW_ROTATIONS,
@@ -66,12 +72,13 @@ def load_analysis_dependencies() -> AnalysisDependencies:
 
         from box_pose import (
             CameraIntrinsics,
+            estimate_known_size_box,
             estimate_metric_box,
             estimate_pixel_box,
             evaluate_still_frame_spread,
             segment_yellow_box,
         )
-        from box_pose.visualization import draw_pixel_estimate
+        from box_pose.visualization import draw_known_size_estimate, draw_pixel_estimate
     except Exception as exc:
         raise SystemExit(
             "Failed to import OpenCV-based analysis dependencies. "
@@ -82,10 +89,12 @@ def load_analysis_dependencies() -> AnalysisDependencies:
     return AnalysisDependencies(
         cv2=cv2,
         camera_intrinsics_cls=CameraIntrinsics,
+        estimate_known_size_box=estimate_known_size_box,
         estimate_metric_box=estimate_metric_box,
         estimate_pixel_box=estimate_pixel_box,
         evaluate_still_frame_spread=evaluate_still_frame_spread,
         segment_yellow_box=segment_yellow_box,
+        draw_known_size_estimate=draw_known_size_estimate,
         draw_pixel_estimate=draw_pixel_estimate,
     )
 
@@ -210,10 +219,15 @@ def analyze_frame(
     save_debug: bool,
     save_mask: bool,
     run_metric: bool,
+    run_known_size: bool,
     view_rotation: str,
+    box_long_m: float,
+    box_short_m: float,
+    box_height_m: float,
 ) -> dict[str, Any]:
     image = rotate_array_for_view(load_rgb_frame(session_dir, record, deps.cv2), view_rotation)
     mask, mask_stats = deps.segment_yellow_box(image)
+    evidence_mask, evidence_stats = deps.segment_yellow_box(image, keep_largest_component=False)
     pixel_estimate = deps.estimate_pixel_box(mask, mask_stats)
 
     result: dict[str, Any] = {
@@ -226,8 +240,25 @@ def analyze_frame(
         "pixel": pixel_estimate.to_dict(),
     }
 
-    if run_metric and intrinsics is not None:
+    depth = None
+    if intrinsics is not None and (run_metric or run_known_size):
         depth = rotate_array_for_view(load_depth_frame(session_dir, record), view_rotation)
+
+    known_size_estimate = None
+    if run_known_size and intrinsics is not None and depth is not None:
+        known_size_estimate = deps.estimate_known_size_box(
+            evidence_mask,
+            depth,
+            intrinsics,
+            box_long_m=box_long_m,
+            box_short_m=box_short_m,
+            box_height_m=box_height_m,
+        )
+        known_size = known_size_estimate.to_dict()
+        known_size["mask_stats"] = evidence_stats.to_dict()
+        result["known_size"] = known_size
+
+    if run_metric and intrinsics is not None and depth is not None:
         metric_estimate = deps.estimate_metric_box(mask, depth, intrinsics)
         metric = metric_estimate.to_dict()
         metric["long_length_m"] = metric_estimate.long_length_m
@@ -241,12 +272,15 @@ def analyze_frame(
         debug_dir = output_dir / "debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
         overlay = deps.draw_pixel_estimate(image, pixel_estimate)
+        if known_size_estimate is not None:
+            overlay = deps.draw_known_size_estimate(overlay, known_size_estimate)
         deps.cv2.imwrite(str(debug_dir / f"frame_{int(record['frame_id']):06d}_debug.png"), overlay)
 
     if save_mask:
         mask_dir = output_dir / "mask"
         mask_dir.mkdir(parents=True, exist_ok=True)
         deps.cv2.imwrite(str(mask_dir / f"frame_{int(record['frame_id']):06d}_mask.png"), mask)
+        deps.cv2.imwrite(str(mask_dir / f"frame_{int(record['frame_id']):06d}_evidence_mask.png"), evidence_mask)
 
     return result
 
@@ -258,6 +292,12 @@ def summarize_results(results: list[dict[str, Any]], evaluate_still_frame_spread
         for item in results
         if item.get("metric", {}).get("confidence", {}).get("ok") and item["metric"].get("center_camera_m") is not None
     ]
+    known_size_ok = [
+        item
+        for item in results
+        if item.get("known_size", {}).get("confidence", {}).get("ok")
+        and item["known_size"].get("center_top_camera_m") is not None
+    ]
 
     summary: dict[str, Any] = {
         "frames_analyzed": len(results),
@@ -266,7 +306,12 @@ def summarize_results(results: list[dict[str, Any]], evaluate_still_frame_spread
         "pixel_ok_fraction": 0.0 if not results else len(pixel_ok) / len(results),
         "metric_ok_frames": len(metric_ok),
         "metric_ok_fraction": 0.0 if not results else len(metric_ok) / len(results),
+        "known_size_ok_frames": len(known_size_ok),
+        "known_size_ok_fraction": 0.0 if not results else len(known_size_ok) / len(results),
         "pixel_yaw_mod_180": yaw_summary([item["pixel"]["yaw_mod_180"] for item in pixel_ok]),
+        "known_size_yaw_mod_180": yaw_summary(
+            [item["known_size"]["yaw_mod_180"] for item in known_size_ok]
+        ),
     }
 
     if metric_ok:
@@ -277,6 +322,13 @@ def summarize_results(results: list[dict[str, Any]], evaluate_still_frame_spread
         if evaluate_still_frame_spread is not None and centers.shape[0] >= 2:
             spread_conf = evaluate_still_frame_spread(centers, yaws)
             summary["metric_still_frame_spread"] = spread_conf.to_dict()
+    if known_size_ok:
+        centers = np.asarray([item["known_size"]["center_top_camera_m"] for item in known_size_ok], dtype=np.float64)
+        yaws = np.asarray([item["known_size"]["yaw_mod_180"] for item in known_size_ok], dtype=np.float64)
+        summary["known_size_center_top_camera_m_mean"] = centers.mean(axis=0).tolist()
+        if evaluate_still_frame_spread is not None and centers.shape[0] >= 2:
+            spread_conf = evaluate_still_frame_spread(centers, yaws)
+            summary["known_size_still_frame_spread"] = spread_conf.to_dict()
     return summary
 
 
@@ -357,7 +409,11 @@ def main() -> int:
                 save_debug=save_debug,
                 save_mask=save_debug and args.save_mask,
                 run_metric=not args.no_metric,
+                run_known_size=not args.no_known_size,
                 view_rotation=view_rotation,
+                box_long_m=args.box_long_m,
+                box_short_m=args.box_short_m,
+                box_height_m=args.box_height_m,
             )
             results.append(result)
             frame_file.write(json.dumps(result, sort_keys=True) + "\n")
@@ -366,7 +422,7 @@ def main() -> int:
     write_json(output_dir / "summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
     print(f"Wrote {frame_records_path}")
-    return 0 if summary["pixel_ok_frames"] > 0 else 2
+    return 0 if summary["known_size_ok_frames"] > 0 or summary["pixel_ok_frames"] > 0 else 2
 
 
 if __name__ == "__main__":

@@ -94,7 +94,9 @@ class ReplayRecordingTests(unittest.TestCase):
         self.assertEqual(summary["frames_analyzed"], 3)
         self.assertEqual(summary["pixel_ok_frames"], 2)
         self.assertEqual(summary["metric_ok_frames"], 2)
+        self.assertEqual(summary["known_size_ok_frames"], 2)
         self.assertAlmostEqual(summary["pixel_ok_fraction"], 2 / 3)
+        self.assertAlmostEqual(summary["known_size_ok_fraction"], 2 / 3)
 
     def test_rotate_array_for_cw_view(self) -> None:
         raw = np.array([[1, 2, 3], [4, 5, 6]])
@@ -168,6 +170,11 @@ def sample_result(*, frame_id: int, pixel_ok: bool, metric_ok: bool, yaw: float)
             "confidence": {"ok": metric_ok, "score": 1.0 if metric_ok else 0.0, "reasons": []},
             "yaw_mod_180": yaw,
             "center_camera_m": [float(frame_id), 0.0, 1.0] if metric_ok else None,
+        },
+        "known_size": {
+            "confidence": {"ok": metric_ok, "score": 1.0 if metric_ok else 0.0, "reasons": []},
+            "yaw_mod_180": yaw,
+            "center_top_camera_m": [float(frame_id), 0.0, 1.0] if metric_ok else None,
         },
     }
 

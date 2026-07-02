@@ -10,10 +10,13 @@ env/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.omx/
 
 recordings/
 *.svo
 *.svo2
+*.whl
+*.run
 
 *.log
 .DS_Store

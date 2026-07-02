@@ -14,6 +14,7 @@ from box_pose import (
     CameraIntrinsics,
     MaskStats,
     evaluate_still_frame_spread,
+    estimate_known_size_box,
     estimate_metric_box,
     estimate_pixel_box,
     safe_output_dict,
@@ -35,6 +36,20 @@ class BoxPoseTests(unittest.TestCase):
         self.assertEqual(stats.significant_components, 1)
         self.assertEqual(int(mask[80, 110]), 255)
         self.assertEqual(int(mask[20, 15]), 0)
+
+    def test_hsv_segmentation_can_keep_all_cleaned_components(self) -> None:
+        image = np.zeros((160, 220, 3), dtype=np.uint8)
+        cv2.rectangle(image, (30, 45), (80, 115), (0, 190, 255), -1)
+        cv2.rectangle(image, (140, 45), (190, 115), (0, 190, 255), -1)
+
+        dominant, dominant_stats = segment_yellow_box(image)
+        evidence, evidence_stats = segment_yellow_box(image, keep_largest_component=False)
+
+        self.assertLess(np.count_nonzero(dominant), np.count_nonzero(evidence))
+        self.assertEqual(dominant_stats.significant_components, 2)
+        self.assertEqual(evidence_stats.significant_components, 2)
+        self.assertEqual(int(evidence[80, 55]), 255)
+        self.assertEqual(int(evidence[80, 165]), 255)
 
     def test_synthetic_rotated_rectangles_normalize_yaw_mod_180(self) -> None:
         for angle in (-75, -30, 0, 25, 70):
@@ -241,6 +256,54 @@ class BoxPoseTests(unittest.TestCase):
         self.assertFalse(estimate.confidence.ok)
         self.assertIn("insufficient_boundary_depth", estimate.failure_reasons)
 
+    def test_known_size_box_recovers_center_and_yaw_from_cropped_rim(self) -> None:
+        mask = cropped_rim_mask(
+            shape=(320, 300),
+            center=(150.0, 160.0),
+            long_len=360.0,
+            short_len=115.0,
+            yaw_deg=0.0,
+        )
+        depth = np.where(mask > 0, 1.0, 0.0).astype(np.float64)
+        intr = CameraIntrinsics(fx=712.0, fy=712.0, cx=150.0, cy=160.0)
+
+        estimate = estimate_known_size_box(
+            mask,
+            depth,
+            intr,
+            box_long_m=360.0 / 712.0,
+            box_short_m=115.0 / 712.0,
+            min_depth_pixels=50,
+        )
+
+        self.assertTrue(estimate.confidence.ok, estimate.failure_reasons)
+        self.assertIsNotNone(estimate.center_image)
+        self.assertLess(np.linalg.norm(np.asarray(estimate.center_image) - np.array([150.0, 160.0])), 6.0)
+        self.assertLessEqual(angle_error_mod_180(float(estimate.yaw_mod_180), 0.0), 2.0)
+
+    def test_known_size_box_recovers_yaw_from_partial_rotated_rim(self) -> None:
+        mask = cropped_rim_mask(
+            shape=(340, 320),
+            center=(160.0, 172.0),
+            long_len=330.0,
+            short_len=120.0,
+            yaw_deg=22.0,
+        )
+        depth = np.where(mask > 0, 1.0, 0.0).astype(np.float64)
+        intr = CameraIntrinsics(fx=650.0, fy=650.0, cx=160.0, cy=172.0)
+
+        estimate = estimate_known_size_box(
+            mask,
+            depth,
+            intr,
+            box_long_m=330.0 / 650.0,
+            box_short_m=120.0 / 650.0,
+            min_depth_pixels=50,
+        )
+
+        self.assertTrue(estimate.confidence.ok, estimate.failure_reasons)
+        self.assertLessEqual(angle_error_mod_180(float(estimate.yaw_mod_180), 22.0), 4.0)
+
     def test_confidence_threshold_edges(self) -> None:
         base = rotated_rectangle_mask((100, 100), (60, 20), 0)
         base_stats = stats_for_mask(base)
@@ -283,6 +346,33 @@ def rotated_rectangle_mask(shape: tuple[int, int], size: tuple[float, float], an
     corners = cv2.boxPoints(rect).astype(np.int32)
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.fillConvexPoly(mask, corners, 255)
+    return mask
+
+
+def cropped_rim_mask(
+    *,
+    shape: tuple[int, int],
+    center: tuple[float, float],
+    long_len: float,
+    short_len: float,
+    yaw_deg: float,
+) -> np.ndarray:
+    h, w = shape
+    angle = math.radians(yaw_deg)
+    u = np.array([math.cos(angle), math.sin(angle)], dtype=np.float64)
+    v = np.array([-math.sin(angle), math.cos(angle)], dtype=np.float64)
+    c = np.array(center, dtype=np.float64)
+    corners = np.array(
+        [
+            c - long_len * 0.5 * u - short_len * 0.5 * v,
+            c + long_len * 0.5 * u - short_len * 0.5 * v,
+            c + long_len * 0.5 * u + short_len * 0.5 * v,
+            c - long_len * 0.5 * u + short_len * 0.5 * v,
+        ],
+        dtype=np.int32,
+    )
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.polylines(mask, [corners], isClosed=True, color=255, thickness=14)
     return mask
 
 

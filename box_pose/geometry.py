@@ -105,6 +105,55 @@ class MetricBoxEstimate:
         )
 
 
+@dataclass(frozen=True)
+class KnownSizeBoxEstimate:
+    center_image: tuple[float, float] | None
+    center_top_camera_m: tuple[float, float, float] | None
+    yaw_mod_180: float | None
+    long_axis_image: tuple[float, float] | None
+    grasp_axis_image: tuple[float, float] | None
+    model_corners: tuple[tuple[float, float], ...] | None
+    model_long_length_px: float | None
+    model_short_length_px: float | None
+    depth_reference_m: float | None
+    box_long_m: float
+    box_short_m: float
+    box_height_m: float
+    projection_plane: str
+    support: dict[str, Any]
+    confidence: Confidence
+    failure_reasons: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return safe_output_dict(
+            {
+                "center_image": None if self.center_image is None else list(self.center_image),
+                "center_top_camera_m": None
+                if self.center_top_camera_m is None
+                else list(self.center_top_camera_m),
+                "yaw_mod_180": self.yaw_mod_180,
+                "yaw_frame": "image",
+                "long_axis_image": None if self.long_axis_image is None else list(self.long_axis_image),
+                "grasp_axis_image": None if self.grasp_axis_image is None else list(self.grasp_axis_image),
+                "model_corners": None
+                if self.model_corners is None
+                else [list(corner) for corner in self.model_corners],
+                "model_long_length_px": self.model_long_length_px,
+                "model_short_length_px": self.model_short_length_px,
+                "depth_reference_m": self.depth_reference_m,
+                "box_size_m": {
+                    "long": self.box_long_m,
+                    "short": self.box_short_m,
+                    "height": self.box_height_m,
+                },
+                "projection_plane": self.projection_plane,
+                "support": self.support,
+                "confidence": self.confidence.to_dict(),
+                "failure_reasons": list(self.failure_reasons),
+            }
+        )
+
+
 def estimate_pixel_box(
     mask: np.ndarray,
     mask_stats: MaskStats,
@@ -162,6 +211,184 @@ def estimate_pixel_box(
         yaw_mod_180=float(yaw),
         long_axis_image=tuple(float(v) for v in long_axis),
         grasp_axis_image=tuple(float(v) for v in short_axis),
+        failure_reasons=confidence.reasons,
+    )
+
+
+def estimate_known_size_box(
+    mask: np.ndarray,
+    depth_m: np.ndarray,
+    intrinsics: CameraIntrinsics | dict[str, Any],
+    *,
+    box_long_m: float = 0.505,
+    box_short_m: float = 0.335,
+    box_height_m: float = 0.195,
+    projection_plane: str = "box_top_plane",
+    min_evidence_pixels: int = 500,
+    min_depth_pixels: int = 200,
+    depth_band_below_m: float = 0.25,
+    depth_band_above_m: float = 0.18,
+    yaw_cluster_deg: float = 18.0,
+    short_pair_min_ratio: float = 0.45,
+    short_pair_max_ratio: float = 1.45,
+) -> KnownSizeBoxEstimate:
+    """Fit a fixed-size box footprint to partial yellow/rim evidence.
+
+    The D405 crop case often invalidates a plain minAreaRect: the visible
+    yellow mask can be only one wall, one rim, or a clipped footprint. This
+    estimator uses Hough line orientation for yaw, then combines observed long
+    rim lines with the known box size and depth-derived pixel scale to infer a
+    best-effort center in the analysis image frame.
+    """
+
+    mask_u8 = _require_mask(mask)
+    depth = np.asarray(depth_m, dtype=np.float64)
+    if depth.ndim != 2 or depth.shape != mask_u8.shape:
+        raise ValueError(f"depth_m must be 2D and match mask shape, got {depth.shape} vs {mask_u8.shape}")
+    intr = intrinsics if isinstance(intrinsics, CameraIntrinsics) else CameraIntrinsics.from_mapping(intrinsics)
+
+    rows, cols = np.nonzero(mask_u8 > 0)
+    if cols.size < min_evidence_pixels:
+        return _known_size_failure(
+            "insufficient_yellow_evidence",
+            box_long_m=box_long_m,
+            box_short_m=box_short_m,
+            box_height_m=box_height_m,
+            projection_plane=projection_plane,
+            support={"evidence_pixels": int(cols.size)},
+        )
+
+    reasons: list[str] = []
+    support_notes: dict[str, Any] = {"raw_evidence_pixels": int(cols.size)}
+    raw_depth_values = depth[rows, cols]
+    raw_valid_depth = raw_depth_values[np.isfinite(raw_depth_values) & (raw_depth_values > 0.0)]
+    if raw_valid_depth.size >= min_depth_pixels:
+        preliminary_depth = float(np.median(raw_valid_depth))
+        lower_depth = max(0.0, preliminary_depth - float(depth_band_below_m))
+        upper_depth = preliminary_depth + float(depth_band_above_m)
+        depth_band = np.isfinite(depth) & (depth > 0.0) & (depth >= lower_depth) & (depth <= upper_depth)
+        filtered_mask = np.where((mask_u8 > 0) & depth_band, 255, 0).astype(np.uint8)
+        filtered_count = int(np.count_nonzero(filtered_mask))
+        support_notes["depth_filter"] = {
+            "preliminary_median_m": preliminary_depth,
+            "lower_m": lower_depth,
+            "upper_m": upper_depth,
+            "filtered_evidence_pixels": filtered_count,
+        }
+        if filtered_count >= min_evidence_pixels:
+            mask_u8 = filtered_mask
+            rows, cols = np.nonzero(mask_u8 > 0)
+        else:
+            reasons.append("depth_filter_too_sparse")
+
+    points = np.column_stack((cols, rows)).astype(np.float64)
+    depth_values = depth[rows, cols]
+    valid_depth = depth_values[np.isfinite(depth_values) & (depth_values > 0.0)]
+    depth_reference = None
+    expected_long_px = None
+    expected_short_px = None
+    if valid_depth.size < min_depth_pixels:
+        reasons.append("insufficient_depth_support")
+    else:
+        q10, q90 = np.quantile(valid_depth, [0.10, 0.90])
+        trimmed = valid_depth[(valid_depth >= q10) & (valid_depth <= q90)]
+        depth_reference = float(np.median(trimmed if trimmed.size else valid_depth))
+        focal = float((intr.fx + intr.fy) * 0.5)
+        expected_long_px = focal * float(box_long_m) / depth_reference
+        expected_short_px = focal * float(box_short_m) / depth_reference
+
+    edge = yellow_edge_mask(mask_u8)
+    lines = hough_line_segments(edge)
+    if not lines:
+        pixel_fallback = estimate_pixel_box(mask_u8, MaskStats(mask_u8.size, int(cols.size), int(cols.size), 1.0, 1))
+        if not np.isfinite(pixel_fallback.yaw_mod_180):
+            return _known_size_failure(
+                "insufficient_line_support",
+                box_long_m=box_long_m,
+                box_short_m=box_short_m,
+                box_height_m=box_height_m,
+                projection_plane=projection_plane,
+                support={"evidence_pixels": int(cols.size), "line_count": 0},
+            )
+        yaw = float(pixel_fallback.yaw_mod_180)
+        yaw_lines: list[dict[str, Any]] = []
+        reasons.append("pixel_yaw_fallback")
+    else:
+        yaw, yaw_lines, line_support_fraction = dominant_line_yaw(lines, cluster_deg=yaw_cluster_deg)
+        if line_support_fraction < 0.35:
+            reasons.append("weak_yaw_line_consensus")
+
+    u_axis = np.array([math.cos(math.radians(yaw)), math.sin(math.radians(yaw))], dtype=np.float64)
+    if u_axis[0] < 0.0:
+        u_axis = -u_axis
+    v_axis = np.array([-u_axis[1], u_axis[0]], dtype=np.float64)
+
+    image_h, image_w = mask_u8.shape
+    long_len_px = choose_model_long_length(points, u_axis, expected_long_px)
+    short_pair = choose_short_axis_pair(
+        yaw_lines,
+        v_axis,
+        expected_short_px,
+        min_ratio=short_pair_min_ratio,
+        max_ratio=short_pair_max_ratio,
+    )
+    if short_pair is None:
+        reasons.append("missing_parallel_short_extent")
+        short_len_px = choose_fallback_short_length(points, v_axis, expected_short_px)
+        center_v = choose_fallback_short_center(points, v_axis, short_len_px)
+    else:
+        center_v, short_len_px, pair_support = short_pair
+
+    center_u = choose_long_center(points, u_axis, long_len_px)
+    center = center_u * u_axis + center_v * v_axis
+    corners = rectangle_corners(center, u_axis, v_axis, long_len_px, short_len_px)
+
+    perimeter_support = score_rectangle_perimeter(edge, mask_u8, corners)
+    if perimeter_support["visible_samples"] < 20:
+        reasons.append("too_little_visible_model_perimeter")
+    if perimeter_support["edge_support_fraction"] < 0.08:
+        reasons.append("low_perimeter_edge_support")
+
+    if not (0.0 <= center[0] < image_w and 0.0 <= center[1] < image_h):
+        reasons.append("center_outside_image")
+
+    center_camera = None
+    if depth_reference is not None and np.all(np.isfinite(center)):
+        center_camera = backproject_center(center, depth_reference, intr)
+
+    line_support_fraction = 0.0 if not lines else float(sum(line["weight"] for line in yaw_lines) / sum(line["weight"] for line in lines))
+    support: dict[str, Any] = {
+        "evidence_pixels": int(cols.size),
+        "depth_pixels": int(valid_depth.size),
+        "line_count": len(lines),
+        "yaw_line_count": len(yaw_lines),
+        "yaw_line_support_fraction": line_support_fraction,
+        "perimeter": perimeter_support,
+        "expected_long_length_px": expected_long_px,
+        "expected_short_length_px": expected_short_px,
+    }
+    support.update(support_notes)
+    if short_pair is not None:
+        support["short_axis_pair_support"] = pair_support
+
+    score = known_size_confidence_score(reasons, line_support_fraction, perimeter_support)
+    confidence = Confidence(not reasons, score, tuple(reasons))
+    return KnownSizeBoxEstimate(
+        center_image=tuple(float(v) for v in center),
+        center_top_camera_m=None if center_camera is None else tuple(float(v) for v in center_camera),
+        yaw_mod_180=float(yaw % 180.0),
+        long_axis_image=tuple(float(v) for v in u_axis),
+        grasp_axis_image=tuple(float(v) for v in v_axis),
+        model_corners=tuple(tuple(float(v) for v in corner) for corner in corners),
+        model_long_length_px=float(long_len_px),
+        model_short_length_px=float(short_len_px),
+        depth_reference_m=depth_reference,
+        box_long_m=float(box_long_m),
+        box_short_m=float(box_short_m),
+        box_height_m=float(box_height_m),
+        projection_plane=projection_plane,
+        support=support,
+        confidence=confidence,
         failure_reasons=confidence.reasons,
     )
 
@@ -284,6 +511,284 @@ def evaluate_still_frame_spread(
     if yaw_spread_mod_180(yaws) > max_yaw_spread_deg:
         reasons.append("yaw_spread_too_large")
     return Confidence(not reasons, 0.0 if reasons else 1.0, tuple(reasons))
+
+
+def yellow_edge_mask(mask: np.ndarray) -> np.ndarray:
+    mask_u8 = _require_mask(mask)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    edge = cv2.morphologyEx(mask_u8, cv2.MORPH_GRADIENT, kernel)
+    return np.where(edge > 0, 255, 0).astype(np.uint8)
+
+
+def hough_line_segments(edge: np.ndarray) -> list[dict[str, Any]]:
+    edge_u8 = _require_mask(edge)
+    h, w = edge_u8.shape
+    min_line_length = max(35, int(round(min(h, w) * 0.06)))
+    threshold = max(18, int(round(min_line_length * 0.55)))
+    max_line_gap = max(12, int(round(min_line_length * 0.45)))
+    raw_lines = cv2.HoughLinesP(
+        edge_u8,
+        1,
+        np.pi / 180.0,
+        threshold=threshold,
+        minLineLength=min_line_length,
+        maxLineGap=max_line_gap,
+    )
+    if raw_lines is None:
+        return []
+
+    lines: list[dict[str, Any]] = []
+    for x1, y1, x2, y2 in raw_lines[:, 0, :]:
+        dx = float(x2 - x1)
+        dy = float(y2 - y1)
+        length = float(math.hypot(dx, dy))
+        if length < min_line_length:
+            continue
+        angle = math.degrees(math.atan2(dy, dx)) % 180.0
+        midpoint = np.array([(float(x1) + float(x2)) * 0.5, (float(y1) + float(y2)) * 0.5], dtype=np.float64)
+        lines.append(
+            {
+                "p1": (float(x1), float(y1)),
+                "p2": (float(x2), float(y2)),
+                "midpoint": midpoint,
+                "angle_deg": float(angle),
+                "length_px": length,
+                "weight": float(length * length),
+            }
+        )
+    return lines
+
+
+def dominant_line_yaw(lines: list[dict[str, Any]], *, cluster_deg: float) -> tuple[float, list[dict[str, Any]], float]:
+    total_weight = float(sum(line["weight"] for line in lines))
+    best_group: list[dict[str, Any]] = []
+    best_weight = -1.0
+    for candidate in lines:
+        group = [
+            line
+            for line in lines
+            if angle_distance_mod_180(float(candidate["angle_deg"]), float(line["angle_deg"])) <= cluster_deg
+        ]
+        weight = float(sum(line["weight"] for line in group))
+        if weight > best_weight:
+            best_weight = weight
+            best_group = group
+
+    yaw = weighted_circular_mean_mod_180(
+        np.array([line["angle_deg"] for line in best_group], dtype=np.float64),
+        np.array([line["weight"] for line in best_group], dtype=np.float64),
+    )
+    return float(yaw), best_group, 0.0 if total_weight <= 0.0 else float(best_weight / total_weight)
+
+
+def weighted_circular_mean_mod_180(values_deg: np.ndarray, weights: np.ndarray) -> float:
+    if values_deg.size == 0:
+        return math.nan
+    doubled = np.deg2rad((values_deg % 180.0) * 2.0)
+    w = np.asarray(weights, dtype=np.float64)
+    if not np.any(w > 0.0):
+        w = np.ones_like(values_deg, dtype=np.float64)
+    sin_mean = float(np.average(np.sin(doubled), weights=w))
+    cos_mean = float(np.average(np.cos(doubled), weights=w))
+    return float((math.degrees(math.atan2(sin_mean, cos_mean)) * 0.5) % 180.0)
+
+
+def choose_model_long_length(points_xy: np.ndarray, u_axis: np.ndarray, expected_long_px: float | None) -> float:
+    projection = np.asarray(points_xy, dtype=np.float64) @ u_axis
+    q01, q99 = np.quantile(projection, [0.01, 0.99])
+    observed_span = float(max(q99 - q01, 1.0))
+    if expected_long_px is None or not np.isfinite(expected_long_px) or expected_long_px <= 0.0:
+        return max(observed_span, 20.0)
+    return max(float(expected_long_px), 20.0)
+
+
+def choose_long_center(points_xy: np.ndarray, u_axis: np.ndarray, long_len_px: float) -> float:
+    projection = np.asarray(points_xy, dtype=np.float64) @ u_axis
+    q01, q99 = np.quantile(projection, [0.01, 0.99])
+    low = float(q99 - long_len_px * 0.5)
+    high = float(q01 + long_len_px * 0.5)
+    if low <= high:
+        return float((low + high) * 0.5)
+    return float((q01 + q99) * 0.5)
+
+
+def choose_short_axis_pair(
+    yaw_lines: list[dict[str, Any]],
+    v_axis: np.ndarray,
+    expected_short_px: float | None,
+    *,
+    min_ratio: float = 0.45,
+    max_ratio: float = 1.45,
+) -> tuple[float, float, dict[str, Any]] | None:
+    if len(yaw_lines) < 2:
+        return None
+
+    raw_positions = []
+    for line in yaw_lines:
+        position = float(np.asarray(line["midpoint"], dtype=np.float64) @ v_axis)
+        raw_positions.append((position, float(line["weight"]), float(line["length_px"])))
+    raw_positions.sort(key=lambda item: item[0])
+
+    merge_threshold = 18.0
+    if expected_short_px is not None and np.isfinite(expected_short_px):
+        merge_threshold = max(18.0, float(expected_short_px) * 0.06)
+    clusters: list[dict[str, Any]] = []
+    for position, weight, length in raw_positions:
+        if not clusters or abs(position - float(clusters[-1]["position"])) > merge_threshold:
+            clusters.append({"position": position, "weight": weight, "count": 1, "max_length_px": length})
+            continue
+        cluster = clusters[-1]
+        total = float(cluster["weight"]) + weight
+        cluster["position"] = (float(cluster["position"]) * float(cluster["weight"]) + position * weight) / total
+        cluster["weight"] = total
+        cluster["count"] = int(cluster["count"]) + 1
+        cluster["max_length_px"] = max(float(cluster["max_length_px"]), length)
+
+    if len(clusters) < 2:
+        return None
+
+    best: tuple[float, float, dict[str, Any]] | None = None
+    best_score = -1.0
+    for i, first in enumerate(clusters):
+        for second in clusters[i + 1 :]:
+            separation = abs(float(second["position"]) - float(first["position"]))
+            if expected_short_px is not None and np.isfinite(expected_short_px):
+                min_sep = max(35.0, float(expected_short_px) * min_ratio)
+                max_sep = max(min_sep, float(expected_short_px) * max_ratio)
+                if separation < min_sep or separation > max_sep:
+                    continue
+                closeness = 1.0 - min(abs(separation - float(expected_short_px)) / float(expected_short_px), 1.0)
+            else:
+                if separation < 35.0:
+                    continue
+                closeness = 0.5
+            score = (float(first["weight"]) + float(second["weight"])) * (0.65 + 0.35 * closeness)
+            if score > best_score:
+                center_v = (float(first["position"]) + float(second["position"])) * 0.5
+                pair_support = {
+                    "cluster_count": len(clusters),
+                    "first": {
+                        "position": float(first["position"]),
+                        "line_count": int(first["count"]),
+                        "max_length_px": float(first["max_length_px"]),
+                    },
+                    "second": {
+                        "position": float(second["position"]),
+                        "line_count": int(second["count"]),
+                        "max_length_px": float(second["max_length_px"]),
+                    },
+                    "separation_px": float(separation),
+                    "score": float(score),
+                }
+                best = (float(center_v), float(separation), pair_support)
+                best_score = score
+    return best
+
+
+def choose_fallback_short_length(points_xy: np.ndarray, v_axis: np.ndarray, expected_short_px: float | None) -> float:
+    projection = np.asarray(points_xy, dtype=np.float64) @ v_axis
+    q10, q80 = np.quantile(projection, [0.10, 0.80])
+    observed = float(max(q80 - q10, 20.0))
+    if expected_short_px is None or not np.isfinite(expected_short_px) or expected_short_px <= 0.0:
+        return observed
+    return float(max(20.0, min(observed, expected_short_px)))
+
+
+def choose_fallback_short_center(points_xy: np.ndarray, v_axis: np.ndarray, short_len_px: float) -> float:
+    projection = np.asarray(points_xy, dtype=np.float64) @ v_axis
+    q05, q75 = np.quantile(projection, [0.05, 0.75])
+    if q75 - q05 > short_len_px * 1.15:
+        return float(q05 + short_len_px * 0.5)
+    return float((q05 + q75) * 0.5)
+
+
+def rectangle_corners(
+    center_xy: np.ndarray,
+    u_axis: np.ndarray,
+    v_axis: np.ndarray,
+    long_len_px: float,
+    short_len_px: float,
+) -> np.ndarray:
+    center = np.asarray(center_xy, dtype=np.float64).reshape(2)
+    half_long = float(long_len_px) * 0.5
+    half_short = float(short_len_px) * 0.5
+    return np.array(
+        [
+            center - half_long * u_axis - half_short * v_axis,
+            center + half_long * u_axis - half_short * v_axis,
+            center + half_long * u_axis + half_short * v_axis,
+            center - half_long * u_axis + half_short * v_axis,
+        ],
+        dtype=np.float64,
+    )
+
+
+def score_rectangle_perimeter(edge: np.ndarray, mask: np.ndarray, corners: np.ndarray) -> dict[str, Any]:
+    edge_u8 = _require_mask(edge)
+    mask_u8 = _require_mask(mask)
+    h, w = edge_u8.shape
+    edge_binary = np.where(edge_u8 > 0, 255, 0).astype(np.uint8)
+    dist = cv2.distanceTransform(255 - edge_binary, cv2.DIST_L2, 3)
+    dilated_mask = cv2.dilate(mask_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+
+    samples = sample_polygon_perimeter(np.asarray(corners, dtype=np.float64), samples_per_edge=90)
+    cols = np.rint(samples[:, 0]).astype(int)
+    rows = np.rint(samples[:, 1]).astype(int)
+    inside = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
+    if not np.any(inside):
+        return {
+            "visible_samples": 0,
+            "edge_support_fraction": 0.0,
+            "mask_support_fraction": 0.0,
+            "mean_edge_distance_px": None,
+        }
+
+    rows = rows[inside]
+    cols = cols[inside]
+    distances = dist[rows, cols].astype(np.float64)
+    edge_support = distances <= 10.0
+    mask_support = dilated_mask[rows, cols] > 0
+    return {
+        "visible_samples": int(rows.size),
+        "edge_support_fraction": float(np.mean(edge_support)),
+        "mask_support_fraction": float(np.mean(mask_support)),
+        "mean_edge_distance_px": float(np.mean(distances)),
+    }
+
+
+def sample_polygon_perimeter(corners: np.ndarray, *, samples_per_edge: int) -> np.ndarray:
+    pts = np.asarray(corners, dtype=np.float64).reshape(4, 2)
+    samples = []
+    count = max(int(samples_per_edge), 2)
+    for index in range(4):
+        start = pts[index]
+        end = pts[(index + 1) % 4]
+        alpha = np.linspace(0.0, 1.0, count, endpoint=False, dtype=np.float64)
+        samples.append(start[None, :] * (1.0 - alpha[:, None]) + end[None, :] * alpha[:, None])
+    return np.vstack(samples)
+
+
+def backproject_center(center_xy: np.ndarray, depth_m: float, intrinsics: CameraIntrinsics) -> np.ndarray:
+    center = np.asarray(center_xy, dtype=np.float64).reshape(2)
+    z = float(depth_m)
+    x = (float(center[0]) - intrinsics.cx) * z / intrinsics.fx
+    y = (float(center[1]) - intrinsics.cy) * z / intrinsics.fy
+    return np.array([x, y, z], dtype=np.float64)
+
+
+def known_size_confidence_score(
+    reasons: list[str],
+    line_support_fraction: float,
+    perimeter_support: dict[str, Any],
+) -> float:
+    edge_support = float(perimeter_support.get("edge_support_fraction") or 0.0)
+    mask_support = float(perimeter_support.get("mask_support_fraction") or 0.0)
+    raw = 0.25 + 0.35 * min(max(line_support_fraction, 0.0), 1.0)
+    raw += 0.25 * min(max(edge_support / 0.25, 0.0), 1.0)
+    raw += 0.15 * min(max(mask_support / 0.55, 0.0), 1.0)
+    if reasons:
+        raw *= 0.45
+    return float(round(min(max(raw, 0.0), 1.0), 3))
 
 
 def largest_contour(mask: np.ndarray) -> np.ndarray | None:
@@ -531,6 +1036,36 @@ def _metric_failure(yaw_frame: str, reason: str) -> MetricBoxEstimate:
         yaw_frame=yaw_frame,
         long_length_m=None,
         short_length_m=None,
+        confidence=confidence,
+        failure_reasons=confidence.reasons,
+    )
+
+
+def _known_size_failure(
+    reason: str,
+    *,
+    box_long_m: float,
+    box_short_m: float,
+    box_height_m: float,
+    projection_plane: str,
+    support: dict[str, Any] | None = None,
+) -> KnownSizeBoxEstimate:
+    confidence = Confidence(False, 0.0, (reason,))
+    return KnownSizeBoxEstimate(
+        center_image=None,
+        center_top_camera_m=None,
+        yaw_mod_180=None,
+        long_axis_image=None,
+        grasp_axis_image=None,
+        model_corners=None,
+        model_long_length_px=None,
+        model_short_length_px=None,
+        depth_reference_m=None,
+        box_long_m=float(box_long_m),
+        box_short_m=float(box_short_m),
+        box_height_m=float(box_height_m),
+        projection_plane=projection_plane,
+        support={} if support is None else support,
         confidence=confidence,
         failure_reasons=confidence.reasons,
     )
