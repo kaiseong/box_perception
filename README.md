@@ -130,26 +130,41 @@ PY
 
 `ModuleNotFoundError: No module named 'pyrealsense2'`가 나오면 librealsense Python binding이 없는 상태입니다.
 
-가능하면 배포 패키지를 먼저 확인합니다.
+Jetson에서 apt repo에 RealSense C++ runtime은 보이지만 Python binding 패키지가 없는 경우가 있습니다. 예를 들어 아래처럼 `python3-pyrealsense2`가 보이지 않으면 정상적으로 이 케이스입니다.
 
 ```bash
 apt-cache search realsense | sort
 ```
 
-패키지가 제공되는 환경이면 system package로 설치하는 쪽이 가장 단순합니다.
+이 경우 apt로는 device/udev/runtime 쪽을 설치하고, venv 안에서는 공식 PyPI wheel을 먼저 설치합니다. 현재 Python 3.10 aarch64 wheel이 제공되므로 이 경로가 가장 가볍습니다.
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y librealsense2-utils librealsense2-dev
+sudo apt-get install -y \
+  librealsense2 \
+  librealsense2-udev-rules \
+  librealsense2-utils \
+  librealsense2-dev
+
+cd ~/box_perception
+source .venv/bin/activate
+python -m pip install pyrealsense2
 ```
 
-Python binding 패키지가 따로 제공되면 같이 설치합니다.
+설치 후 카메라를 다시 꽂거나 재부팅한 뒤 확인합니다.
 
 ```bash
-sudo apt-get install -y python3-pyrealsense2
+python - <<'PY'
+import pyrealsense2 as rs
+ctx = rs.context()
+devices = ctx.query_devices()
+print("device_count", len(devices))
+for dev in devices:
+    print(dev.get_info(rs.camera_info.name), dev.get_info(rs.camera_info.serial_number))
+PY
 ```
 
-패키지가 없거나 Jetson kernel/JetPack 조합 때문에 동작하지 않으면 공식 문서 기준으로 source build를 사용합니다.
+만약 `pip install pyrealsense2`가 현재 Jetson/Python 조합에서 실패하거나 import는 되지만 shared library 로딩 문제가 나면 공식 문서 기준으로 source build를 사용합니다. venv를 activate한 상태에서 `-DPYTHON_EXECUTABLE="$(which python)"`를 넣어 현재 venv용 binding을 만들도록 합니다.
 
 ```bash
 cd ~
@@ -169,6 +184,7 @@ cd build
 cmake .. \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_PYTHON_BINDINGS=ON \
+  -DPYTHON_EXECUTABLE="$(which python)" \
   -DBUILD_EXAMPLES=ON \
   -DBUILD_GRAPHICAL_EXAMPLES=OFF
 make -j"$(nproc)"
@@ -176,7 +192,24 @@ sudo make install
 sudo ldconfig
 ```
 
-설치 후 터미널을 새로 열거나 venv를 다시 activate한 뒤 확인합니다.
+source build 후 import가 안 보이면 Python path를 확인합니다. 공식 문서도 `/usr/local/lib` 또는 `/usr/local/lib/<python version>/pyrealsense2`를 `PYTHONPATH`에 추가하는 방식을 안내합니다.
+
+```bash
+python - <<'PY'
+import sys
+print("\n".join(sys.path))
+PY
+
+find /usr/local/lib -name 'pyrealsense2*.so' -o -path '*/pyrealsense2/__init__.py'
+```
+
+예를 들어 `/usr/local/lib/python3.10/pyrealsense2` 아래에 설치되어 있으면:
+
+```bash
+export PYTHONPATH="${PYTHONPATH}:/usr/local/lib/python3.10/pyrealsense2"
+```
+
+마지막으로 다시 확인합니다.
 
 ```bash
 cd ~/box_perception
@@ -424,6 +457,19 @@ RealSense 카메라 없이도 unit tests는 돌아가야 합니다. 실제 D405 
 ### `ModuleNotFoundError: No module named 'pyrealsense2'`
 
 RealSense Python binding이 현재 venv에서 보이지 않는 상태입니다.
+
+가장 먼저 venv 안에서 PyPI wheel을 설치합니다.
+
+```bash
+source .venv/bin/activate
+python -m pip install pyrealsense2
+```
+
+그리고 RealSense runtime/udev 패키지를 확인합니다.
+
+```bash
+sudo apt-get install -y librealsense2 librealsense2-udev-rules librealsense2-utils librealsense2-dev
+```
 
 확인:
 

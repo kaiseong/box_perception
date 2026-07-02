@@ -320,8 +320,10 @@ def import_realsense_sdk() -> Any:
         import pyrealsense2 as rs  # type: ignore[import-not-found]
     except ImportError as exc:
         raise SystemExit(
-            "Failed to import pyrealsense2. Install Intel RealSense librealsense/pyrealsense2 "
-            "on the Jetson, then rerun recording.py."
+            "Failed to import pyrealsense2. In the active venv, run "
+            "`python -m pip install pyrealsense2`. Also install the Jetson RealSense "
+            "runtime/udev packages if needed: `sudo apt-get install librealsense2 "
+            "librealsense2-udev-rules librealsense2-utils librealsense2-dev`."
         ) from exc
     return rs
 
