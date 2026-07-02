@@ -321,9 +321,10 @@ def import_realsense_sdk() -> Any:
     except ImportError as exc:
         raise SystemExit(
             "Failed to import pyrealsense2. In the active venv, run "
-            "`python -m pip install pyrealsense2`. Also install the Jetson RealSense "
-            "runtime/udev packages if needed: `sudo apt-get install librealsense2 "
-            "librealsense2-udev-rules librealsense2-utils librealsense2-dev`."
+            "`python -m pip install pyrealsense2`. On Jetson aarch64, use a Python 3.12 "
+            "venv; Python 3.13 may have no matching pyrealsense2 wheel. Also install "
+            "the RealSense runtime/udev packages if needed: `sudo apt-get install "
+            "librealsense2 librealsense2-udev-rules librealsense2-utils librealsense2-dev`."
         ) from exc
     return rs
 
