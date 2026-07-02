@@ -15,6 +15,7 @@ import numpy as np
 
 
 FORMAT_VERSION = "box-perception-recording-v2"
+VIEW_ROTATIONS = ("none", "cw90", "ccw90", "180")
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class RecordingConfig:
     align_depth_to_color: bool
     enable_emitter: bool
     laser_power: float | None
+    view_rotation: str
 
 
 @dataclass(frozen=True)
@@ -86,6 +88,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help="Optional RealSense laser power value. Only applied when the sensor supports it.",
     )
+    parser.add_argument(
+        "--view-rotation",
+        choices=VIEW_ROTATIONS,
+        default="none",
+        help=(
+            "Metadata for the analysis/viewing orientation relative to saved raw frames. "
+            "Use cw90 when the camera is mounted 90 degrees counter-clockwise and frames "
+            "must be viewed clockwise."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -122,6 +134,7 @@ def config_from_args(args: argparse.Namespace) -> RecordingConfig:
         align_depth_to_color=not bool(args.no_align_depth),
         enable_emitter=not bool(args.disable_emitter),
         laser_power=None if args.laser_power is None else float(args.laser_power),
+        view_rotation=str(args.view_rotation),
     )
 
 
@@ -185,6 +198,8 @@ def build_manifest(
             "depth_units": "meter",
             "depth_aligned_to_color": bool(config.align_depth_to_color),
             "rgb_color_order": "BGR",
+            "saved_frame_orientation": "raw_camera",
+            "view_rotation_from_raw_to_analysis": config.view_rotation,
         },
     }
 

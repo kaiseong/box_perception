@@ -51,6 +51,7 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(config.fps, 30)
         self.assertTrue(config.align_depth_to_color)
         self.assertTrue(config.enable_emitter)
+        self.assertEqual(config.view_rotation, "none")
 
     def test_prepare_session_creates_expected_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -86,6 +87,8 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(manifest["depth_scale_m_per_unit"], 0.001)
         self.assertEqual(manifest["data_layout"]["depth_units"], "meter")
         self.assertTrue(manifest["data_layout"]["depth_aligned_to_color"])
+        self.assertEqual(manifest["data_layout"]["saved_frame_orientation"], "raw_camera")
+        self.assertEqual(manifest["data_layout"]["view_rotation_from_raw_to_analysis"], "none")
         self.assertEqual(manifest["recording"]["frame_count"], 0)
 
     def test_save_frame_writes_rgb_depth_metadata_and_index_record(self) -> None:
@@ -190,6 +193,7 @@ def sample_args(**overrides: object) -> object:
         "no_align_depth": False,
         "disable_emitter": False,
         "laser_power": None,
+        "view_rotation": "none",
     }
     values.update(overrides)
     return type("Args", (), values)()
@@ -213,6 +217,7 @@ def sample_config(max_frames: int | None = 10, duration_sec: float | None = None
         align_depth_to_color=True,
         enable_emitter=True,
         laser_power=None,
+        view_rotation="none",
     )
 
 

@@ -12,6 +12,9 @@ from typing import Any
 import numpy as np
 
 
+VIEW_ROTATIONS = ("none", "cw90", "ccw90", "180")
+
+
 @dataclass(frozen=True)
 class AnalysisDependencies:
     cv2: Any
@@ -44,6 +47,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save-mask", action="store_true", help="Save binary masks next to debug overlays.")
     parser.add_argument("--no-metric", action="store_true", help="Skip depth/intrinsics metric estimation.")
+    parser.add_argument(
+        "--view-rotation",
+        choices=("auto",) + VIEW_ROTATIONS,
+        default="auto",
+        help=(
+            "Rotate raw RGB/depth frames into the analysis image orientation. "
+            "auto uses manifest config.view_rotation when present. Use cw90 for the current "
+            "rotated D405 mount."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -133,6 +146,60 @@ def load_depth_frame(session_dir: Path, record: dict[str, Any]) -> np.ndarray:
     return depth
 
 
+def resolve_view_rotation(manifest: dict[str, Any], requested: str) -> str:
+    if requested != "auto":
+        return normalize_view_rotation(requested)
+    config_rotation = manifest.get("config", {}).get("view_rotation")
+    layout_rotation = manifest.get("data_layout", {}).get("view_rotation_from_raw_to_analysis")
+    return normalize_view_rotation(config_rotation or layout_rotation or "none")
+
+
+def normalize_view_rotation(rotation: str | None) -> str:
+    value = "none" if rotation is None else str(rotation).lower()
+    if value not in VIEW_ROTATIONS:
+        raise ValueError(f"Unsupported view rotation: {rotation!r}")
+    return value
+
+
+def rotate_array_for_view(array: np.ndarray, rotation: str) -> np.ndarray:
+    normalized = normalize_view_rotation(rotation)
+    if normalized == "none":
+        return array
+    if normalized == "cw90":
+        return np.rot90(array, k=3).copy()
+    if normalized == "ccw90":
+        return np.rot90(array, k=1).copy()
+    if normalized == "180":
+        return np.rot90(array, k=2).copy()
+    raise AssertionError(f"unreachable rotation: {normalized}")
+
+
+def image_size_from_manifest_or_record(manifest: dict[str, Any], record: dict[str, Any]) -> tuple[int, int]:
+    intrinsics = manifest.get("intrinsics", {})
+    if "width" in intrinsics and "height" in intrinsics:
+        return int(intrinsics["width"]), int(intrinsics["height"])
+    config = manifest.get("config", {})
+    if "width" in config and "height" in config:
+        return int(config["width"]), int(config["height"])
+    image_shape = record.get("image_shape")
+    if isinstance(image_shape, list) and len(image_shape) >= 2:
+        return int(image_shape[1]), int(image_shape[0])
+    raise ValueError("Cannot determine raw image size for rotated intrinsics.")
+
+
+def rotate_intrinsics_for_view(intrinsics: Any, *, width: int, height: int, rotation: str, intrinsics_cls: Any) -> Any:
+    normalized = normalize_view_rotation(rotation)
+    if normalized == "none":
+        return intrinsics
+    if normalized == "cw90":
+        return intrinsics_cls(fx=intrinsics.fy, fy=intrinsics.fx, cx=(height - 1.0) - intrinsics.cy, cy=intrinsics.cx)
+    if normalized == "ccw90":
+        return intrinsics_cls(fx=intrinsics.fy, fy=intrinsics.fx, cx=intrinsics.cy, cy=(width - 1.0) - intrinsics.cx)
+    if normalized == "180":
+        return intrinsics_cls(fx=intrinsics.fx, fy=intrinsics.fy, cx=(width - 1.0) - intrinsics.cx, cy=(height - 1.0) - intrinsics.cy)
+    raise AssertionError(f"unreachable rotation: {normalized}")
+
+
 def analyze_frame(
     deps: AnalysisDependencies,
     *,
@@ -143,8 +210,9 @@ def analyze_frame(
     save_debug: bool,
     save_mask: bool,
     run_metric: bool,
+    view_rotation: str,
 ) -> dict[str, Any]:
-    image = load_rgb_frame(session_dir, record, deps.cv2)
+    image = rotate_array_for_view(load_rgb_frame(session_dir, record, deps.cv2), view_rotation)
     mask, mask_stats = deps.segment_yellow_box(image)
     pixel_estimate = deps.estimate_pixel_box(mask, mask_stats)
 
@@ -153,11 +221,13 @@ def analyze_frame(
         "wall_time": record.get("wall_time"),
         "rgb_path": record.get("rgb_path"),
         "depth_path": record.get("depth_path"),
+        "view_rotation": view_rotation,
+        "analysis_image_shape": list(image.shape),
         "pixel": pixel_estimate.to_dict(),
     }
 
     if run_metric and intrinsics is not None:
-        depth = load_depth_frame(session_dir, record)
+        depth = rotate_array_for_view(load_depth_frame(session_dir, record), view_rotation)
         metric_estimate = deps.estimate_metric_box(mask, depth, intrinsics)
         metric = metric_estimate.to_dict()
         metric["long_length_m"] = metric_estimate.long_length_m
@@ -191,6 +261,7 @@ def summarize_results(results: list[dict[str, Any]], evaluate_still_frame_spread
 
     summary: dict[str, Any] = {
         "frames_analyzed": len(results),
+        "view_rotation": None if not results else results[0].get("view_rotation"),
         "pixel_ok_frames": len(pixel_ok),
         "pixel_ok_fraction": 0.0 if not results else len(pixel_ok) / len(results),
         "metric_ok_frames": len(metric_ok),
@@ -259,9 +330,18 @@ def main() -> int:
     if not records:
         raise SystemExit(f"No frames selected from {session_dir / 'index.jsonl'}")
 
+    view_rotation = resolve_view_rotation(manifest, args.view_rotation)
     intrinsics = None
     if not args.no_metric:
-        intrinsics = deps.camera_intrinsics_cls.from_mapping(manifest["intrinsics"])
+        raw_width, raw_height = image_size_from_manifest_or_record(manifest, records[0])
+        raw_intrinsics = deps.camera_intrinsics_cls.from_mapping(manifest["intrinsics"])
+        intrinsics = rotate_intrinsics_for_view(
+            raw_intrinsics,
+            width=raw_width,
+            height=raw_height,
+            rotation=view_rotation,
+            intrinsics_cls=deps.camera_intrinsics_cls,
+        )
 
     frame_records_path = output_dir / "frames.jsonl"
     results: list[dict[str, Any]] = []
@@ -277,6 +357,7 @@ def main() -> int:
                 save_debug=save_debug,
                 save_mask=save_debug and args.save_mask,
                 run_metric=not args.no_metric,
+                view_rotation=view_rotation,
             )
             results.append(result)
             frame_file.write(json.dumps(result, sort_keys=True) + "\n")

@@ -13,13 +13,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from recording import RecordingConfig, build_manifest, prepare_session, save_frame
 from replay_recording import (
     angular_distance_mod_180,
+    image_size_from_manifest_or_record,
     iter_index_records,
     load_depth_frame,
     load_manifest,
     load_rgb_frame,
+    resolve_view_rotation,
+    rotate_array_for_view,
+    rotate_intrinsics_for_view,
     summarize_results,
     yaw_summary,
 )
+from box_pose import CameraIntrinsics
 
 
 class ReplayRecordingTests(unittest.TestCase):
@@ -91,6 +96,44 @@ class ReplayRecordingTests(unittest.TestCase):
         self.assertEqual(summary["metric_ok_frames"], 2)
         self.assertAlmostEqual(summary["pixel_ok_fraction"], 2 / 3)
 
+    def test_rotate_array_for_cw_view(self) -> None:
+        raw = np.array([[1, 2, 3], [4, 5, 6]])
+
+        rotated = rotate_array_for_view(raw, "cw90")
+
+        np.testing.assert_array_equal(rotated, np.array([[4, 1], [5, 2], [6, 3]]))
+
+    def test_rotate_intrinsics_for_cw_view(self) -> None:
+        intrinsics = CameraIntrinsics(fx=100.0, fy=200.0, cx=2.0, cy=1.0)
+
+        rotated = rotate_intrinsics_for_view(
+            intrinsics,
+            width=4,
+            height=3,
+            rotation="cw90",
+            intrinsics_cls=CameraIntrinsics,
+        )
+
+        self.assertEqual(rotated.fx, 200.0)
+        self.assertEqual(rotated.fy, 100.0)
+        self.assertEqual(rotated.cx, 1.0)
+        self.assertEqual(rotated.cy, 2.0)
+
+    def test_resolve_view_rotation_uses_manifest_config(self) -> None:
+        manifest = {
+            "config": {"view_rotation": "cw90"},
+            "data_layout": {"view_rotation_from_raw_to_analysis": "none"},
+        }
+
+        self.assertEqual(resolve_view_rotation(manifest, "auto"), "cw90")
+        self.assertEqual(resolve_view_rotation(manifest, "ccw90"), "ccw90")
+
+    def test_image_size_uses_record_shape_when_manifest_lacks_size(self) -> None:
+        manifest: dict = {"intrinsics": {}}
+        record = {"image_shape": [720, 1280, 3]}
+
+        self.assertEqual(image_size_from_manifest_or_record(manifest, record), (1280, 720))
+
 
 def sample_config() -> RecordingConfig:
     return RecordingConfig(
@@ -110,6 +153,7 @@ def sample_config() -> RecordingConfig:
         align_depth_to_color=True,
         enable_emitter=True,
         laser_power=None,
+        view_rotation="none",
     )
 
 

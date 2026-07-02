@@ -277,18 +277,29 @@ python recording.py \
   --width 1280 \
   --height 720 \
   --fps 30 \
-  --duration-sec 20
+  --duration-sec 20 \
+  --view-rotation cw90
 ```
+
+현재 D405는 카메라가 90도 돌아간 상태로 장착되어 있으므로, 사람이 보는 분석 기준 이미지는 raw frame을 **시계방향 90도 회전한 좌표계**입니다. `--view-rotation cw90`는 저장된 raw frame을 바꾸지 않고 manifest에 이 분석 방향만 기록합니다. 이미 녹화된 session에 이 metadata가 없으면 replay에서 `--view-rotation cw90`를 지정하면 됩니다.
 
 여러 상황을 모을 때는 session name을 바꿉니다.
 
 ```bash
-python recording.py --output-root recordings --session-name d405_center_visible_full_001 --duration-sec 20
-python recording.py --output-root recordings --session-name d405_center_visible_left_crop_001 --duration-sec 20
-python recording.py --output-root recordings --session-name d405_center_visible_both_crop_001 --duration-sec 20
-python recording.py --output-root recordings --session-name d405_near_030cm_001 --duration-sec 20
-python recording.py --output-root recordings --session-name d405_far_065cm_001 --duration-sec 20
+python recording.py --output-root recordings --session-name d405_center_001 --duration-sec 20 --view-rotation cw90
+python recording.py --output-root recordings --session-name d405_left_crop_001 --duration-sec 20 --view-rotation cw90
+python recording.py --output-root recordings --session-name d405_right_crop_001 --duration-sec 20 --view-rotation cw90
+python recording.py --output-root recordings --session-name d405_yaw_plus_001 --duration-sec 20 --view-rotation cw90
+python recording.py --output-root recordings --session-name d405_yaw_minus_001 --duration-sec 20 --view-rotation cw90
 ```
+
+Session 의미:
+
+- `center`: 박스 중심을 화면 중심 근처에 두고 로봇 정면 방향으로 앞뒤 이동
+- `left_crop`: 박스를 왼쪽으로 옮긴 뒤 로봇 정면 방향으로 앞뒤 이동
+- `right_crop`: 박스를 오른쪽으로 옮긴 뒤 로봇 정면 방향으로 앞뒤 이동
+- `yaw_plus`: 박스를 반시계 방향으로 회전시키고, 이후 로봇 정면 방향으로 앞뒤 이동
+- `yaw_minus`: 박스를 시계 방향으로 회전시키고, 이후 로봇 정면 방향으로 앞뒤 이동
 
 기본값:
 
@@ -359,6 +370,8 @@ recordings/<session_name>/
 - `depth_scale_m_per_unit`: raw z16 depth scale
 - `extrinsics`: color/depth stream 간 extrinsics
 - `data_layout.depth_aligned_to_color`: depth가 color frame에 align됐는지 여부
+- `data_layout.saved_frame_orientation`: 저장된 frame은 raw camera 방향
+- `data_layout.view_rotation_from_raw_to_analysis`: 분석/시각화 때 적용할 회전. 현재 장착은 `cw90`
 
 `index.jsonl`은 frame별 record입니다.
 
@@ -443,8 +456,11 @@ python replay_recording.py recordings/d405_box_static_001 \
   --max-frames 50 \
   --stride 3 \
   --debug-every 5 \
-  --save-mask
+  --save-mask \
+  --view-rotation cw90
 ```
+
+`--view-rotation auto`가 기본값입니다. 새로 녹화한 session의 manifest에 `view_rotation`이 들어 있으면 자동으로 사용합니다. 기존 녹화처럼 metadata가 없으면 `--view-rotation cw90`를 명시합니다. replay는 RGB, depth, camera intrinsics를 모두 같은 방향으로 회전한 뒤 분석하므로 pixel center/yaw와 metric projection의 좌표계가 일치합니다.
 
 결과:
 
