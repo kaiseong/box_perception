@@ -357,6 +357,36 @@ class BoxPoseTests(unittest.TestCase):
         self.assertTrue(support.get("top_plane_extent_clamped"))
         self.assertGreater(float(support.get("raw_separation_px")), float(support.get("clamped_separation_px")))
 
+    def test_known_size_box_searches_scale_for_better_perimeter_fit(self) -> None:
+        mask = cropped_rim_mask(
+            shape=(320, 360),
+            center=(180.0, 160.0),
+            long_len=313.2,
+            short_len=116.0,
+            yaw_deg=0.0,
+        )
+        depth = np.where(mask > 0, 1.0, 0.0).astype(np.float64)
+        intr = CameraIntrinsics(fx=700.0, fy=700.0, cx=180.0, cy=160.0)
+
+        estimate = estimate_known_size_box(
+            mask,
+            depth,
+            intr,
+            box_long_m=270.0 / 700.0,
+            box_short_m=100.0 / 700.0,
+            min_depth_pixels=50,
+            top_plane_short_projection_scale=1.0,
+        )
+
+        self.assertTrue(estimate.confidence.ok, estimate.failure_reasons)
+        fit_search = estimate.support.get("fit_search", {})
+        self.assertGreater(float(fit_search.get("selected_common_scale")), 1.0)
+        self.assertGreater(float(estimate.model_long_length_px), 285.0)
+        self.assertGreater(float(estimate.model_short_length_px), 110.0)
+        perimeter = estimate.support.get("perimeter", {})
+        self.assertGreaterEqual(float(perimeter.get("edge_support_fraction")), 0.95)
+        self.assertGreaterEqual(float(perimeter.get("mask_support_fraction")), 0.95)
+
     def test_confidence_threshold_edges(self) -> None:
         base = rotated_rectangle_mask((100, 100), (60, 20), 0)
         base_stats = stats_for_mask(base)

@@ -154,6 +154,23 @@ class KnownSizeBoxEstimate:
         )
 
 
+@dataclass(frozen=True)
+class KnownSizeFitCandidate:
+    yaw: float
+    yaw_lines: list[dict[str, Any]]
+    line_support_fraction: float
+    u_axis: np.ndarray
+    v_axis: np.ndarray
+    center: np.ndarray
+    corners: np.ndarray
+    long_len_px: float
+    short_len_px: float
+    pair_support: dict[str, Any] | None
+    perimeter_support: dict[str, Any]
+    score: float
+    support: dict[str, Any]
+
+
 def estimate_pixel_box(
     mask: np.ndarray,
     mask_stats: MaskStats,
@@ -315,40 +332,73 @@ def estimate_known_size_box(
             )
         yaw = float(pixel_fallback.yaw_mod_180)
         yaw_lines: list[dict[str, Any]] = []
+        line_support_fraction = 0.0
         reasons.append("pixel_yaw_fallback")
+        u_axis, v_axis = axes_from_yaw(yaw)
+        long_len_px = choose_model_long_length(points, u_axis, expected_long_px)
+        short_len_px = choose_fallback_short_length(points, v_axis, expected_short_px)
+        center_v = choose_fallback_short_center(points, v_axis, short_len_px)
+        center_u = choose_long_center(points, u_axis, long_len_px)
+        center = center_u * u_axis + center_v * v_axis
+        corners = rectangle_corners(center, u_axis, v_axis, long_len_px, short_len_px)
+        pair_support = None
+        perimeter_support = score_rectangle_perimeter(edge, mask_u8, corners)
+        fit_support: dict[str, Any] = {"candidate_count": 0, "selection": "pixel_yaw_fallback"}
     else:
-        yaw, yaw_lines, line_support_fraction = dominant_line_yaw(lines, cluster_deg=yaw_cluster_deg)
+        fit = select_known_size_fit_candidate(
+            points,
+            lines,
+            edge,
+            mask_u8,
+            expected_long_px,
+            expected_short_px,
+            yaw_cluster_deg=yaw_cluster_deg,
+            short_pair_min_ratio=short_pair_min_ratio,
+            short_pair_max_ratio=short_pair_max_ratio,
+        )
+        if fit is None:
+            yaw, yaw_lines, line_support_fraction = dominant_line_yaw(lines, cluster_deg=yaw_cluster_deg)
+            u_axis, v_axis = axes_from_yaw(yaw)
+            long_len_px = choose_model_long_length(points, u_axis, expected_long_px)
+            short_pair = choose_short_axis_pair(
+                yaw_lines,
+                v_axis,
+                expected_short_px,
+                min_ratio=short_pair_min_ratio,
+                max_ratio=short_pair_max_ratio,
+            )
+            if short_pair is None:
+                reasons.append("missing_parallel_short_extent")
+                short_len_px = choose_fallback_short_length(points, v_axis, expected_short_px)
+                center_v = choose_fallback_short_center(points, v_axis, short_len_px)
+                pair_support = None
+            else:
+                center_v, short_len_px, pair_support = short_pair
+                center_v, short_len_px = clamp_top_plane_short_extent(
+                    center_v, short_len_px, pair_support, expected_short_px
+                )
+            center_u = choose_long_center(points, u_axis, long_len_px)
+            center = center_u * u_axis + center_v * v_axis
+            corners = rectangle_corners(center, u_axis, v_axis, long_len_px, short_len_px)
+            perimeter_support = score_rectangle_perimeter(edge, mask_u8, corners)
+            fit_support = {"candidate_count": 0, "selection": "dominant_yaw_fallback"}
+        else:
+            yaw = fit.yaw
+            yaw_lines = fit.yaw_lines
+            line_support_fraction = fit.line_support_fraction
+            u_axis = fit.u_axis
+            v_axis = fit.v_axis
+            center = fit.center
+            corners = fit.corners
+            long_len_px = fit.long_len_px
+            short_len_px = fit.short_len_px
+            pair_support = fit.pair_support
+            perimeter_support = fit.perimeter_support
+            fit_support = fit.support
         if line_support_fraction < 0.35:
             reasons.append("weak_yaw_line_consensus")
 
-    u_axis = np.array([math.cos(math.radians(yaw)), math.sin(math.radians(yaw))], dtype=np.float64)
-    if u_axis[0] < 0.0:
-        u_axis = -u_axis
-    v_axis = np.array([-u_axis[1], u_axis[0]], dtype=np.float64)
-
     image_h, image_w = mask_u8.shape
-    long_len_px = choose_model_long_length(points, u_axis, expected_long_px)
-    short_pair = choose_short_axis_pair(
-        yaw_lines,
-        v_axis,
-        expected_short_px,
-        min_ratio=short_pair_min_ratio,
-        max_ratio=short_pair_max_ratio,
-    )
-    if short_pair is None:
-        reasons.append("missing_parallel_short_extent")
-        short_len_px = choose_fallback_short_length(points, v_axis, expected_short_px)
-        center_v = choose_fallback_short_center(points, v_axis, short_len_px)
-        pair_support = None
-    else:
-        center_v, short_len_px, pair_support = short_pair
-        center_v, short_len_px = clamp_top_plane_short_extent(center_v, short_len_px, pair_support, expected_short_px)
-
-    center_u = choose_long_center(points, u_axis, long_len_px)
-    center = center_u * u_axis + center_v * v_axis
-    corners = rectangle_corners(center, u_axis, v_axis, long_len_px, short_len_px)
-
-    perimeter_support = score_rectangle_perimeter(edge, mask_u8, corners)
     if perimeter_support["visible_samples"] < 20:
         reasons.append("too_little_visible_model_perimeter")
     if perimeter_support["edge_support_fraction"] < 0.08:
@@ -373,9 +423,10 @@ def estimate_known_size_box(
         "expected_short_length_px": expected_short_px,
         "pinhole_short_length_px": pinhole_short_px,
         "top_plane_short_projection_scale": float(top_plane_short_projection_scale),
+        "fit_search": fit_support,
     }
     support.update(support_notes)
-    if short_pair is not None and pair_support is not None:
+    if pair_support is not None:
         support["short_axis_pair_support"] = pair_support
 
     score = known_size_confidence_score(reasons, line_support_fraction, perimeter_support)
@@ -626,6 +677,141 @@ def dominant_line_yaw(lines: list[dict[str, Any]], *, cluster_deg: float) -> tup
         np.array([line["weight"] for line in best_group], dtype=np.float64),
     )
     return float(yaw), best_group, 0.0 if total_weight <= 0.0 else float(best_weight / total_weight)
+
+
+def axes_from_yaw(yaw_deg: float) -> tuple[np.ndarray, np.ndarray]:
+    long_axis = np.array([math.cos(math.radians(yaw_deg)), math.sin(math.radians(yaw_deg))], dtype=np.float64)
+    if long_axis[0] < 0.0:
+        long_axis = -long_axis
+    short_axis = np.array([-long_axis[1], long_axis[0]], dtype=np.float64)
+    return long_axis, short_axis
+
+
+def select_known_size_fit_candidate(
+    points_xy: np.ndarray,
+    lines: list[dict[str, Any]],
+    edge: np.ndarray,
+    mask: np.ndarray,
+    expected_long_px: float | None,
+    expected_short_px: float | None,
+    *,
+    yaw_cluster_deg: float,
+    short_pair_min_ratio: float,
+    short_pair_max_ratio: float,
+) -> KnownSizeFitCandidate | None:
+    yaw, _group, yaw_weight_fraction = dominant_line_yaw(lines, cluster_deg=yaw_cluster_deg)
+    if not np.isfinite(yaw):
+        return None
+
+    total_weight = max(float(sum(line["weight"] for line in lines)), 1e-9)
+    scale_candidates = known_size_scale_candidates()
+    best: KnownSizeFitCandidate | None = None
+    yaw_lines = [line for line in lines if angle_distance_mod_180(yaw, float(line["angle_deg"])) <= yaw_cluster_deg]
+    if len(yaw_lines) < 2:
+        return None
+    line_support_fraction = float(sum(line["weight"] for line in yaw_lines) / total_weight)
+    u_axis, v_axis = axes_from_yaw(yaw)
+    yaw_item = {
+        "source": "dominant_line_cluster",
+        "weight_fraction": float(yaw_weight_fraction),
+        "base_yaw": float(yaw),
+        "delta": 0.0,
+    }
+
+    for common_scale in scale_candidates:
+        candidate_expected_long = scale_expected_length(expected_long_px, common_scale)
+        candidate_expected_short = scale_expected_length(expected_short_px, common_scale)
+        long_len_px = choose_model_long_length(points_xy, u_axis, candidate_expected_long)
+        short_pair = choose_short_axis_pair(
+            yaw_lines,
+            v_axis,
+            candidate_expected_short,
+            min_ratio=short_pair_min_ratio,
+            max_ratio=short_pair_max_ratio,
+        )
+        if short_pair is None:
+            continue
+
+        center_v, short_len_px, pair_support = short_pair
+        center_v, short_len_px = clamp_top_plane_short_extent(
+            center_v, short_len_px, pair_support, candidate_expected_short
+        )
+        center_u = choose_long_center(points_xy, u_axis, long_len_px)
+        center = center_u * u_axis + center_v * v_axis
+        corners = rectangle_corners(center, u_axis, v_axis, long_len_px, short_len_px)
+        perimeter_support = score_rectangle_perimeter(edge, mask, corners)
+        fit_score = known_size_fit_candidate_score(
+            perimeter_support,
+            line_support_fraction,
+            pair_support,
+            common_scale,
+            yaw_item,
+        )
+        support = {
+            "candidate_count": len(scale_candidates),
+            "selection": "yaw_scale_perimeter_search",
+            "selected_yaw_source": yaw_item["source"],
+            "selected_yaw_weight_fraction": float(yaw_item["weight_fraction"]),
+            "selected_yaw_base_deg": float(yaw_item["base_yaw"]),
+            "selected_yaw_delta_deg": float(yaw_item["delta"]),
+            "selected_common_scale": float(common_scale),
+            "selected_score": float(fit_score),
+        }
+        candidate = KnownSizeFitCandidate(
+            yaw=yaw,
+            yaw_lines=yaw_lines,
+            line_support_fraction=line_support_fraction,
+            u_axis=u_axis,
+            v_axis=v_axis,
+            center=center,
+            corners=corners,
+            long_len_px=long_len_px,
+            short_len_px=short_len_px,
+            pair_support=pair_support,
+            perimeter_support=perimeter_support,
+            score=fit_score,
+            support=support,
+        )
+        if best is None or candidate.score > best.score:
+            best = candidate
+    return best
+
+
+def known_size_scale_candidates() -> tuple[float, ...]:
+    return (0.84, 0.90, 0.96, 1.0, 1.04, 1.10, 1.16)
+
+
+def scale_expected_length(expected_px: float | None, scale: float) -> float | None:
+    if expected_px is None or not np.isfinite(expected_px) or expected_px <= 0.0:
+        return expected_px
+    return float(expected_px) * float(scale)
+
+
+def known_size_fit_candidate_score(
+    perimeter_support: dict[str, Any],
+    line_support_fraction: float,
+    pair_support: dict[str, Any],
+    common_scale: float,
+    yaw_item: dict[str, Any],
+) -> float:
+    edge_support = float(perimeter_support.get("edge_support_fraction") or 0.0)
+    mask_support = float(perimeter_support.get("mask_support_fraction") or 0.0)
+    mean_distance = perimeter_support.get("mean_edge_distance_px")
+    distance_score = 0.0 if mean_distance is None else 1.0 / (1.0 + max(float(mean_distance), 0.0) / 18.0)
+    pair_score = min(max(float(pair_support.get("depth_score", 1.0)), 0.0), 1.0)
+    scale_penalty = max(0.0, 1.0 - abs(float(common_scale) - 1.0) * 0.35)
+    yaw_delta_penalty = max(0.0, 1.0 - abs(float(yaw_item.get("delta", 0.0))) * 0.04)
+    yaw_weight = min(max(float(yaw_item.get("weight_fraction", 0.0)) / 0.35, 0.0), 1.0)
+    return float(
+        0.36 * edge_support
+        + 0.24 * mask_support
+        + 0.20 * distance_score
+        + 0.10 * min(max(line_support_fraction / 0.55, 0.0), 1.0)
+        + 0.06 * pair_score
+        + 0.02 * scale_penalty
+        + 0.02 * yaw_delta_penalty
+        + 0.02 * yaw_weight
+    )
 
 
 def weighted_circular_mean_mod_180(values_deg: np.ndarray, weights: np.ndarray) -> float:

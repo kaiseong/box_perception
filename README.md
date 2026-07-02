@@ -54,7 +54,9 @@ D405 depth는 너무 가깝거나 멀 때, 얇은 테두리/반사/구멍/내부
 6. `long_axis`에 수직인 축을 `short_axis`로 둡니다. 이 축은 박스 짧은 방향이며, 양팔 그리퍼가 양쪽 긴 벽을 잡기 위해 서로 모여드는 방향입니다.
 7. `short_axis` 방향 line pair는 depth ordering을 봐서 먼 뒤쪽 top rim과 가까운 앞쪽 top rim 조합을 선호합니다. 중간에 더 가까운 top-rim 후보가 있는데 더 아래쪽 wall edge를 선택하는 경우에는 벌점을 줍니다.
 8. 관측 line pair 간격이 top-plane 예상 short 길이보다 과하게 길면, 그 pair를 그대로 믿지 않고 뒤쪽 top rim에서 예상 short 길이만큼만 내려오도록 clamp합니다. 이 보정은 `support.short_axis_pair_support.top_plane_extent_clamped`에 남습니다.
-9. model perimeter가 실제 mask edge와 얼마나 맞는지, line consensus가 얼마나 강한지, center가 이미지 안에 있는지를 confidence score와 failure reason으로 남깁니다.
+9. D405 depth와 부분 crop 때문에 pinhole 계산으로 나온 pixel 길이가 실제 rim보다 작게 보이는 프레임이 있습니다. 그래서 yaw는 5번의 dominant line cluster로 고정한 채, 박스 `long/short` pixel 길이에 공통 scale 후보 `0.84, 0.90, 0.96, 1.00, 1.04, 1.10, 1.16`을 적용해 여러 rectangle 후보를 만듭니다.
+10. 각 후보는 model perimeter가 실제 mask edge와 얼마나 붙는지, mask 내부를 얼마나 잘 지나가는지, edge까지 평균 거리가 얼마나 작은지, line consensus가 얼마나 강한지를 점수화합니다. 최종 선택은 `support.fit_search.selected_common_scale`, `support.fit_search.selected_score`에 남습니다.
+11. yaw 후보까지 자유롭게 흔드는 방식도 비교했지만, 일부 프레임에서 yaw가 불필요하게 바뀌었습니다. 현재 기본값은 yaw 안정성을 우선해서 dominant yaw를 유지하고 top-plane 크기/extent만 perimeter score로 고릅니다.
 
 축 이름은 다음 의미입니다.
 
@@ -75,6 +77,13 @@ frame별 주요 출력:
     "short_axis_image": [0.0, 1.0],
     "box_size_m": {"long": 0.505, "short": 0.335, "height": 0.195},
     "projection_plane": "box_top_plane",
+    "support": {
+      "fit_search": {
+        "selection": "yaw_scale_perimeter_search",
+        "selected_common_scale": 1.10,
+        "selected_yaw_delta_deg": 0.0
+      }
+    },
     "confidence": {"ok": true, "score": 0.86, "reasons": []}
   }
 }
@@ -540,6 +549,19 @@ d405_yaw_minus       known_size_ok=1.00  yaw_spread=23.16 deg
 ```
 
 `yaw_plus` / `yaw_minus`는 영상 안에서 실제로 회전시키는 구간이 포함되어 있으므로 spread가 큰 것이 정상입니다. `center/right/left`의 spread는 로봇 정면 방향 앞뒤 이동과 원근, line 선택 변화가 섞인 offline 지표입니다. 최종 `2 cm`, `4 deg` 판정은 camera-to-T5 및 table/top-plane calibration 이후 같은 frame pose를 T5 기준으로 비교해야 합니다.
+
+top-plane scale search를 넣은 최신 결과는 이전 fixed-size fit보다 mask/rim에 더 잘 붙습니다. 아래 값은 같은 녹화 5개를 `--stride 3 --view-rotation cw90`로 replay해서 `known_size.support.perimeter`를 평균낸 값입니다.
+
+```text
+session              edge_support  mask_support  mean_edge_dist  yaw_spread_delta
+d405_center_visible  +0.086        +0.088        -6.48 px        +0.00 deg
+d405_left_crop       +0.120        +0.106        -7.04 px        +0.00 deg
+d405_right_crop      +0.092        +0.086        -8.39 px        +0.00 deg
+d405_yaw_minus       +0.054        +0.061        -2.00 px        +0.00 deg
+d405_yaw_plus        +0.173        +0.155        -10.61 px       +0.00 deg
+```
+
+`yaw_spread_delta`가 0인 이유는 의도적으로 yaw 후보를 새로 탐색하지 않고 기존 dominant rim yaw를 유지했기 때문입니다. 이번 개선은 yaw를 흔들지 않으면서 자홍색 `known_size` top-plane rectangle이 실제 박스 테두리에 더 가깝게 붙도록 만든 변경입니다.
 
 debug overlay 색:
 
