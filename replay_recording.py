@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay a ZED recording session and estimate box yaw frame by frame."""
+"""Replay a D405 recording session and estimate box yaw frame by frame."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "session",
         nargs="?",
-        default="recordings/desk_a_box_static_001",
+        default="recordings/d405_box_static_001",
         help="Recording session directory containing manifest.json and index.jsonl.",
     )
     parser.add_argument("--output-dir", help="Analysis output directory. Defaults to <session>/analysis.")
@@ -62,9 +62,8 @@ def load_analysis_dependencies() -> AnalysisDependencies:
     except Exception as exc:
         raise SystemExit(
             "Failed to import OpenCV-based analysis dependencies. "
-            "Run replay_recording.py in the offline analysis environment, for example "
-            "`source ~/.venvs/keti-box-pose/bin/activate` with cv2 and numpy==1.26.4. "
-            "Do not use the pyzed/NumPy2 recording venv for this analysis step."
+            "Run replay_recording.py in the offline analysis environment with OpenCV and NumPy installed. "
+            "The RealSense recording environment can be reused if cv2 imports cleanly there."
         ) from exc
 
     return AnalysisDependencies(

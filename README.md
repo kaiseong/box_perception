@@ -1,1082 +1,275 @@
-# Pallet Box Yaw Vision
+# Box Perception
 
-RBY1 양팔 로봇이 노란 오픈탑 박스를 A 책상과 B 책상 사이에서 반복적으로 옮기는 작업을 위한 경량 vision prototype입니다.
+Intel RealSense D405로 노란 박스의 중심과 yaw를 추정하기 위한 녹화, replay, offline 분석 코드입니다.
 
-목표는 로봇 제어 명령을 만들지 않고, 박스를 안정적으로 양쪽 긴 변에서 잡기 위해 필요한 perception 정보만 계산하는 것입니다.
+현재 1차 목표는 **다양한 D405 RGB-D 상황을 재현 가능한 dataset으로 녹화**하는 것입니다. 이후 추정기는 이 녹화 데이터에서 RGB 색상/edge, 고정 table/box height, D405 depth 품질 검증을 조합해 `center + yaw + confidence`를 출력하도록 확장합니다.
 
-- 박스 중심점
-- 박스의 긴 축 yaw
-- 긴 축에 수직인 grasp 축
-- confidence와 실패 이유
-- Phase 1에서는 카메라/T5 기준 metric pose
+## 현재 전제
 
-현재 구현은 Jetson Orin AGX에서 dependency 문제를 줄이기 위해 OpenCV + NumPy만 사용합니다. 첫 구현에서는 YOLO, FoundationPose, Open3D registration을 쓰지 않았습니다.
+- 카메라: Intel RealSense D405
+- Jetson: Orin AGX
+- 해상도: 기본 `1280x720`
+- 박스: 크기 고정, 노란/주황색 플라스틱 박스
+- 박스 중심: 화면 안에 들어온다고 가정
+- 박스는 완전히 보일 수도 있고, 일부가 잘릴 수도 있고, 양쪽이 잘릴 수도 있음
+- 박스 안에는 물건이 있을 수 있지만 박스 위로 튀어나오지는 않음
+- 책상 높이와 박스 중심 높이는 고정값으로 둘 수 있음
+- `camera-to-T5` transform은 외부 calibration 파라미터로 나중에 제공
+- 허용 오차: 중심 `2 cm`, yaw `4 deg`
+- 1차 구현 범위: 학습 모델 없이 RGB-D 기하 기반
 
-## 결과 미리보기
+## 권장 추정 방향
 
-아래 3개 이미지는 현재 오프라인 smoke run으로 생성된 결과입니다.
+잘린 RGB mask의 bbox/OBB 중심은 실제 박스 중심이 아닐 수 있습니다. 그래서 최종 추정은 단순 `minAreaRect(mask)`가 아니라 아래 방향으로 가야 합니다.
 
-| 입력 이미지 | HSV/connected-component 마스크 | Debug overlay |
-| --- | --- | --- |
-| <img src="./pallet_box.png" width="260"> | <img src="./pallet_box_mask.png" width="260"> | <img src="./pallet_box_debug.png" width="260"> |
+```text
+D405 RGB
+  -> yellow/orange mask 및 edge/rim 후보
+  -> image ray를 고정 table/box height plane에 투영
+  -> 실제 박스 크기의 rectangle model을 부분 관측에 fitting
+  -> center, yaw, confidence, reasons 출력
 
-Debug overlay 해석:
+D405 depth
+  -> pose를 직접 오염시키는 주 입력으로 쓰지 않음
+  -> depth valid ratio, median, spread, 주변 일관성으로 confidence 검증
+```
 
-- 초록색 사각형: segmented box contour에서 계산한 pixel OBB
-- 흰 점: pixel OBB 중심
-- 파란 화살표 `long`: 박스의 긴 축
-- 빨간 화살표 `grasp`: 긴 축에 수직인 짧은 축, 즉 양손을 모을 방향
-- 좌상단 텍스트: image-frame yaw와 confidence
+D405 depth는 너무 가깝거나 멀 때, 얇은 테두리/반사/구멍/내부 물품 때문에 흔들릴 수 있습니다. 따라서 1차 추정에서는 **고정 높이 기반 center/yaw를 기본값**으로 두고, raw depth는 `depth_unreliable` 같은 reason과 confidence 조정에 사용합니다.
 
-현재 `pallet_box.png` 기준 오프라인 출력의 핵심 값:
+출력 계약은 항상 best-effort pose를 반환하는 형태가 좋습니다.
 
 ```json
 {
-  "confidence": {"ok": true, "score": 0.867, "reasons": []},
-  "yaw_frame": "image",
-  "yaw_mod_180": 0.36034980284148743,
-  "pixel_obb": {
-    "center": [417.1156921386719, 322.607629776001],
-    "long_length_px": 680.0494604356386,
-    "short_length_px": 446.02255392882427,
-    "aspect_ratio": 1.5246974720120545,
-    "fill_ratio": 0.9424055550190638
-  },
-  "mask_stats": {
-    "dominant_area": 286886,
-    "dominant_fraction": 1.0,
-    "significant_components": 1
+  "center_image": [640.0, 360.0],
+  "center_camera_m": [0.12, -0.03, 0.48],
+  "yaw_mod_180_deg": 3.2,
+  "confidence": {
+    "score": 0.82,
+    "meets_grasp_quality": true,
+    "reasons": []
   }
 }
 ```
 
-중요: 위 값은 Phase 0 image-frame pixel 결과입니다. centimeter 단위 정확도 주장을 하지 않습니다.
-
-## 구현 파일 구조
+## Repository Layout
 
 ```text
-box_perception/
-  README.md
-  demo_offline.py
-  recording.py
-  replay_recording.py
-  pallet_box.png
-  pallet_box_mask.png
-  pallet_box_debug.png
-  box_pose/
-    __init__.py
-    segmentation.py
-    geometry.py
-    visualization.py
-  tests/
-    test_box_pose.py
+box_pose/
+  segmentation.py       HSV 기반 노란 박스 후보 mask
+  geometry.py           pixel/metric geometry helpers
+  visualization.py      debug overlay
+
+recording.py            D405 RGB/depth/intrinsics/timestamp 녹화 CLI
+replay_recording.py     녹화 session replay 및 frame별 분석
+demo_offline.py         단일 이미지 offline demo
+tests/                  unit tests
 ```
 
-역할:
+`recordings/`는 `.gitignore`에 포함되어 있어 대용량 녹화 데이터가 git에 섞이지 않습니다.
 
-- `box_pose/segmentation.py`: 노란 박스 HSV segmentation, morphology, largest component filtering, mask 통계
-- `box_pose/geometry.py`: pixel OBB yaw, metric RGB-D projection, table-plane fallback, confidence gates, output safety
-- `box_pose/visualization.py`: OBB/center/axis debug overlay
-- `demo_offline.py`: `pallet_box.png` 같은 정적 이미지용 Phase 0 CLI
-- `recording.py`: ZED RGB/depth/intrinsics/timestamp recording CLI
-- `replay_recording.py`: 녹화 session을 다시 읽어 frame별 mask/center/yaw/metric estimate/debug image 생성
-- `tests/test_box_pose.py`: synthetic/unit/offline/metric/safety tests
+## Jetson Installation
 
-## Jetson Orin AGX Installation
+아래는 Jetson Orin AGX에서 D405 녹화를 위한 기본 설치 흐름입니다. RealSense 설치 방식은 JetPack/kernel 상태에 따라 달라질 수 있으므로, 막히면 Intel RealSense 공식 librealsense 문서를 기준으로 맞춰야 합니다.
 
-이 프로젝트는 Jetson에서 dependency 충돌을 줄이기 위해 환경을 2개로 나눠 쓰는 것을 기본으로 합니다.
+참고한 공식 문서:
 
-```text
-offline analysis:
-  cv2 + numpy==1.26.4
-  demo_offline.py, replay_recording.py, tests
+- Linux installation: https://github.com/IntelRealSense/librealsense/blob/master/doc/installation.md
+- Jetson installation: https://github.com/IntelRealSense/librealsense/blob/master/doc/installation_jetson.md
+- Python wrapper: https://github.com/IntelRealSense/librealsense/blob/master/wrappers/python/readme.md
+- Depth-to-color alignment example: https://github.com/IntelRealSense/librealsense/blob/master/wrappers/python/examples/align-depth2color.py
 
-zed recording:
-  pyzed==5.4 + numpy==2.x
-  recording.py, RGB/depth dataset capture
-```
-
-`pyzed`와 Jetson OpenCV를 한 venv에 같이 넣으면 NumPy ABI 충돌이 쉽게 납니다. 특히 ZED Python API 5.4는 `numpy>=2.0,<3.0`을 요구하고, Jetson apt OpenCV는 NumPy 1.x ABI로 빌드된 경우가 많았습니다.
-
-### 실제 Jetson 설치 순서
-
-아래 순서는 Jetson Orin AGX, L4T 36.5, ZED SDK 5.4 기준으로 정리한 현재 권장 경로입니다.
-
-1. Repository 받기
+### 1. Repo 준비
 
 ```bash
 cd ~
 git clone https://github.com/kaiseong/box_perception.git
-cd ~/box_perception
+cd box_perception
 ```
 
-이미 clone되어 있으면:
+이미 받아둔 repo라면:
 
 ```bash
 cd ~/box_perception
 git pull
 ```
 
-2. Offline analysis venv 만들기
+### 2. Python venv
 
-이 환경은 OpenCV 기반 segmentation, replay 분석, unittest용입니다.
+```bash
+cd ~/box_perception
+python3 -m venv .venv --system-site-packages
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install "numpy<2" opencv-python
+```
+
+Jetson에서 apt OpenCV를 쓸 때는 `opencv-python` wheel 대신 system OpenCV가 잡히는 편이 나을 수 있습니다. 이 경우 `--system-site-packages` venv에서 아래 확인만 통과하면 됩니다.
+
+```bash
+python - <<'PY'
+import sys
+import cv2
+import numpy as np
+print("python", sys.version)
+print("opencv", cv2.__version__)
+print("numpy", np.__version__)
+PY
+```
+
+### 3. librealsense / pyrealsense2 설치 확인
+
+먼저 설치 여부를 확인합니다.
+
+```bash
+python - <<'PY'
+import pyrealsense2 as rs
+print("pyrealsense2 ok")
+print(rs.context().query_devices())
+PY
+```
+
+`ModuleNotFoundError: No module named 'pyrealsense2'`가 나오면 librealsense Python binding이 없는 상태입니다.
+
+가능하면 배포 패키지를 먼저 확인합니다.
+
+```bash
+apt-cache search realsense | sort
+```
+
+패키지가 제공되는 환경이면 system package로 설치하는 쪽이 가장 단순합니다.
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3-venv python3-pip python3-opencv
-
-python3 -m venv ~/.venvs/keti-box-pose --system-site-packages
-source ~/.venvs/keti-box-pose/bin/activate
-python -m pip install -U pip
-python -m pip install "numpy==1.26.4"
+sudo apt-get install -y librealsense2-utils librealsense2-dev
 ```
 
-확인:
+Python binding 패키지가 따로 제공되면 같이 설치합니다.
 
 ```bash
-python - <<'PY'
-import sys
-import cv2
-import numpy as np
-
-print("python", sys.version)
-print("opencv", cv2.__version__)
-print("numpy", np.__version__)
-PY
+sudo apt-get install -y python3-pyrealsense2
 ```
 
-3. Offline smoke/test
+패키지가 없거나 Jetson kernel/JetPack 조합 때문에 동작하지 않으면 공식 문서 기준으로 source build를 사용합니다.
 
 ```bash
-cd ~/box_perception
-source ~/.venvs/keti-box-pose/bin/activate
-
-python -m py_compile demo_offline.py recording.py replay_recording.py box_pose/*.py tests/*.py
-python -m unittest discover -s tests -v
-python demo_offline.py \
-  --image pallet_box.png \
-  --save-debug pallet_box_debug.png \
-  --mask-output pallet_box_mask.png
-```
-
-4. ZED SDK 설치
-
-Jetson 버전 확인:
-
-```bash
-cat /etc/nv_tegra_release
-```
-
-실제 사용한 Jetson은 L4T 36.5였고, installer는 아래 파일이었습니다.
-
-```text
-ZED_SDK_Tegra_L4T36.5_v5.4.0.zstd.run
-```
-
-다른 PC에서 복사:
-
-```bash
-rsync -avP kgs@192.168.0.45:/home/kgs/ZED_SDK_Tegra_L4T36.5_v5.4.0.zstd.run /home/nvidia/
-```
-
-설치:
-
-```bash
-cd /home/nvidia
-chmod +x ZED_SDK_Tegra_L4T36.5_v5.4.0.zstd.run
-./ZED_SDK_Tegra_L4T36.5_v5.4.0.zstd.run
-```
-
-설치 중 선택 기준:
-
-- EULA: `y`
-- CUDA 12.6 자동 설치 질문: CUDA가 없으면 `y`
-- samples/dependencies 설치: `y` 권장
-- Python API 설치: 신규 설치라면 여기서 건너뛰고 아래 `.zedvenv`에서 설치해도 됩니다. 이미 진행했다면 해당 active venv를 recording 전용으로 쓰면 됩니다.
-- AI model/ZED Diagnostic model download: `ULTRA` depth 녹화만 할 때는 필수 아님. `NEURAL` depth나 ZED AI 기능을 쓸 예정이면 `y`, 아니면 `n`이어도 됩니다.
-
-CUDA/ZED/udev 설치 후에는 재부팅합니다.
-
-```bash
-sudo reboot
-```
-
-재부팅 후 ZED SDK 파일 확인:
-
-```bash
-ls /usr/local/zed/get_python_api.py
-```
-
-5. ZED recording venv 만들기
-
-```bash
-cd ~/box_perception
-python3 -m venv .zedvenv --system-site-packages
-source .zedvenv/bin/activate
-python -m pip install -U pip
-python /usr/local/zed/get_python_api.py
-```
-
-확인:
-
-```bash
-python - <<'PY'
-import pyzed.sl as sl
-import numpy as np
-
-print("pyzed ok", sl.Camera)
-print("numpy", np.__version__)
-PY
-```
-
-이미 설치 중 `~/.venvs`에 pyzed가 들어갔다면 임시로 그 환경을 recording 전용으로 써도 됩니다.
-
-```bash
-source ~/.venvs/bin/activate
-```
-
-6. ZED 연결 확인
-
-카메라가 OS에 보이지 않으면 `recording.py`는 열 수 없습니다.
-
-```bash
-lsusb
-ls -l /dev/video*
-```
-
-`lsusb`에 ZED/Stereolabs 장치가 안 보이면 USB3 포트, 케이블, 전원, 허브 사용 여부를 먼저 확인합니다. 설치 직후라면 재부팅도 필요합니다.
-
-7. 녹화 실행
-
-```bash
-cd ~/box_perception
-source .zedvenv/bin/activate
-
-python recording.py \
-  --output-root recordings \
-  --session-name desk_a_box_static_001 \
-  --resolution HD720 \
-  --depth-mode ULTRA \
-  --fps 15 \
-  --duration-sec 20
-```
-
-`CAMERA STREAM FAILED TO START`가 나면 `--fps 0`으로 SDK 기본값을 시도합니다.
-
-```bash
-python recording.py \
-  --output-root recordings \
-  --session-name desk_a_box_static_001_auto_fps \
-  --resolution HD720 \
-  --depth-mode ULTRA \
-  --fps 0 \
-  --duration-sec 20
-```
-
-8. 녹화 session replay 분석
-
-분석은 다시 offline analysis venv에서 실행합니다.
-
-```bash
-cd ~/box_perception
-source ~/.venvs/keti-box-pose/bin/activate
-
-python replay_recording.py recordings/desk_a_box_static_001 \
-  --debug-every 10 \
-  --save-mask
-```
-
-결과:
-
-```bash
-cat recordings/desk_a_box_static_001/analysis/summary.json
-ls recordings/desk_a_box_static_001/analysis/debug | head
-```
-
-현재 구현의 runtime dependency는 작게 유지했습니다.
-
-필수:
-
-- Python 3.10 이상
-- NumPy
-- OpenCV Python binding, 즉 `cv2`
-
-선택:
-
-- `pytest`: test runner로 쓰고 싶을 때만 필요합니다. 기본 검증은 `unittest`로도 됩니다.
-- ZED SDK / `pyzed`: ZED 녹화(`recording.py`)가 필요할 때만 설치합니다. offline demo, replay 분석, core geometry test에는 필요 없습니다.
-
-### Python version 주의
-
-이 코드는 Python 3.10 문법을 사용합니다.
-
-예:
-
-```python
-np.ndarray | None
-CameraIntrinsics | dict[str, Any]
-```
-
-따라서 JetPack 6 계열처럼 기본 Python이 3.10이면 그대로 쓰기 쉽습니다. JetPack 5 계열처럼 기본 Python이 3.8이면 두 가지 중 하나를 선택해야 합니다.
-
-1. Miniforge/conda 등으로 Python 3.10 이상 환경을 만든다.
-2. 코드의 type hint를 Python 3.8 호환 문법으로 바꾼다.
-
-권장 경로는 1번입니다. 실제 로봇 쪽 dependency와 분리하기 쉽고, 이 prototype의 dependency가 작아서 환경 관리가 단순합니다.
-
-### Option A: JetPack 6 / Python 3.10 system venv
-
-Jetson의 system OpenCV를 쓰는 방식입니다. Jetson에서는 `pip install opencv-python`이 오래 걸리거나 binary 문제가 날 수 있으므로, 가능하면 JetPack/apt가 제공하는 OpenCV를 먼저 씁니다.
-
-```bash
+cd ~
 sudo apt-get update
-sudo apt-get install -y python3-venv python3-pip python3-opencv
+sudo apt-get install -y \
+  git cmake build-essential pkg-config \
+  libssl-dev libusb-1.0-0-dev libudev-dev \
+  libgtk-3-dev libglfw3-dev libgl1-mesa-dev libglu1-mesa-dev \
+  python3-dev python3-pip
 
-cd ~/box_perception
-python3 -m venv ~/.venvs/keti-box-pose --system-site-packages
-source ~/.venvs/keti-box-pose/bin/activate
+git clone https://github.com/IntelRealSense/librealsense.git
+cd librealsense
+./scripts/setup_udev_rules.sh
 
-python -m pip install -U pip
-python -m pip install "numpy==1.26.4"
+mkdir -p build
+cd build
+cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_PYTHON_BINDINGS=ON \
+  -DBUILD_EXAMPLES=ON \
+  -DBUILD_GRAPHICAL_EXAMPLES=OFF
+make -j"$(nproc)"
+sudo make install
+sudo ldconfig
 ```
 
-설치 확인:
+설치 후 터미널을 새로 열거나 venv를 다시 activate한 뒤 확인합니다.
 
 ```bash
+cd ~/box_perception
+source .venv/bin/activate
 python - <<'PY'
-import sys
-import cv2
-import numpy as np
-
-print("python", sys.version)
-print("opencv", cv2.__version__)
-print("numpy", np.__version__)
+import pyrealsense2 as rs
+ctx = rs.context()
+devices = ctx.query_devices()
+print("device_count", len(devices))
+for dev in devices:
+    print(dev.get_info(rs.camera_info.name), dev.get_info(rs.camera_info.serial_number))
 PY
 ```
 
-`python` version이 3.10 이상이고 `numpy`가 1.26.4 계열이면 offline 분석 환경으로 사용합니다. 이 환경에는 `pyzed`와 `rby1-sdk`를 같이 넣지 않는 편이 안전합니다.
-
-### Option B: JetPack 5 / Python 3.8 기본 환경일 때
-
-JetPack 5의 기본 Python 3.8에서 이 코드를 그대로 실행하면 syntax error가 날 수 있습니다. 이 경우 Python 3.10 이상 conda 환경을 따로 만듭니다.
-
-Miniforge가 이미 설치되어 있다고 가정하면:
+GUI가 가능한 환경이면 `realsense-viewer`로 D405가 보이는지 확인합니다.
 
 ```bash
-conda create -n keti-box-pose python=3.10 -y
-conda activate keti-box-pose
-conda install -c conda-forge numpy opencv -y
+realsense-viewer
 ```
 
-설치 확인:
+headless/SSH 환경에서는 GUI가 안 뜰 수 있으므로 Python import와 device enumeration만 먼저 확인하면 됩니다.
 
-```bash
-python - <<'PY'
-import sys
-import cv2
-import numpy as np
+## D405 Recording
 
-print("python", sys.version)
-print("opencv", cv2.__version__)
-print("numpy", np.__version__)
-PY
-```
-
-만약 conda의 OpenCV 설치가 Jetson에서 맞지 않으면, system Python 3.10을 별도로 준비하거나 JetPack을 Python 3.10 기반으로 맞추는 편이 낫습니다. 이 prototype은 OpenCV의 CUDA 기능을 쓰지 않으므로 `cv2.inRange`, morphology, contour, `minAreaRect`가 CPU에서 정상 동작하면 충분합니다.
-
-### Workspace 설치
-
-별도 package install은 아직 없습니다. `box_perception` repository root에서 바로 실행합니다.
+기본 녹화 명령:
 
 ```bash
 cd ~/box_perception
-python demo_offline.py \
-  --image pallet_box.png \
-  --save-debug pallet_box_debug.png \
-  --mask-output pallet_box_mask.png
-```
-
-성공 조건:
-
-- exit code 0
-- JSON의 `confidence.ok`가 `true`
-- `pallet_box_debug.png` 생성
-- `pallet_box_mask.png` 생성
-
-현재 reference image 기준 기대되는 대략적 출력:
-
-```text
-yaw_frame = image
-yaw_mod_180 ~= 0.36 deg
-dominant_area ~= 286886
-significant_components = 1
-confidence.ok = true
-```
-
-### 테스트 실행
-
-`pytest` 없이도 표준 라이브러리 `unittest`로 테스트할 수 있습니다.
-
-```bash
-cd ~/box_perception
-python -m py_compile demo_offline.py recording.py replay_recording.py box_pose/*.py tests/*.py
-python -m unittest discover -s tests -v
-```
-
-`pytest`를 쓰고 싶으면:
-
-```bash
-python -m pip install pytest
-python -m pytest tests -q
-```
-
-단, 현재 이 workspace의 활성 환경에서는 `pytest`가 설치되어 있지 않아 `unittest`로 검증했습니다.
-
-### ZED SDK는 언제 필요한가
-
-현재 구현은 아래 입력만 받으면 동작합니다.
-
-- BGR image
-- depth map in meters
-- camera intrinsics
-- optional `t5_T_camera`
-- optional table plane
-
-따라서 offline Phase 0와 synthetic Phase 1 test에는 ZED SDK가 필요 없습니다.
-
-Live ZED 연동을 시작할 때만 Jetson에 맞는 Stereolabs ZED SDK와 Python API를 설치하고, adapter에서 다음 값을 뽑아 core estimator에 넘기면 됩니다.
-
-```text
-zed_rgb_bgr -> segment_yellow_box()
-zed_depth_m -> estimate_metric_box()
-zed_intrinsics -> CameraIntrinsics
-fixed_head_pose -> t5_T_camera
-```
-
-ZED adapter를 추가하더라도 `box_pose/geometry.py`는 ZED SDK에 직접 의존하지 않게 유지하는 것이 좋습니다. 그래야 offline test와 robot/live dependency를 분리할 수 있습니다.
-
-### ZED SDK / pyzed 설치
-
-아래 에러가 나면 ZED SDK Python API가 현재 Python environment에 없는 상태입니다.
-
-```text
-ModuleNotFoundError: No module named 'pyzed'
-Failed to import pyzed.sl
-```
-
-먼저 ZED SDK 자체가 설치되어 있는지 확인합니다.
-
-```bash
-ls /usr/local/zed/get_python_api.py
-```
-
-파일이 없으면 Jetson에 맞는 Stereolabs ZED SDK를 먼저 설치해야 합니다.
-
-현재 Jetson 로그 기준:
-
-```text
-cat /etc/nv_tegra_release
-# R36 (release), REVISION: 5.0 ...
-```
-
-이 환경은 L4T 36.5 / JetPack 6 계열이므로 ZED SDK도 `Tegra_L4T36.5` installer를 써야 합니다. 실제로 사용한 installer 파일명은 아래였습니다.
-
-```text
-ZED_SDK_Tegra_L4T36.5_v5.4.0.zstd.run
-```
-
-다른 PC에서 installer를 복사할 때 파일 확장자까지 정확히 맞아야 합니다. 아래처럼 `.zstd`만 쓰면 remote 파일이 없어서 실패합니다.
-
-```text
-rsync: [sender] link_stat ".../ZED_SDK_Tegra_L4T36.5_v5.4.0.zstd" failed: No such file or directory (2)
-```
-
-정상 복사 예:
-
-```bash
-rsync -avP kgs@192.168.0.45:/home/kgs/ZED_SDK_Tegra_L4T36.5_v5.4.0.zstd.run /home/nvidia/
-```
-
-installer가 어디 있는지 모르면 먼저 remote machine에서 찾습니다.
-
-```bash
-ssh kgs@192.168.0.45 'find /home/kgs -maxdepth 4 \( -iname "*ZED*SDK*" -o -iname "*zed*" \) -print'
-```
-
-복사 후 설치:
-
-```bash
-cd /home/nvidia
-chmod +x ZED_SDK_Tegra_L4T36.5_v5.4.0.zstd.run
-./ZED_SDK_Tegra_L4T36.5_v5.4.0.zstd.run
-```
-
-실제 설치 중 확인된 흐름:
-
-- EULA accept
-- install path: `/usr/local/zed`
-- CUDA 12.6이 없으면 installer가 `CUDA 12.6 required`라고 안내하고 자동 설치 여부를 묻습니다.
-- `Y`를 누르면 Jetson apt repo에서 CUDA 12.6 / cuDNN / TensorRT / OpenCV / VPI / JetPack dev package 등을 크게 설치합니다.
-- 다운로드 크기는 약 3.8 GB, 설치 후 추가 공간은 약 9 GB 이상이었습니다.
-- samples 설치와 dependency auto-install은 `Y`로 진행해도 됩니다.
-- Python API 설치 질문이 나오면 `Y`, python executable은 보통 `python3`로 입력합니다.
-- NEURAL depth model 최적화 질문은 `Y`로 미리 해두면 첫 runtime startup 지연을 줄일 수 있습니다.
-
-설치가 끝나면 아래 파일이 있어야 합니다.
-
-```bash
-ls /usr/local/zed/get_python_api.py
-```
-
-ZED SDK가 설치되어 있으면 recording 전용 venv를 따로 만드는 것을 권장합니다.
-
-```bash
-cd ~/box_perception
-
-python3 -m venv .zedvenv --system-site-packages
-source .zedvenv/bin/activate
-python -m pip install -U pip
-python /usr/local/zed/get_python_api.py
-```
-
-중요: 이미 `~/.venvs` 같은 기존 venv를 activate한 상태에서 installer의 Python API 설치를 진행했다면, pyzed는 그 venv에 설치됩니다. 실제 로그에서는 아래처럼 기존 NumPy 1.26.4가 제거되고 pyzed 요구사항 때문에 NumPy 2.2.6으로 올라갔습니다.
-
-```text
-Requirement already satisfied: numpy in /home/nvidia/.venvs/lib/python3.10/site-packages (1.26.4)
-Processing ./pyzed-5.4-cp310-cp310-linux_aarch64.whl
-Collecting numpy<3.0,>=2.0 (from pyzed==5.4)
-Successfully installed cython-3.2.8 numpy-2.2.6 pyzed-5.4
-```
-
-이 경우 그 venv는 recording 전용으로 취급하는 것이 안전합니다. OpenCV offline 분석용 venv는 별도로 만들고 NumPy 1.26.4를 사용합니다.
-
-설치 확인:
-
-```bash
-python - <<'PY'
-import pyzed.sl as sl
-
-print("pyzed ok")
-print(sl.Camera)
-PY
-```
-
-왜 `.zedvenv`를 따로 쓰는가:
-
-- ZED Python API는 최신 버전에서 NumPy 2.x를 요구할 수 있습니다.
-- Jetson system OpenCV 4.5.4는 NumPy 1.x ABI로 빌드된 경우가 많습니다.
-- 따라서 `cv2 + numpy==1.26.4` offline 분석 환경과 `pyzed==5.4 + numpy==2.2.6` recording 환경을 분리하는 편이 안전합니다.
-
-`recording.py`의 기본 RGB 저장 형식은 `.npy`라서 OpenCV를 import하지 않아도 녹화할 수 있습니다. `--rgb-format jpg/png` 또는 `--preview`를 쓸 때만 OpenCV가 필요합니다.
-
-현재 Jetson에서 이미 `~/.venvs`에 pyzed를 설치했다면 다음 순서로 계속 진행합니다.
-
-```bash
-cd ~/box_perception
-source ~/.venvs/bin/activate
-
-python - <<'PY'
-import pyzed.sl as sl
-import numpy as np
-
-print("pyzed ok", sl.Camera)
-print("numpy", np.__version__)
-PY
+source .venv/bin/activate
 
 python recording.py \
   --output-root recordings \
-  --session-name desk_a_box_static_001 \
-  --resolution HD720 \
-  --depth-mode ULTRA \
-  --fps 15 \
+  --session-name d405_box_static_001 \
+  --width 1280 \
+  --height 720 \
+  --fps 30 \
   --duration-sec 20
 ```
 
-이 recording 환경에서는 기본값인 `--rgb-format npy`를 유지합니다. `--preview`, `--rgb-format jpg`, `--rgb-format png`는 OpenCV import가 필요하므로 NumPy/OpenCV ABI 충돌이 다시 날 수 있습니다.
-
-### 자주 나는 설치 문제
-
-| 증상 | 원인 | 대응 |
-| --- | --- | --- |
-| `SyntaxError`가 `| None` 근처에서 발생 | Python 3.8 이하 | Python 3.10+ 환경 사용 |
-| `ModuleNotFoundError: No module named 'cv2'` | OpenCV Python binding 없음 | `python3-opencv` 설치 또는 conda `opencv` 설치 |
-| `ModuleNotFoundError: No module named 'pyzed'` | ZED Python API 없음 | ZED SDK 설치 후 `/usr/local/zed/get_python_api.py` 실행 |
-| `ModuleNotFoundError: No module named 'numpy'` | NumPy 없음 | `python -m pip install numpy` 또는 conda `numpy` 설치 |
-| `No module named pytest` | pytest 없음 | `unittest` 사용 또는 `python -m pip install pytest` |
-| `cv2.imread(...)`가 `None` | 실행 위치/path 문제 | `~/box_perception`에서 실행하거나 `--image` 절대경로 사용 |
-| `chmod: cannot access 'ZED_SDK_Tegra_L4T36*.run'` | 현재 directory에 installer 없음 | `/home/nvidia` 또는 실제 installer 위치로 이동 후 `ls ZED_SDK_Tegra_L4T36*` 확인 |
-| `rsync link_stat ... No such file or directory` | remote path 또는 파일명 오타 | `.zstd.run` 확장자까지 포함해서 다시 복사 |
-| `ERROR : failed to detect CUDA version` | CUDA 12.6 미설치 또는 path 미감지 | installer의 CUDA 12.6 자동 설치를 진행하거나 JetPack/CUDA 설치 확인 |
-| OpenCV/NumPy ABI 관련 import error | system package와 pip package 혼용 | 새 venv/conda env를 만들고 한 경로로 통일 |
-
-### NumPy 2.x와 Jetson OpenCV ABI 충돌
-
-Jetson에서 아래와 같은 에러가 나면 OpenCV와 NumPy ABI가 맞지 않는 상태입니다.
-
-```text
-A module that was compiled using NumPy 1.x cannot be run in NumPy 2.2.6
-AttributeError: _ARRAY_API not found
-ImportError: numpy.core.multiarray failed to import
-```
-
-대부분의 경우 원인은 venv 안의 `numpy==2.x`가 Jetson system/apt OpenCV보다 먼저 import되는 것입니다. Jetson의 `python3-opencv` 또는 오래된 `opencv-python` wheel은 NumPy 1.x ABI로 빌드된 경우가 많으므로, 이 prototype에서는 NumPy를 1.x로 고정하는 편이 가장 단순합니다.
-
-offline 분석용 venv 안에서 다음처럼 정리합니다.
+여러 상황을 모을 때는 session name을 바꿉니다.
 
 ```bash
-source ~/.venvs/keti-box-pose/bin/activate
-
-python -m pip uninstall -y numpy
-python -m pip install "numpy<2"
+python recording.py --output-root recordings --session-name d405_center_visible_full_001 --duration-sec 20
+python recording.py --output-root recordings --session-name d405_center_visible_left_crop_001 --duration-sec 20
+python recording.py --output-root recordings --session-name d405_center_visible_both_crop_001 --duration-sec 20
+python recording.py --output-root recordings --session-name d405_near_030cm_001 --duration-sec 20
+python recording.py --output-root recordings --session-name d405_far_065cm_001 --duration-sec 20
 ```
 
-좀 더 고정하고 싶으면 Python 3.10 기준으로 다음 버전을 사용합니다.
+기본값:
+
+- color stream: `1280x720`, `bgr8`, `30 fps`
+- depth stream: `1280x720`, `z16`, `30 fps`
+- depth는 color frame에 align
+- RGB 저장: `.npy`
+- depth 저장: `.npz`, meter 단위 `depth_m`
+- IR emitter는 가능한 경우 enabled
+
+저장 속도가 부족하면 depth 압축 비용을 줄입니다.
 
 ```bash
-python -m pip install "numpy==1.26.4"
+python recording.py \
+  --output-root recordings \
+  --session-name d405_fast_depth_001 \
+  --duration-sec 20 \
+  --depth-format npy
 ```
 
-그 다음 다시 확인합니다.
+미리보기 창이 필요한 경우:
 
 ```bash
-python - <<'PY'
-import sys
-import cv2
-import numpy as np
-
-print("python", sys.version)
-print("opencv", cv2.__version__)
-print("numpy", np.__version__)
-PY
+python recording.py \
+  --output-root recordings \
+  --session-name d405_preview_001 \
+  --duration-sec 20 \
+  --preview
 ```
 
-만약 여전히 깨지면 venv 안에 pip OpenCV와 apt OpenCV가 섞여 있을 수 있습니다. 아래를 확인합니다.
+`--preview`, `--rgb-format jpg`, `--rgb-format png`는 OpenCV image IO가 필요합니다. 녹화 안정성이 우선이면 기본 `.npy`를 유지합니다.
+
+카메라가 여러 대면 serial number를 지정합니다.
 
 ```bash
-python -m pip list | grep -E "numpy|opencv"
-python - <<'PY'
-import cv2
-print(cv2.__file__)
-PY
+python recording.py \
+  --output-root recordings \
+  --session-name d405_serial_test \
+  --serial-number 123456789 \
+  --duration-sec 20
 ```
 
-`opencv-python`, `opencv-contrib-python`, `opencv-python-headless`가 pip로 설치되어 있고 system OpenCV를 쓰고 싶다면 제거합니다.
+## Recording Output
 
-```bash
-python -m pip uninstall -y opencv-python opencv-contrib-python opencv-python-headless
-```
-
-그 후 해당 venv를 버리고 system package 접근 가능하게 다시 만드는 방식이 안정적입니다.
-
-```bash
-deactivate
-rm -rf ~/.venvs/keti-box-pose
-python3 -m venv ~/.venvs/keti-box-pose --system-site-packages
-source ~/.venvs/keti-box-pose/bin/activate
-python -m pip install "numpy==1.26.4"
-```
-
-이 에러는 이 perception 코드의 문제가 아니라 Jetson OpenCV 바이너리와 NumPy major version이 맞지 않아 생기는 설치 문제입니다.
-
-### RBY1 SDK와 같은 venv에 넣지 않는 것을 권장
-
-Jetson에서 다음과 같은 dependency conflict가 보일 수 있습니다.
-
-```text
-rby1-sdk 0.10.0 requires numpy<3.0.0,>=2.0.1,
-but you have numpy 1.26.4 which is incompatible.
-```
-
-이 경우 현재 venv는 OpenCV 4.5.4 import를 위해 NumPy 1.26.4를 쓰고 있고, `rby1-sdk`는 NumPy 2.x를 요구하는 상태입니다. ZED Python API 5.4도 `numpy>=2.0,<3.0`을 요구합니다. 세 조건은 같은 Python environment에서 동시에 만족하기 어렵습니다.
-
-권장 구조:
-
-```text
-offline analysis venv:
-  Python 3.10
-  OpenCV 4.5.4
-  NumPy 1.26.4
-  box_pose estimator
-
-zed recording venv:
-  Python 3.10
-  pyzed 5.4
-  NumPy 2.2.6
-  recording.py with --rgb-format npy
-
-robot/control venv:
-  rby1-sdk
-  NumPy 2.x
-  robot command / motion stack
-```
-
-이 repository의 estimator는 perception-only로 유지했으므로 robot SDK와 같은 process에 묶을 필요가 없습니다. Vision process는 `camera_T_box`, `t5_T_box`, `long_axis`, `grasp_axis`, `confidence` 같은 perception result만 JSON, socket, ROS topic, shared file 등으로 넘기고, robot/control process가 별도 환경에서 grasp planning과 RBY1 SDK command를 처리하는 구조가 안전합니다.
-
-현재 vision venv에서 아래 확인이 되면 이 estimator 실행에는 충분합니다.
-
-```text
-python 3.10.x
-opencv 4.5.4
-numpy 1.26.4
-```
-
-## 전체 파이프라인
-
-```mermaid
-flowchart LR
-    A[RGB image] --> B[HSV yellow/orange threshold]
-    B --> C[Morphology open/close]
-    C --> D[Largest connected component]
-    D --> E[Outer contour / convex hull]
-    E --> F[cv2.minAreaRect OBB]
-    F --> G[Normalize long/short axes]
-    G --> H[yaw_mod_180, center, confidence]
-    H --> I[Debug overlay + JSON output]
-```
-
-Phase 1 metric path는 depth와 intrinsics가 있을 때 별도로 동작합니다.
-
-```mermaid
-flowchart LR
-    A[Mask boundary pixels] --> B{Valid boundary depth >= N?}
-    B -- yes --> C[Backproject pixels to 3D]
-    B -- no + table plane --> D[Check sparse depth against plane]
-    D --> E[Intersect boundary rays with table plane]
-    C --> F[Fit/use table plane basis]
-    E --> F
-    F --> G[Project 3D boundary to plane 2D]
-    G --> H[2D OBB in table plane]
-    H --> I[Recover 3D center + axes]
-    I --> J[camera_T_box]
-    J --> K{t5_T_camera provided?}
-    K -- yes --> L[t5_T_box = t5_T_camera @ camera_T_box]
-    K -- no --> M[yaw_frame = camera_table_plane]
-```
-
-## Phase 0: Offline Pixel POC
-
-Phase 0는 단일 RGB 이미지에서 image-frame 기준의 pixel center와 yaw를 계산합니다.
-
-### 1. HSV segmentation
-
-구현: `segment_yellow_box()` in `box_pose/segmentation.py`
-
-기본 HSV threshold:
-
-```python
-lower_hsv = (5, 70, 70)
-upper_hsv = (45, 255, 255)
-```
-
-처리 순서:
-
-1. BGR 이미지를 HSV로 변환
-2. `cv2.inRange()`로 yellow/orange 영역 추출
-3. elliptical kernel size 7로 morphology open
-4. 같은 kernel로 morphology close
-5. connected components 계산
-6. 가장 큰 component만 최종 mask로 사용
-7. `MaskStats` 반환
-
-`MaskStats` 필드:
-
-```python
-MaskStats(
-    image_area: int,
-    total_mask_area: int,
-    dominant_area: int,
-    dominant_fraction: float,
-    significant_components: int,
-)
-```
-
-의도:
-
-- 작은 노란 잡음은 morphology와 largest component filtering으로 제거
-- 책상 위에 박스만 있다는 현재 조건에서는 HSV가 YOLO보다 훨씬 가볍고 dependency risk가 낮음
-- 이후 조명 변화가 커지면 YOLO segmentation을 Phase 2 fallback으로 붙일 수 있음
-
-### 2. Pixel OBB와 yaw 계산
-
-구현: `estimate_pixel_box()` in `box_pose/geometry.py`
-
-처리 순서:
-
-1. binary mask를 0/255 `uint8`로 정규화
-2. 가장 큰 contour 선택
-3. `cv2.minAreaRect(contour)`로 oriented bounding box 계산
-4. `cv2.boxPoints(rect)`로 4개 corner를 얻음
-5. corner 간 edge 길이를 직접 계산
-6. 가장 긴 edge를 `long_axis_image`로 선택
-7. 그에 직교하는 짧은 edge를 `grasp_axis_image`로 선택
-8. `atan2(long_axis.y, long_axis.x) % 180`으로 `yaw_mod_180` 계산
-
-여기서 중요한 점은 `cv2.minAreaRect`의 angle/width/height를 그대로 믿지 않는다는 것입니다. OpenCV는 각도에 따라 width/height가 swap되는 경우가 있어서, 구현은 항상 corner edge 길이를 다시 계산해서 가장 긴 edge를 long axis로 정합니다.
-
-그래서 박스가 0도, 90도 근처, 179도 근처에 있어도 long/short axis identity가 유지됩니다. 단, 박스가 거의 정사각형처럼 보이면 long/short 구분 자체가 불안정하므로 confidence를 낮춥니다.
-
-### 3. 180도 ambiguity 처리
-
-박스 grasp 관점에서는 yaw 0도와 yaw 180도는 같은 긴 축입니다.
-
-그래서 yaw는 항상 modulo 180으로 표현합니다.
-
-```python
-yaw_mod_180 = atan2(long_axis_y, long_axis_x) % 180.0
-```
-
-예:
-
-- 0도와 180도는 같은 축
-- 1도와 181도는 같은 축
-- 179도와 -1도는 같은 축
-
-박스를 긴 양쪽 변에서 집는 작업에서는 이 ambiguity가 문제가 되지 않습니다. 어느 손이 왼쪽/오른쪽을 잡을지는 downstream grasp planner가 로봇 base 기준 위치나 현재 hand 위치를 보고 정하면 됩니다.
-
-### 4. Phase 0 출력
-
-`PixelBoxEstimate.to_dict()`는 perception-only field만 반환합니다.
-
-```json
-{
-  "pixel_obb": {
-    "center": [x_px, y_px],
-    "corners": [[x0, y0], [x1, y1], [x2, y2], [x3, y3]],
-    "long_length_px": 680.0,
-    "short_length_px": 446.0,
-    "aspect_ratio": 1.52,
-    "fill_ratio": 0.94
-  },
-  "mask_stats": {...},
-  "confidence": {"ok": true, "score": 0.867, "reasons": []},
-  "yaw_mod_180": 0.36,
-  "yaw_frame": "image",
-  "long_axis_image": [0.99998, 0.00629],
-  "grasp_axis_image": [0.00629, -0.99998],
-  "failure_reasons": []
-}
-```
-
-Phase 0에는 아래 field가 없습니다.
-
-- `camera_T_box`
-- `t5_T_box`
-- `center_m`
-- `metric_tolerance_cm`
-
-이렇게 한 이유는 단일 RGB 이미지의 perspective OBB만으로는 책상 위 실제 중심을 cm 단위로 보장할 수 없기 때문입니다.
-
-## Phase 1: Metric RGB-D Estimator
-
-Phase 1는 ZED 같은 RGB-D 카메라에서 depth map과 camera intrinsics가 있을 때 사용하는 metric estimator입니다.
-
-구현: `estimate_metric_box()` in `box_pose/geometry.py`
-
-입력:
-
-```python
-estimate_metric_box(
-    mask: np.ndarray,
-    depth_m: np.ndarray,
-    intrinsics: CameraIntrinsics | dict,
-    t5_T_camera: np.ndarray | None = None,
-    table_plane: tuple[np.ndarray, np.ndarray] | None = None,
-    min_boundary_depth_points: int = 30,
-)
-```
-
-`CameraIntrinsics`:
-
-```python
-CameraIntrinsics(
-    fx: float,
-    fy: float,
-    cx: float,
-    cy: float,
-)
-```
-
-### 왜 boundary/rim depth만 쓰나?
-
-박스 안에는 3kg를 채우기 위한 물품이 들어갈 예정이고, 물품은 박스 윗단보다 낮게 둘 계획입니다.
-
-그래도 전체 mask 내부 point cloud를 PCA하면 내부 물품의 depth가 섞여 yaw/center를 오염시킬 수 있습니다. 그래서 metric pose는 full-mask PCA가 아니라 외곽 contour/convex hull boundary만 사용합니다.
-
-처리 순서:
-
-1. mask의 largest contour를 찾음
-2. contour의 convex hull boundary pixel을 그림
-3. boundary pixel의 valid depth만 backproject
-4. valid boundary depth가 충분하면 그 3D point로 진행
-5. valid boundary depth가 부족하고 `table_plane`이 있으면 ray-plane intersection 사용
-6. sparse valid depth가 하나라도 있으면 table plane과 3cm 이내로 일치하는지 먼저 검사
-7. 불일치하면 `depth_plane_inconsistent`로 fail closed
-8. table plane도 유효하지 않으면 `ok=false`
-
-### Table-plane fallback의 fail-safe 조건
-
-Depth가 sparse할 때 table plane fallback을 쓰지만, 아무 plane이나 무조건 믿지는 않습니다.
-
-검사:
-
-```python
-points_match_plane(points, table_plane, max_error_m=0.03)
-```
-
-즉 boundary depth sample이 조금이라도 있으면, 그 sample들이 주어진 table plane에서 3cm 이내인지 확인합니다.
-
-실패 reason:
-
-- `insufficient_boundary_depth`: boundary depth가 부족하고 table plane도 없음
-- `depth_plane_inconsistent`: sparse depth와 table plane이 불일치
-- `invalid_table_plane_fallback`: ray-plane intersection 결과가 유효하지 않음
-
-### Metric OBB 계산
-
-3D boundary point가 확보되면:
-
-1. table plane normal과 origin을 정함
-2. plane 위의 2D basis `u_axis`, `v_axis`를 만듦
-3. 3D boundary point를 plane 2D coordinate로 projection
-4. projected 2D point에 `cv2.minAreaRect` 적용
-5. 2D OBB center와 long/short axis를 다시 3D로 복원
-6. `camera_T_box` 생성
-
-`camera_T_box` 축 정의:
-
-```text
-camera_T_box[:3, 0] = short/grasp axis
-camera_T_box[:3, 1] = long axis
-camera_T_box[:3, 2] = table normal
-camera_T_box[:3, 3] = box center
-```
-
-즉 box local frame에서:
-
-- X축: grasp 방향, 박스 짧은 방향
-- Y축: 박스 긴 방향
-- Z축: table normal 방향
-
-### T5 transform
-
-`t5_T_camera`가 주어지면:
-
-```python
-t5_T_box = t5_T_camera @ camera_T_box
-```
-
-그리고 yaw frame은 `"t5"`로 표시합니다.
-
-`t5_T_camera`가 없으면:
-
-```text
-yaw_frame = "camera_table_plane"
-```
-
-이렇게 frame label을 명시해서, camera 기준 yaw와 robot/T5 기준 yaw를 섞지 않게 했습니다.
-
-## Confidence gates
-
-현재 기본 confidence gate는 보수적으로 잡았습니다.
-
-| Gate | 기본값 | 실패 reason |
-| --- | ---: | --- |
-| dominant component 면적 / image 면적 | `>= 0.03` | `mask_area_too_small` |
-| dominant component / total mask | `>= 0.70` | `dominant_component_too_weak` |
-| OBB aspect ratio | `>= 1.25` | `aspect_ratio_ambiguous` |
-| contour fill ratio | `>= 0.45` | `partial_or_sparse_contour` |
-| significant components | `<= 3` | `mask_fragmented` |
-| metric boundary depth samples | `>= 30` or valid table fallback | `insufficient_boundary_depth` |
-| metric projected aspect ratio | `>= 1.25` | `metric_aspect_ratio_ambiguous` |
-| metric short extent | `>= 0.02 m` | `boundary_support_biased` |
-| still-frame center spread | `<= 0.01 m` | `center_spread_too_large` |
-| still-frame yaw spread | `<= 5 deg` | `yaw_spread_too_large` |
-
-`confidence.score`는 gate를 통과하면 aspect ratio와 fill ratio를 반영해서 0.5 이상으로 계산하고, 실패 reason이 있으면 0.0입니다.
-
-## Still-frame spread check
-
-실제 ZED live frame에서는 한 프레임만 보고 바로 robot-facing integration으로 넘기면 위험합니다.
-
-그래서 다음 helper를 추가했습니다.
-
-```python
-evaluate_still_frame_spread(
-    centers_m,
-    yaws_deg,
-    max_center_spread_m=0.01,
-    max_yaw_spread_deg=5.0,
-)
-```
-
-의도:
-
-- 3-5개 still frame에서 center spread가 1cm 이하인지 확인
-- yaw spread가 5도 이하인지 확인
-- yaw는 modulo 180 기준으로 spread를 계산하므로 179도와 1도는 서로 가까운 방향으로 처리
-
-## Output safety
-
-이 패키지는 perception prototype입니다. 로봇을 움직이는 명령을 만들지 않습니다.
-
-`safe_output_dict()`는 아래 field가 output에 들어가면 예외를 발생시킵니다.
-
-```python
-FORBIDDEN_OUTPUT_FIELDS = {
-    "address",
-    "command_recommended",
-    "power",
-    "servo",
-    "target_t5_T_ee",
-}
-```
-
-중첩 dict/list 내부에 있어도 탐지합니다.
-
-테스트에서는 아래처럼 직접 검증합니다.
-
-```python
-with self.assertRaises(ValueError):
-    safe_output_dict({"target_t5_T_ee": np.eye(4).tolist()})
-
-with self.assertRaises(ValueError):
-    safe_output_dict({"debug": {"command": {"target_t5_T_ee": np.eye(4).tolist()}}})
-```
-
-허용되는 것은 pose/axis/confidence 같은 perception field입니다. RBY1 SDK call, servo on/off, power, end-effector target command는 이 repo의 책임 밖입니다.
-
-## 실행 방법
-
-현재 repository root에서 실행:
-
-```bash
-cd ~/box_perception
-python demo_offline.py \
-  --image pallet_box.png \
-  --save-debug pallet_box_debug.png \
-  --mask-output pallet_box_mask.png
-```
-
-성공하면 JSON이 stdout으로 출력되고, exit code 0을 반환합니다.
-
-Confidence가 실패하면 JSON은 출력하지만 exit code 2를 반환합니다.
-
-## ZED 녹화 데이터 만들기
-
-나중에 박스 중심점과 회전각을 안정적으로 테스트/시각화하려면 live camera frame을 바로 알고리즘에 물리기 전에 재현 가능한 recording dataset을 먼저 만들어 두는 편이 좋습니다.
-
-`recording.py`는 ZED에서 아래 정보를 동기화해서 한 session directory에 저장합니다.
-
-- left RGB image
-- depth map in meters
-- camera intrinsics
-- timestamp
-- frame index
-- per-frame depth statistics
-- recording config
-- camera metadata
-
-저장 구조:
+세션 구조:
 
 ```text
 recordings/<session_name>/
@@ -1085,515 +278,227 @@ recordings/<session_name>/
   rgb/
     frame_000000.npy
     frame_000001.npy
-    ...
   depth/
     frame_000000.depth.npz
     frame_000001.depth.npz
-    ...
 ```
 
-`recordings/`는 `.gitignore`에 들어가 있으므로 대용량 녹화 데이터가 git commit에 섞이지 않습니다.
+`manifest.json`에는 녹화 전체 metadata가 들어갑니다.
 
-### 기본 녹화 명령
+주요 필드:
 
-Jetson에서 ZED SDK Python API가 설치되어 있고 `pyzed.sl` import가 되는 환경에서 실행합니다.
+- `format_version`: `box-perception-recording-v2`
+- `config`: recording CLI 설정
+- `camera`: RealSense device name, serial, firmware, USB 정보
+- `intrinsics` / `color_intrinsics`: color camera intrinsics
+- `depth_intrinsics`: depth camera intrinsics
+- `depth_scale_m_per_unit`: raw z16 depth scale
+- `extrinsics`: color/depth stream 간 extrinsics
+- `data_layout.depth_aligned_to_color`: depth가 color frame에 align됐는지 여부
+
+`index.jsonl`은 frame별 record입니다.
+
+주요 필드:
+
+- `frame_id`
+- `wall_time`
+- `monotonic_time_sec`
+- `rgb_path`
+- `depth_path`
+- `image_shape`
+- `depth_shape`
+- `depth_stats`
+- `camera_metadata`
+
+`depth_stats`는 depth 품질 판단용으로 저장됩니다.
+
+- `valid_count`
+- `total_count`
+- `valid_fraction`
+- `min_m`
+- `max_m`
+- `mean_m`
+- `median_m`
+- `p05_m`
+- `p95_m`
+
+## Recording 검증
+
+녹화 후 바로 구조와 depth 값을 확인합니다.
 
 ```bash
-cd ~/box_perception
-source .zedvenv/bin/activate
-# 이미 ~/.venvs에 pyzed를 설치했다면 대신 source ~/.venvs/bin/activate
-
-python recording.py \
-  --output-root recordings \
-  --session-name box_table_test_001 \
-  --resolution HD720 \
-  --depth-mode ULTRA \
-  --fps 15 \
-  --duration-sec 30
-```
-
-또는 frame 수로 멈추려면:
-
-```bash
-python recording.py \
-  --output-root recordings \
-  --session-name box_table_test_001 \
-  --resolution HD720 \
-  --depth-mode ULTRA \
-  --fps 15 \
-  --max-frames 300
-```
-
-둘 중 하나의 stop condition은 반드시 필요합니다.
-
-- `--duration-sec`
-- `--max-frames`
-
-### 권장 녹화 조건
-
-처음에는 아래 정도로 시작합니다.
-
-```bash
-python recording.py \
-  --output-root recordings \
-  --session-name desk_a_box_static_001 \
-  --resolution HD720 \
-  --depth-mode ULTRA \
-  --fps 15 \
-  --duration-sec 20
-```
-
-권장 이유:
-
-- `HD720`: 처리/저장 부담과 해상도의 균형이 좋음
-- `ULTRA`: Jetson에서 `NEURAL` depth mode보다 dependency surprise가 적음
-- `fps 15`: ZED에서 흔히 지원되는 capture FPS라 stream start 실패 가능성이 낮음
-- `duration-sec 20`: 정지 박스, A/B 책상 위치, 조명 변화 테스트에 적당함
-
-ZED 모델/해상도마다 지원 FPS가 다릅니다. `CAMERA STREAM FAILED TO START`가 나면 `--fps 15` 또는 `--fps 0`을 먼저 시도합니다. `--fps 0`은 SDK 기본값을 쓰게 하는 옵션입니다.
-
-Preview가 필요하면:
-
-```bash
-python recording.py \
-  --output-root recordings \
-  --session-name desk_a_box_static_001 \
-  --resolution HD720 \
-  --depth-mode ULTRA \
-  --fps 15 \
-  --duration-sec 20 \
-  --preview
-```
-
-Preview 창에서 `q`를 누르면 녹화를 멈춥니다. SSH만 쓰는 환경에서는 `--preview`를 쓰지 않는 편이 안전합니다.
-
-### 저장 파일 의미
-
-`manifest.json`에는 recording 전체 metadata가 들어갑니다.
-
-중요 필드:
-
-```json
-{
-  "format_version": "box-perception-recording-v1",
-  "config": {
-    "resolution": "HD720",
-    "depth_mode": "ULTRA",
-    "fps": 15
-  },
-  "camera": {
-    "serial_number": 12345678,
-    "resolution": {"width": 1280, "height": 720}
-  },
-  "intrinsics": {
-    "fx": 0.0,
-    "fy": 0.0,
-    "cx": 0.0,
-    "cy": 0.0
-  }
-}
-```
-
-`index.jsonl`은 frame마다 한 줄씩 기록됩니다.
-
-예:
-
-```json
-{"frame_id":0,"rgb_path":"rgb/frame_000000.npy","depth_path":"depth/frame_000000.depth.npz","wall_time":"2026-07-01T00:00:00.000Z","depth_stats":{"valid_count":123456,"min_m":0.4,"max_m":2.1,"mean_m":1.0}}
-```
-
-RGB 파일은 기본적으로 BGR channel order의 NumPy array입니다.
-
-```python
-image_bgr = np.load("frame_000000.npy")
-```
-
-`--rgb-format jpg` 또는 `--rgb-format png`를 지정하면 OpenCV로 이미지 파일을 저장합니다. 다만 pyzed/NumPy2 recording environment에서는 Jetson OpenCV ABI 충돌을 피하기 위해 기본 `.npy` 저장을 권장합니다.
-
-Depth 파일은 기본적으로 compressed NumPy archive입니다.
-
-```python
-depth_m = np.load("frame_000000.depth.npz")["depth_m"]
-```
-
-저장 속도가 부족하면 `--depth-format npy`를 쓸 수 있습니다. 파일은 더 커지지만 압축 비용이 줄어듭니다.
-
-```bash
-python recording.py \
-  --output-root recordings \
-  --session-name fast_depth_test \
-  --resolution HD720 \
-  --depth-mode ULTRA \
-  --fps 15 \
-  --max-frames 300 \
-  --depth-format npy
-```
-
-### 녹화 결과 빠른 확인
-
-녹화가 끝나면 먼저 session 구조와 depth 유효값을 확인합니다.
-
-```bash
-cd ~/box_perception
-
-find recordings/desk_a_box_static_001 -maxdepth 2 -type f | head -20
 python - <<'PY'
 import json
 from pathlib import Path
 import numpy as np
 
-session = Path("recordings/desk_a_box_static_001")
+session = Path("recordings/d405_box_static_001")
 manifest = json.loads((session / "manifest.json").read_text())
-lines = (session / "index.jsonl").read_text().splitlines()
+records = [json.loads(line) for line in (session / "index.jsonl").read_text().splitlines()]
 
-print("frames", len(lines))
-print("config", manifest["config"])
-print("camera", manifest.get("camera", {}))
-print("intrinsics", manifest.get("intrinsics", {}))
+print("frames", len(records))
+print("format", manifest["format_version"])
+print("camera", manifest["camera"])
+print("intrinsics", manifest["intrinsics"])
+print("depth_scale", manifest["depth_scale_m_per_unit"])
 
-first = json.loads(lines[0])
+first = records[0]
 rgb = np.load(session / first["rgb_path"])
 depth = np.load(session / first["depth_path"])["depth_m"]
-finite = np.isfinite(depth)
+finite = np.isfinite(depth) & (depth > 0)
 
 print("first", first)
-print("rgb", rgb.shape, rgb.dtype, rgb.min(), rgb.max())
-print("depth", depth.shape, depth.dtype, "finite", int(finite.sum()))
-print("depth finite range", float(depth[finite].min()), float(depth[finite].max()))
+print("rgb", rgb.shape, rgb.dtype, int(rgb.min()), int(rgb.max()))
+print("depth", depth.shape, depth.dtype, "valid", int(finite.sum()), "/", depth.size)
+if finite.any():
+    print("depth finite range", float(depth[finite].min()), float(depth[finite].max()))
 PY
 ```
 
-해석:
+정상 기준:
 
-- `rgb (720, 1280, 3) uint8`이면 RGB 저장은 정상입니다.
-- `depth (720, 1280) float32`이고 `finite`가 충분히 크면 depth 저장은 정상입니다.
-- ZED depth에는 invalid value로 `inf` 또는 `-inf`가 들어올 수 있습니다. 분석 때는 `np.isfinite(depth)`로 걸러야 합니다.
-- 20초 녹화에서 frame 수가 요청 FPS보다 적으면 `.npz` 압축 저장 속도, USB bandwidth, depth computation 부하 중 하나가 병목일 수 있습니다. 더 높은 저장 FPS가 필요하면 `--depth-format npy`를 먼저 시도합니다.
+- `rgb` shape이 `(720, 1280, 3)`
+- `depth` shape이 `(720, 1280)`
+- `depth` dtype이 `float32`
+- `depth_stats.valid_fraction`이 충분히 큼
+- `median_m`이 실제 카메라-책상/박스 거리와 대략 맞음
 
-### 녹화 session replay 분석
+현재 측정된 작업 범위는 대략 다음 정도입니다.
 
-`replay_recording.py`는 녹화 session을 다시 읽어서 frame별 pixel/metric estimate를 생성합니다.
+- 가까운 상태: 약 `0.30 m`
+- 먼 상태: 약 `0.65 m`
 
-출력 구조:
+이 값은 로봇과 책상/박스 배치에 따라 바뀌므로 threshold로 하드코딩하지 않습니다. 대신 frame마다 depth 품질을 confidence에 반영합니다.
 
-```text
-recordings/<session_name>/analysis/
-  summary.json
-  frames.jsonl
-  debug/
-    frame_000000_debug.png
-    frame_000010_debug.png
-    ...
-  mask/                  # --save-mask를 켠 경우
-    frame_000000_mask.png
-    ...
-```
+## Replay
 
-실행:
+녹화 세션을 offline 환경에서 다시 분석합니다.
 
 ```bash
-cd ~/box_perception
-source ~/.venvs/keti-box-pose/bin/activate
-
-python replay_recording.py recordings/desk_a_box_static_001 \
-  --debug-every 10 \
+python replay_recording.py recordings/d405_box_static_001 \
+  --max-frames 50 \
+  --stride 3 \
+  --debug-every 5 \
   --save-mask
-```
-
-중요: `replay_recording.py`는 OpenCV 기반 segmentation을 사용하므로 `cv2 + numpy==1.26.4` offline 분석 환경에서 실행합니다. `pyzed + numpy==2.x` recording venv에서 실행하면 Jetson OpenCV ABI 문제로 실패할 수 있습니다.
-
-빠르게 일부 frame만 보려면:
-
-```bash
-python replay_recording.py recordings/desk_a_box_static_001 \
-  --max-frames 20 \
-  --stride 2 \
-  --debug-every 5
-```
-
-metric depth 쪽을 잠시 끄고 색상 mask/yaw만 보고 싶으면:
-
-```bash
-python replay_recording.py recordings/desk_a_box_static_001 \
-  --no-metric \
-  --debug-every 10
-```
-
-`summary.json`의 주요 필드:
-
-- `frames_analyzed`: 분석한 frame 수
-- `pixel_ok_frames`, `pixel_ok_fraction`: 색상 mask + OBB가 성공한 frame 수/비율
-- `metric_ok_frames`, `metric_ok_fraction`: depth/intrinsics metric estimate가 성공한 frame 수/비율
-- `pixel_yaw_mod_180`: image-frame yaw 통계
-- `metric_center_camera_m_mean`: metric 성공 frame들의 평균 camera-frame 중심
-- `metric_still_frame_spread`: still frame에서 center/yaw가 안정적인지 보는 gate
-
-### Python에서 녹화 데이터를 직접 쓰는 방식
-
-녹화 데이터는 아래 흐름으로 직접 재사용할 수도 있습니다.
-
-```python
-import json
-from pathlib import Path
-
-import cv2
-import numpy as np
-
-from box_pose import CameraIntrinsics, estimate_metric_box, estimate_pixel_box, segment_yellow_box
-
-session = Path("recordings/desk_a_box_static_001")
-manifest = json.loads((session / "manifest.json").read_text())
-intr = CameraIntrinsics.from_mapping(manifest["intrinsics"])
-
-with (session / "index.jsonl").open() as f:
-    first = json.loads(next(f))
-
-rgb_path = session / first["rgb_path"]
-if rgb_path.suffix == ".npy":
-    image = np.load(rgb_path)
-else:
-    image = cv2.imread(str(rgb_path), cv2.IMREAD_COLOR)
-depth = np.load(session / first["depth_path"])["depth_m"]
-
-mask, stats = segment_yellow_box(image)
-pixel_estimate = estimate_pixel_box(mask, stats)
-metric_estimate = estimate_metric_box(mask, depth, intr)
-```
-
-## Python에서 직접 사용
-
-Phase 0:
-
-```python
-import cv2
-
-from box_pose import estimate_pixel_box, segment_yellow_box
-
-image = cv2.imread("pallet_box.png", cv2.IMREAD_COLOR)
-mask, stats = segment_yellow_box(image)
-estimate = estimate_pixel_box(mask, stats)
-
-print(estimate.to_dict())
-```
-
-repository root인 `~/box_perception` 안에서 실행하면 바로 import할 수 있습니다. repo 밖에서 실행하려면 `box_perception` repo를 `PYTHONPATH`에 넣습니다.
-
-```bash
-PYTHONPATH=~/box_perception python your_script.py
-```
-
-Phase 1 synthetic usage:
-
-```python
-import numpy as np
-
-from box_pose import CameraIntrinsics, estimate_metric_box
-
-intr = CameraIntrinsics(fx=100.0, fy=100.0, cx=80.0, cy=80.0)
-estimate = estimate_metric_box(
-    mask=mask,
-    depth_m=depth_m,
-    intrinsics=intr,
-    table_plane=(np.array([0.0, 0.0, 1.0]), np.array([0.0, 0.0, 1.0])),
-)
-
-if estimate.confidence.ok:
-    camera_T_box = estimate.camera_T_box
-    long_axis_camera = estimate.long_axis_camera
-    grasp_axis_camera = estimate.grasp_axis_camera
-else:
-    print(estimate.failure_reasons)
-```
-
-## 테스트
-
-현재 검증한 명령:
-
-```bash
-python -m py_compile demo_offline.py recording.py replay_recording.py box_pose/*.py tests/*.py
-python -m unittest discover -s tests -v
-python demo_offline.py --image pallet_box.png --save-debug pallet_box_debug.png --mask-output pallet_box_mask.png
 ```
 
 결과:
 
-- `py_compile`: PASS
-- `unittest`: PASS, 36/36
-- offline smoke: PASS, `confidence.ok=true`, `yaw_mod_180=0.36034980284148743`
+```text
+recordings/<session_name>/analysis/
+  frames.jsonl
+  summary.json
+  debug/
+  mask/
+```
 
-현재 활성 Python environment에는 `pytest`가 설치되어 있지 않아 아래 명령은 실행되지 않았습니다.
+현재 replay는 기존 HSV segmentation과 pixel/metric geometry helper를 사용합니다. 부분 잘림까지 robust하게 처리하는 known-size rectangle fitting은 다음 구현 단계입니다.
+
+## Offline Demo
+
+단일 이미지 확인:
 
 ```bash
-python -m pytest tests -q
+python demo_offline.py pallet_box.png
 ```
 
-실패:
+생성물:
 
-```text
-No module named pytest
+- `pallet_box_mask.png`
+- `pallet_box_debug.png`
+- JSON 형태의 pixel OBB 결과
+
+이 demo는 전체 박스가 잘 보이는 정지 이미지 sanity check용입니다. 부분 잘림에서의 최종 중심 추정 기준으로 쓰면 안 됩니다.
+
+## Tests
+
+```bash
+python -m py_compile demo_offline.py recording.py replay_recording.py box_pose/*.py tests/*.py
+python -m unittest discover -s tests -v
 ```
 
-`unittest`만으로도 동일 테스트 파일은 모두 통과했습니다.
+RealSense 카메라 없이도 unit tests는 돌아가야 합니다. 실제 D405 접근은 `recording.py` runtime에서만 `pyrealsense2`를 import합니다.
 
-## 테스트가 커버하는 것
+## Troubleshooting
 
-테스트 파일들은 다음 항목을 검증합니다.
+### `ModuleNotFoundError: No module named 'pyrealsense2'`
 
-- HSV segmentation이 dominant yellow box를 유지하고 작은 yellow noise를 제거
-- synthetic rotated rectangle yaw가 +/-2도 이내
-- 0/1/89/90/91/179도 근처 yaw boundary
-- `cv2.minAreaRect` width/height swap에도 long axis identity 유지
-- long/grasp axis 2D orthogonality
-- near-square box는 low confidence
-- tiny mask는 `mask_area_too_small`
-- sparse/partial contour는 `partial_or_sparse_contour`
-- fragmented mask는 `mask_fragmented`
-- Phase 0 output은 image-frame only이며 metric field 없음
-- unsafe robot command field 차단
-- 실제 `pallet_box.png` segmentation/OBB smoke
-- metric RGB-D projection의 center/yaw/axis/physical dimension
-- boundary depth만 사용하고 내부 depth 오염을 피함
-- spatially biased boundary depth는 실패
-- table-plane fallback 성공/실패/불일치
-- `t5_T_box == t5_T_camera @ camera_T_box`
-- depth support 부족 실패
-- still-frame center/yaw spread gate
-- recording manifest/index/RGB/depth 저장 layout
-- replay session loader, frame stride/limit, yaw modulo-180 summary
+RealSense Python binding이 현재 venv에서 보이지 않는 상태입니다.
 
-## 왜 이 접근을 선택했나
+확인:
 
-현재 작업 조건:
-
-- 책상 위에 박스만 있음
-- 박스는 강한 yellow/orange 색
-- ZED가 머리에 고정각도로 장착됨
-- 박스 내부 물품은 윗단보다 낮게 둘 예정
-- 필요한 것은 full 6D object pose가 아니라 long-axis yaw와 center
-- tracking은 필요 없고 한 순간의 yaw만 필요
-- Jetson Orin AGX에서 dependency issue를 줄이는 것이 중요
-
-따라서 첫 구현은 learned model 없이 deterministic geometry로 충분히 시작할 수 있습니다.
-
-FoundationPose를 바로 쓰지 않은 이유:
-
-- full 6D pose에는 과함
-- one-shot yaw/center만 필요
-- TensorRT/CUDA/asset dependency가 커짐
-
-Open3D reference registration을 쓰지 않은 이유:
-
-- 열린 박스는 내부/외곽 관측 상태가 viewpoint와 내용물에 따라 달라짐
-- reference 한 장 기반 SE(3) matching은 현장 변화에 취약
-
-YOLO segmentation을 바로 쓰지 않은 이유:
-
-- 현재 장면 제약에서는 HSV가 더 가볍고 빠름
-- 학습/export/TensorRT 변환/Jetson 배포 이슈가 없음
-- 나중에 조명/배경/다중 객체 때문에 HSV가 깨질 때 같은 geometry backend 앞단만 YOLO mask로 교체 가능
-
-## 현재 한계
-
-1. Phase 0는 pixel/image-frame yaw만 제공합니다.
-   - 실제 로봇 grasp target으로 쓰려면 Phase 1 metric path가 필요합니다.
-
-2. HSV threshold는 조명 변화에 민감할 수 있습니다.
-   - 현재 `lower_hsv=(5,70,70)`, `upper_hsv=(45,255,255)`입니다.
-   - 실험실 조명이 바뀌면 threshold 조정 또는 YOLO mask fallback이 필요할 수 있습니다.
-
-3. Live ZED adapter는 아직 구현하지 않았습니다.
-   - 현재는 RGB image, depth map, intrinsics를 함수에 넣는 core estimator까지만 있습니다.
-
-4. Table plane은 외부에서 제공하거나 valid boundary depth로 plane fit해야 합니다.
-   - ZED live integration 때 table plane calibration/estimation 방식을 정해야 합니다.
-
-5. Metric output은 ZED depth 품질과 table plane 추정/보정에 영향을 받습니다.
-   - `camera_T_box`, metric axis, `long_length_m`, `short_length_m`는 출력하지만, 로봇 기준 pose 안정성은 실제 책상/조명/거리별 replay 검증이 필요합니다.
-   - fixed head `t5_T_camera`가 없으면 robot/T5 frame yaw가 아니라 camera/table-plane frame yaw입니다.
-
-6. 이 패키지는 grasp point를 만들지 않습니다.
-   - 양 end-effector 목표 위치, approach vector, force command, collision check는 downstream motion/grasp planner 책임입니다.
-
-## Live ZED로 확장할 때 필요한 다음 단계
-
-1. ZED frame capture adapter 추가
-   - RGB BGR image
-   - depth in meters
-   - camera intrinsics
-
-2. Head-mounted ZED의 `t5_T_camera` 확정
-   - fixed head pose preset 사용 또는 calibration 결과 입력
-
-3. Table plane 확보
-   - 고정 책상 높이/normal을 T5 frame에서 알고 있으면 camera frame으로 변환
-   - 또는 boundary/table samples로 plane fit
-
-4. 3-5개 still frame sampling
-   - `evaluate_still_frame_spread()`로 center/yaw 안정성 확인
-
-5. Metric output validation
-   - center spread <= 1cm
-   - yaw spread <= 5도
-   - debug overlay와 depth projection 시각 확인
-
-6. 그 다음에만 grasp planner와 연결
-   - 이 estimator는 `camera_T_box`/`t5_T_box`/axis만 넘기고 robot command는 만들지 않음
-
-## 자주 볼 failure reasons
-
-| Reason | 의미 | 대응 |
-| --- | --- | --- |
-| `no_contour` | mask에서 contour를 찾지 못함 | HSV threshold, image input 확인 |
-| `mask_area_too_small` | dominant object가 이미지의 3% 미만 | threshold, 거리, crop 확인 |
-| `dominant_component_too_weak` | mask가 여러 객체/잡음으로 분산됨 | morphology, threshold, 배경 확인 |
-| `mask_fragmented` | 큰 component가 너무 많음 | segmentation 품질 확인 |
-| `aspect_ratio_ambiguous` | long/short 구분이 어려움 | viewpoint, occlusion, box shape 확인 |
-| `partial_or_sparse_contour` | contour fill ratio가 낮음 | mask 구멍, partial detection 확인 |
-| `insufficient_boundary_depth` | boundary depth가 부족하고 fallback 없음 | ZED depth mode/table plane 확인 |
-| `depth_plane_inconsistent` | sparse depth와 table plane이 불일치 | plane calibration/depth 품질 확인 |
-| `invalid_table_plane_fallback` | ray-plane intersection이 유효하지 않음 | plane normal/origin 방향 확인 |
-| `boundary_support_biased` | depth support가 한쪽 edge에 치우침 | depth mask/boundary sampling 확인 |
-| `center_spread_too_large` | still-frame center가 1cm 이상 흔들림 | frame 안정성/segmentation/depth 확인 |
-| `yaw_spread_too_large` | still-frame yaw가 5도 이상 흔들림 | long-axis 안정성/near-square/perspective 확인 |
-
-## Grasp planner에 넘길 때의 해석
-
-이 estimator가 주는 핵심 axis는 다음과 같이 쓰면 됩니다.
-
-```text
-long_axis:  박스의 긴 방향
-grasp_axis: 양쪽 그리퍼가 서로 모일 방향
-center:     박스 중심
+```bash
+which python
+python -V
+python - <<'PY'
+import sys
+print(sys.path)
+PY
 ```
 
-양팔 grasp의 개념적 target은 downstream에서 보통 이렇게 만들 수 있습니다.
+source build를 했다면 `/usr/local/lib` 설치 후 `sudo ldconfig`를 실행하고, Python binding `.so`가 설치된 경로가 현재 Python path에 잡히는지 확인합니다.
 
-```text
-left/right grasp side = center +/- grasp_axis * half_width
-approach direction    = -/+ grasp_axis
-hand assignment       = robot base 기준 좌우 또는 현재 hand 거리로 결정
+### 카메라가 안 열림
+
+확인:
+
+```bash
+lsusb
+python - <<'PY'
+import pyrealsense2 as rs
+ctx = rs.context()
+devices = ctx.query_devices()
+print("device_count", len(devices))
+for dev in devices:
+    print(dev.get_info(rs.camera_info.name), dev.get_info(rs.camera_info.serial_number))
+PY
 ```
 
-하지만 이 repo는 위 target을 직접 출력하지 않습니다. 특히 `target_t5_T_ee` 같은 end-effector command field는 safety contract상 금지했습니다.
+대응:
 
-## 현재 완료 상태
+- USB3 포트/케이블 확인
+- 다른 process가 카메라를 잡고 있는지 확인
+- udev rules 적용 후 재연결 또는 재부팅
+- `realsense-viewer`가 떠 있으면 종료
 
-완료된 것:
+### 요청한 1280x720@30 profile이 안 열림
 
-- Phase 0 offline HSV + OBB estimator
-- 실제 `pallet_box.png` debug overlay
-- Phase 1 metric RGB-D geometry core
-- ZED RGB/depth/intrinsics/timestamp recording CLI
-- recording replay/visualization CLI
-- table-plane fallback과 inconsistency reject
-- still-frame spread confidence helper
-- perception-only output safety
-- unit/offline/synthetic metric/recording/replay tests
+D405 firmware/USB 상태에 따라 profile이 제한될 수 있습니다. 우선 낮은 profile로 확인합니다.
 
-아직 남은 것:
+```bash
+python recording.py \
+  --output-root recordings \
+  --session-name d405_profile_test \
+  --width 640 \
+  --height 480 \
+  --fps 30 \
+  --duration-sec 10
+```
 
-- live ZED adapter
-- fixed head `t5_T_camera` calibration 연결
-- table plane live estimation 또는 calibration source
-- downstream grasp planner integration
-- 필요 시 YOLO segmentation fallback
+이게 열리면 1280x720 쪽은 bandwidth/profile 문제일 가능성이 큽니다.
+
+### depth가 너무 sparse하거나 noisy함
+
+확인할 것:
+
+- 박스/책상까지 거리
+- IR emitter 설정
+- 노출/조명
+- 반사면
+- 너무 가까운 거리 또는 너무 먼 거리
+- depth frame이 color frame에 align되어 있는지
+
+이 프로젝트의 1차 추정 방향은 depth를 주 pose 입력으로 신뢰하지 않고 confidence 검증용으로 쓰는 것입니다. 따라서 depth가 흔들리면 pose를 망가뜨리지 말고 confidence reason을 남기는 쪽으로 처리해야 합니다.
+
+## Next Implementation Step
+
+녹화 데이터가 모이면 다음 순서로 구현합니다.
+
+1. D405 recording session replay에서 RGB/depth sample batch를 읽음
+2. HSV mask와 edge/rim 후보를 추출
+3. 카메라 intrinsics와 고정 table/box height로 image ray를 plane에 투영
+4. 실제 박스 크기 rectangle을 부분 관측에 robust fitting
+5. `center`, `yaw_mod_180`, `confidence`, `reasons`를 frame별로 저장
+6. `2 cm`, `4 deg` 기준으로 success/fail summary 생성
+
+학습 기반 segmentation은 1차 geometry path가 D405 데이터에서 실패하는 케이스가 확인된 뒤에 fallback으로 추가합니다.

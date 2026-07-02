@@ -28,8 +28,10 @@ class ReplayRecordingTests(unittest.TestCase):
             paths = prepare_session(tmp, "session_replay")
             manifest = build_manifest(
                 sample_config(),
-                camera_info={"serial_number": 15466, "camera_model": "ZED"},
+                camera_info={"serial_number": "15466", "camera_backend": "realsense", "name": "Intel RealSense D405"},
                 intrinsics={"fx": 667.0, "fy": 667.0, "cx": 669.0, "cy": 371.0},
+                depth_intrinsics={"fx": 667.0, "fy": 667.0, "cx": 669.0, "cy": 371.0},
+                depth_scale_m_per_unit=0.001,
                 started_at="2026-07-01T00:00:00.000Z",
             )
             paths.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -51,7 +53,7 @@ class ReplayRecordingTests(unittest.TestCase):
             loaded_manifest = load_manifest(session)
             records = iter_index_records(session)
 
-            self.assertEqual(loaded_manifest["camera"]["serial_number"], 15466)
+            self.assertEqual(loaded_manifest["camera"]["serial_number"], "15466")
             self.assertEqual(len(records), 1)
             np.testing.assert_array_equal(load_rgb_frame(session, records[0], cv2_module=None), bgr)
             np.testing.assert_array_equal(load_depth_frame(session, records[0]), depth)
@@ -94,9 +96,9 @@ def sample_config() -> RecordingConfig:
     return RecordingConfig(
         output_root="recordings",
         session_name="unit",
-        fps=15,
-        resolution="HD720",
-        depth_mode="ULTRA",
+        fps=30,
+        width=1280,
+        height=720,
         max_frames=None,
         duration_sec=20.0,
         warmup_frames=10,
@@ -105,6 +107,9 @@ def sample_config() -> RecordingConfig:
         jpeg_quality=95,
         preview=False,
         serial_number=None,
+        align_depth_to_color=True,
+        enable_emitter=True,
+        laser_power=None,
     )
 
 

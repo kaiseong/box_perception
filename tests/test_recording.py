@@ -21,64 +21,36 @@ from recording import (
     prepare_session,
     save_frame,
     should_continue,
-    zed_image_to_bgr,
 )
 
 
 class RecordingTests(unittest.TestCase):
-    def test_default_session_name_uses_utc_zed_prefix(self) -> None:
+    def test_default_session_name_uses_utc_d405_prefix(self) -> None:
         name = default_session_name()
 
-        self.assertTrue(name.startswith("zed_"))
+        self.assertTrue(name.startswith("d405_"))
         self.assertTrue(name.endswith("Z"))
 
     def test_config_requires_stop_condition(self) -> None:
-        args = type(
-            "Args",
-            (),
-            {
-                "output_root": "recordings",
-                "session_name": None,
-                "fps": 15,
-                "resolution": "HD720",
-                "depth_mode": "ULTRA",
-                "max_frames": None,
-                "duration_sec": None,
-                "warmup_frames": 10,
-                "rgb_format": "jpg",
-                "depth_format": "npz",
-                "jpeg_quality": 95,
-                "preview": False,
-                "serial_number": None,
-            },
-        )()
+        args = sample_args(max_frames=None, duration_sec=None)
 
         with self.assertRaises(ValueError):
             config_from_args(args)
 
-    def test_config_rejects_unsupported_camera_fps(self) -> None:
-        args = type(
-            "Args",
-            (),
-            {
-                "output_root": "recordings",
-                "session_name": None,
-                "fps": 10,
-                "resolution": "HD720",
-                "depth_mode": "ULTRA",
-                "max_frames": 1,
-                "duration_sec": None,
-                "warmup_frames": 10,
-                "rgb_format": "npy",
-                "depth_format": "npz",
-                "jpeg_quality": 95,
-                "preview": False,
-                "serial_number": None,
-            },
-        )()
+    def test_config_rejects_non_positive_fps(self) -> None:
+        args = sample_args(fps=0, max_frames=1)
 
-        with self.assertRaisesRegex(ValueError, "--fps must be one of"):
+        with self.assertRaisesRegex(ValueError, "--fps must be positive"):
             config_from_args(args)
+
+    def test_config_builds_d405_defaults(self) -> None:
+        config = config_from_args(sample_args(max_frames=10))
+
+        self.assertEqual(config.width, 1280)
+        self.assertEqual(config.height, 720)
+        self.assertEqual(config.fps, 30)
+        self.assertTrue(config.align_depth_to_color)
+        self.assertTrue(config.enable_emitter)
 
     def test_prepare_session_creates_expected_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -93,23 +65,30 @@ class RecordingTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 prepare_session(tmp, "session_a")
 
-    def test_build_manifest_captures_config_intrinsics_and_layout(self) -> None:
+    def test_build_manifest_captures_d405_metadata_and_layout(self) -> None:
         config = sample_config()
         manifest = build_manifest(
             config,
-            camera_info={"serial_number": 1234, "camera_model": "ZED-X"},
+            camera_info={"serial_number": "1234", "camera_backend": "realsense"},
             intrinsics={"fx": 100.0, "fy": 101.0, "cx": 50.0, "cy": 51.0},
+            depth_intrinsics={"fx": 98.0, "fy": 99.0, "cx": 48.0, "cy": 49.0},
+            depth_scale_m_per_unit=0.001,
+            extrinsics={"depth_to_color": {"translation_m": [0.0, 0.0, 0.0]}},
+            stream_profiles={"color": {"width": 1280, "height": 720, "fps": 30}},
             started_at="2026-07-01T00:00:00.000Z",
         )
 
         self.assertEqual(manifest["format_version"], FORMAT_VERSION)
         self.assertEqual(manifest["config"]["session_name"], "unit")
-        self.assertEqual(manifest["camera"]["serial_number"], 1234)
+        self.assertEqual(manifest["camera"]["camera_backend"], "realsense")
         self.assertEqual(manifest["intrinsics"]["fx"], 100.0)
+        self.assertEqual(manifest["depth_intrinsics"]["fx"], 98.0)
+        self.assertEqual(manifest["depth_scale_m_per_unit"], 0.001)
         self.assertEqual(manifest["data_layout"]["depth_units"], "meter")
+        self.assertTrue(manifest["data_layout"]["depth_aligned_to_color"])
         self.assertEqual(manifest["recording"]["frame_count"], 0)
 
-    def test_save_frame_writes_rgb_depth_and_index_record(self) -> None:
+    def test_save_frame_writes_rgb_depth_metadata_and_index_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = prepare_session(tmp, "session_b")
             bgr = np.zeros((4, 5, 3), dtype=np.uint8)
@@ -134,6 +113,7 @@ class RecordingTests(unittest.TestCase):
                 jpeg_quality=95,
                 wall_time="2026-07-01T00:00:00.000Z",
                 monotonic_time_sec=12.5,
+                camera_metadata={"color": {"frame_number": 10}, "depth": {"frame_number": 10}},
             )
 
             rgb_path = paths.session_dir / record["rgb_path"]
@@ -150,8 +130,11 @@ class RecordingTests(unittest.TestCase):
             self.assertEqual(index_record["rgb_path"], "rgb/frame_000000.png")
             self.assertEqual(index_record["depth_path"], "depth/frame_000000.depth.npz")
             self.assertEqual(index_record["depth_stats"]["valid_count"], 15)
+            self.assertEqual(index_record["depth_stats"]["total_count"], 20)
+            self.assertIn("median_m", index_record["depth_stats"])
+            self.assertEqual(index_record["camera_metadata"]["color"]["frame_number"], 10)
 
-    def test_save_frame_supports_rgb_npy_for_pyzed_numpy2_env(self) -> None:
+    def test_save_frame_supports_rgb_npy_without_opencv_io(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = prepare_session(tmp, "session_rgb_npy")
             bgr = np.arange(24, dtype=np.uint8).reshape(2, 4, 3)
@@ -173,27 +156,13 @@ class RecordingTests(unittest.TestCase):
             self.assertEqual(record["rgb_path"], "rgb/frame_000007.npy")
             np.testing.assert_array_equal(np.load(rgb_path), bgr)
 
-    def test_zed_bgra_image_conversion_drops_alpha_without_opencv(self) -> None:
-        bgra = np.zeros((2, 3, 4), dtype=np.uint8)
-        bgra[:, :, 0] = 10
-        bgra[:, :, 1] = 20
-        bgra[:, :, 2] = 30
-        bgra[:, :, 3] = 255
-
-        bgr = zed_image_to_bgr(bgra)
-
-        self.assertEqual(bgr.shape, (2, 3, 3))
-        self.assertTrue(np.all(bgr[:, :, 0] == 10))
-        self.assertTrue(np.all(bgr[:, :, 1] == 20))
-        self.assertTrue(np.all(bgr[:, :, 2] == 30))
-
     def test_depth_statistics_handles_empty_depth(self) -> None:
         stats = depth_statistics(np.zeros((3, 4), dtype=np.float32))
 
         self.assertEqual(stats["valid_count"], 0)
+        self.assertEqual(stats["total_count"], 12)
+        self.assertEqual(stats["valid_fraction"], 0.0)
         self.assertIsNone(stats["min_m"])
-        self.assertIsNone(stats["max_m"])
-        self.assertIsNone(stats["mean_m"])
 
     def test_should_continue_honors_frame_and_duration_limits(self) -> None:
         config = sample_config(max_frames=3, duration_sec=10.0)
@@ -203,13 +172,36 @@ class RecordingTests(unittest.TestCase):
         self.assertFalse(should_continue(2, 10.0, config))
 
 
+def sample_args(**overrides: object) -> object:
+    values = {
+        "output_root": "recordings",
+        "session_name": None,
+        "fps": 30,
+        "width": 1280,
+        "height": 720,
+        "max_frames": None,
+        "duration_sec": None,
+        "warmup_frames": 30,
+        "rgb_format": "npy",
+        "depth_format": "npz",
+        "jpeg_quality": 95,
+        "preview": False,
+        "serial_number": None,
+        "no_align_depth": False,
+        "disable_emitter": False,
+        "laser_power": None,
+    }
+    values.update(overrides)
+    return type("Args", (), values)()
+
+
 def sample_config(max_frames: int | None = 10, duration_sec: float | None = None) -> RecordingConfig:
     return RecordingConfig(
         output_root="recordings",
         session_name="unit",
-        fps=15,
-        resolution="HD720",
-        depth_mode="ULTRA",
+        fps=30,
+        width=1280,
+        height=720,
         max_frames=max_frames,
         duration_sec=duration_sec,
         warmup_frames=0,
@@ -218,6 +210,9 @@ def sample_config(max_frames: int | None = 10, duration_sec: float | None = None
         jpeg_quality=95,
         preview=False,
         serial_number=None,
+        align_depth_to_color=True,
+        enable_emitter=True,
+        laser_power=None,
     )
 
 
