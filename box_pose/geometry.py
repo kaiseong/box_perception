@@ -230,7 +230,8 @@ def estimate_known_size_box(
     depth_band_above_m: float = 0.18,
     yaw_cluster_deg: float = 18.0,
     short_pair_min_ratio: float = 0.45,
-    short_pair_max_ratio: float = 1.45,
+    short_pair_max_ratio: float = 1.9,
+    top_plane_short_projection_scale: float = 0.72,
 ) -> KnownSizeBoxEstimate:
     """Fit a fixed-size box footprint to partial yellow/rim evidence.
 
@@ -286,6 +287,7 @@ def estimate_known_size_box(
     valid_depth = depth_values[np.isfinite(depth_values) & (depth_values > 0.0)]
     depth_reference = None
     expected_long_px = None
+    pinhole_short_px = None
     expected_short_px = None
     if valid_depth.size < min_depth_pixels:
         reasons.append("insufficient_depth_support")
@@ -295,10 +297,11 @@ def estimate_known_size_box(
         depth_reference = float(np.median(trimmed if trimmed.size else valid_depth))
         focal = float((intr.fx + intr.fy) * 0.5)
         expected_long_px = focal * float(box_long_m) / depth_reference
-        expected_short_px = focal * float(box_short_m) / depth_reference
+        pinhole_short_px = focal * float(box_short_m) / depth_reference
+        expected_short_px = pinhole_short_px * float(top_plane_short_projection_scale)
 
     edge = yellow_edge_mask(mask_u8)
-    lines = hough_line_segments(edge)
+    lines = annotate_line_depths(hough_line_segments(edge), depth)
     if not lines:
         pixel_fallback = estimate_pixel_box(mask_u8, MaskStats(mask_u8.size, int(cols.size), int(cols.size), 1.0, 1))
         if not np.isfinite(pixel_fallback.yaw_mod_180):
@@ -336,8 +339,10 @@ def estimate_known_size_box(
         reasons.append("missing_parallel_short_extent")
         short_len_px = choose_fallback_short_length(points, v_axis, expected_short_px)
         center_v = choose_fallback_short_center(points, v_axis, short_len_px)
+        pair_support = None
     else:
         center_v, short_len_px, pair_support = short_pair
+        center_v, short_len_px = clamp_top_plane_short_extent(center_v, short_len_px, pair_support, expected_short_px)
 
     center_u = choose_long_center(points, u_axis, long_len_px)
     center = center_u * u_axis + center_v * v_axis
@@ -366,9 +371,11 @@ def estimate_known_size_box(
         "perimeter": perimeter_support,
         "expected_long_length_px": expected_long_px,
         "expected_short_length_px": expected_short_px,
+        "pinhole_short_length_px": pinhole_short_px,
+        "top_plane_short_projection_scale": float(top_plane_short_projection_scale),
     }
     support.update(support_notes)
-    if short_pair is not None:
+    if short_pair is not None and pair_support is not None:
         support["short_axis_pair_support"] = pair_support
 
     score = known_size_confidence_score(reasons, line_support_fraction, perimeter_support)
@@ -559,6 +566,46 @@ def hough_line_segments(edge: np.ndarray) -> list[dict[str, Any]]:
     return lines
 
 
+def annotate_line_depths(lines: list[dict[str, Any]], depth_m: np.ndarray) -> list[dict[str, Any]]:
+    depth = np.asarray(depth_m, dtype=np.float64)
+    if depth.ndim != 2:
+        return lines
+    annotated: list[dict[str, Any]] = []
+    for line in lines:
+        item = dict(line)
+        item["depth_m"] = sample_line_depth(item, depth)
+        annotated.append(item)
+    return annotated
+
+
+def sample_line_depth(line: dict[str, Any], depth_m: np.ndarray) -> float | None:
+    p1 = np.asarray(line["p1"], dtype=np.float64)
+    p2 = np.asarray(line["p2"], dtype=np.float64)
+    length = max(float(line.get("length_px", np.linalg.norm(p2 - p1))), 1.0)
+    sample_count = int(min(max(round(length / 18.0), 8), 32))
+    alpha = np.linspace(0.0, 1.0, sample_count, dtype=np.float64)
+    points = p1[None, :] * (1.0 - alpha[:, None]) + p2[None, :] * alpha[:, None]
+    h, w = depth_m.shape
+    values: list[float] = []
+    for x_f, y_f in points:
+        x = int(round(float(x_f)))
+        y = int(round(float(y_f)))
+        x0 = max(0, x - 1)
+        x1 = min(w, x + 2)
+        y0 = max(0, y - 1)
+        y1 = min(h, y + 2)
+        patch = depth_m[y0:y1, x0:x1]
+        valid = patch[np.isfinite(patch) & (patch > 0.0)]
+        if valid.size:
+            values.append(float(np.median(valid)))
+    if not values:
+        return None
+    values_arr = np.asarray(values, dtype=np.float64)
+    q10, q90 = np.quantile(values_arr, [0.10, 0.90])
+    trimmed = values_arr[(values_arr >= q10) & (values_arr <= q90)]
+    return float(np.median(trimmed if trimmed.size else values_arr))
+
+
 def dominant_line_yaw(lines: list[dict[str, Any]], *, cluster_deg: float) -> tuple[float, list[dict[str, Any]], float]:
     total_weight = float(sum(line["weight"] for line in lines))
     best_group: list[dict[str, Any]] = []
@@ -626,16 +673,25 @@ def choose_short_axis_pair(
     raw_positions = []
     for line in yaw_lines:
         position = float(np.asarray(line["midpoint"], dtype=np.float64) @ v_axis)
-        raw_positions.append((position, float(line["weight"]), float(line["length_px"])))
+        raw_positions.append((position, float(line["weight"]), float(line["length_px"]), line.get("depth_m")))
     raw_positions.sort(key=lambda item: item[0])
 
     merge_threshold = 18.0
     if expected_short_px is not None and np.isfinite(expected_short_px):
         merge_threshold = max(18.0, float(expected_short_px) * 0.06)
     clusters: list[dict[str, Any]] = []
-    for position, weight, length in raw_positions:
+    for position, weight, length, depth_value in raw_positions:
+        depth_values = [] if depth_value is None or not np.isfinite(depth_value) else [float(depth_value)]
         if not clusters or abs(position - float(clusters[-1]["position"])) > merge_threshold:
-            clusters.append({"position": position, "weight": weight, "count": 1, "max_length_px": length})
+            clusters.append(
+                {
+                    "position": position,
+                    "weight": weight,
+                    "count": 1,
+                    "max_length_px": length,
+                    "depth_values": depth_values,
+                }
+            )
             continue
         cluster = clusters[-1]
         total = float(cluster["weight"]) + weight
@@ -643,9 +699,22 @@ def choose_short_axis_pair(
         cluster["weight"] = total
         cluster["count"] = int(cluster["count"]) + 1
         cluster["max_length_px"] = max(float(cluster["max_length_px"]), length)
+        cluster["depth_values"].extend(depth_values)
 
     if len(clusters) < 2:
         return None
+
+    for cluster in clusters:
+        values = np.asarray(cluster.pop("depth_values"), dtype=np.float64)
+        cluster["depth_m"] = None if values.size == 0 else float(np.median(values))
+
+    finite_depths = [
+        float(cluster["depth_m"])
+        for cluster in clusters
+        if cluster.get("depth_m") is not None and np.isfinite(float(cluster["depth_m"]))
+    ]
+    min_depth = min(finite_depths) if finite_depths else None
+    max_depth = max(finite_depths) if finite_depths else None
 
     best: tuple[float, float, dict[str, Any]] | None = None
     best_score = -1.0
@@ -662,7 +731,9 @@ def choose_short_axis_pair(
                 if separation < 35.0:
                     continue
                 closeness = 0.5
-            score = (float(first["weight"]) + float(second["weight"])) * (0.65 + 0.35 * closeness)
+            strength = math.sqrt(max(float(first["weight"]), 0.0)) + math.sqrt(max(float(second["weight"]), 0.0))
+            depth_score = top_plane_pair_depth_score(clusters, i, first, second, min_depth, max_depth)
+            score = strength * (0.45 + 0.55 * closeness) * depth_score
             if score > best_score:
                 center_v = (float(first["position"]) + float(second["position"])) * 0.5
                 pair_support = {
@@ -671,18 +742,81 @@ def choose_short_axis_pair(
                         "position": float(first["position"]),
                         "line_count": int(first["count"]),
                         "max_length_px": float(first["max_length_px"]),
+                        "depth_m": first["depth_m"],
                     },
                     "second": {
                         "position": float(second["position"]),
                         "line_count": int(second["count"]),
                         "max_length_px": float(second["max_length_px"]),
+                        "depth_m": second["depth_m"],
                     },
                     "separation_px": float(separation),
+                    "depth_score": float(depth_score),
                     "score": float(score),
                 }
                 best = (float(center_v), float(separation), pair_support)
                 best_score = score
     return best
+
+
+def clamp_top_plane_short_extent(
+    center_v: float,
+    short_len_px: float,
+    pair_support: dict[str, Any],
+    expected_short_px: float | None,
+    *,
+    max_ratio: float = 1.12,
+) -> tuple[float, float]:
+    if expected_short_px is None or not np.isfinite(expected_short_px) or expected_short_px <= 0.0:
+        return center_v, short_len_px
+    if short_len_px <= float(expected_short_px) * max_ratio:
+        pair_support["top_plane_extent_clamped"] = False
+        return center_v, short_len_px
+
+    first = pair_support.get("first", {})
+    first_position = first.get("position")
+    if first_position is None or not np.isfinite(first_position):
+        pair_support["top_plane_extent_clamped"] = False
+        return center_v, short_len_px
+
+    raw_short_len = float(short_len_px)
+    clamped_short_len = float(expected_short_px)
+    clamped_center_v = float(first_position) + clamped_short_len * 0.5
+    pair_support["top_plane_extent_clamped"] = True
+    pair_support["raw_separation_px"] = raw_short_len
+    pair_support["clamped_separation_px"] = clamped_short_len
+    pair_support["clamp_max_ratio"] = float(max_ratio)
+    pair_support["center_anchor"] = "far_top_rim"
+    return clamped_center_v, clamped_short_len
+
+
+def top_plane_pair_depth_score(
+    clusters: list[dict[str, Any]],
+    first_index: int,
+    first: dict[str, Any],
+    second: dict[str, Any],
+    min_depth: float | None,
+    max_depth: float | None,
+) -> float:
+    first_depth = first.get("depth_m")
+    second_depth = second.get("depth_m")
+    if first_depth is None or second_depth is None or not np.isfinite(first_depth) or not np.isfinite(second_depth):
+        return 1.0
+
+    depth_span = 1.0 if min_depth is None or max_depth is None else max(float(max_depth - min_depth), 1e-6)
+    # In the current D405 top-plane view, increasing short-axis image position
+    # moves from the farther back rim toward the nearer front rim.
+    ordering = min(max((float(first_depth) - float(second_depth) + 0.02) / 0.14, 0.0), 1.0)
+    near_rank = 1.0 - min(max((float(second_depth) - float(min_depth or second_depth)) / depth_span, 0.0), 1.0)
+    skipped_nearer_edge = any(
+        cluster.get("depth_m") is not None
+        and np.isfinite(float(cluster["depth_m"]))
+        and float(cluster["depth_m"]) < float(second_depth) - 0.025
+        for cluster in clusters[first_index + 1 :]
+        if float(cluster["position"]) < float(second["position"])
+    )
+    skip_score = 0.35 if skipped_nearer_edge else 1.0
+    return float((0.35 + 0.40 * ordering + 0.25 * near_rank) * skip_score)
 
 
 def choose_fallback_short_length(points_xy: np.ndarray, v_axis: np.ndarray, expected_short_px: float | None) -> float:

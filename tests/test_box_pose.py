@@ -274,6 +274,7 @@ class BoxPoseTests(unittest.TestCase):
             box_long_m=360.0 / 712.0,
             box_short_m=115.0 / 712.0,
             min_depth_pixels=50,
+            top_plane_short_projection_scale=1.0,
         )
 
         self.assertTrue(estimate.confidence.ok, estimate.failure_reasons)
@@ -303,6 +304,58 @@ class BoxPoseTests(unittest.TestCase):
 
         self.assertTrue(estimate.confidence.ok, estimate.failure_reasons)
         self.assertLessEqual(angle_error_mod_180(float(estimate.yaw_mod_180), 22.0), 4.0)
+
+    def test_known_size_box_prefers_top_rim_over_lower_wall_line(self) -> None:
+        mask = np.zeros((280, 360), dtype=np.uint8)
+        cv2.line(mask, (45, 60), (315, 60), 255, 5)
+        cv2.line(mask, (45, 160), (315, 160), 255, 5)
+        cv2.line(mask, (45, 230), (315, 230), 255, 5)
+        depth = np.zeros_like(mask, dtype=np.float64)
+        depth[mask > 0] = 0.55
+        depth[55:66, 40:321] = np.where(mask[55:66, 40:321] > 0, 0.66, depth[55:66, 40:321])
+        depth[155:166, 40:321] = np.where(mask[155:166, 40:321] > 0, 0.42, depth[155:166, 40:321])
+        depth[225:236, 40:321] = np.where(mask[225:236, 40:321] > 0, 0.55, depth[225:236, 40:321])
+        intr = CameraIntrinsics(fx=650.0, fy=650.0, cx=180.0, cy=140.0)
+
+        estimate = estimate_known_size_box(
+            mask,
+            depth,
+            intr,
+            box_long_m=270.0 * 0.55 / 650.0,
+            box_short_m=(100.0 / 0.72) * 0.55 / 650.0,
+            min_depth_pixels=50,
+        )
+
+        self.assertTrue(estimate.confidence.ok, estimate.failure_reasons)
+        self.assertIsNotNone(estimate.center_image)
+        self.assertLess(abs(float(estimate.center_image[1]) - 110.0), 15.0)
+        self.assertLess(abs(float(estimate.model_short_length_px) - 100.0), 20.0)
+
+    def test_known_size_box_clamps_lower_wall_pair_to_top_plane_extent(self) -> None:
+        mask = np.zeros((280, 360), dtype=np.uint8)
+        cv2.line(mask, (45, 60), (315, 60), 255, 5)
+        cv2.line(mask, (45, 230), (315, 230), 255, 5)
+        depth = np.zeros_like(mask, dtype=np.float64)
+        depth[55:66, 40:321] = np.where(mask[55:66, 40:321] > 0, 0.66, depth[55:66, 40:321])
+        depth[225:236, 40:321] = np.where(mask[225:236, 40:321] > 0, 0.42, depth[225:236, 40:321])
+        intr = CameraIntrinsics(fx=650.0, fy=650.0, cx=180.0, cy=140.0)
+
+        estimate = estimate_known_size_box(
+            mask,
+            depth,
+            intr,
+            box_long_m=270.0 * 0.54 / 650.0,
+            box_short_m=(100.0 / 0.72) * 0.54 / 650.0,
+            min_depth_pixels=50,
+        )
+
+        self.assertTrue(estimate.confidence.ok, estimate.failure_reasons)
+        self.assertIsNotNone(estimate.center_image)
+        self.assertLess(abs(float(estimate.center_image[1]) - 110.0), 15.0)
+        self.assertLess(abs(float(estimate.model_short_length_px) - 100.0), 20.0)
+        support = estimate.support.get("short_axis_pair_support", {})
+        self.assertTrue(support.get("top_plane_extent_clamped"))
+        self.assertGreater(float(support.get("raw_separation_px")), float(support.get("clamped_separation_px")))
 
     def test_confidence_threshold_edges(self) -> None:
         base = rotated_rectangle_mask((100, 100), (60, 20), 0)

@@ -49,11 +49,12 @@ D405 depth는 너무 가깝거나 멀 때, 얇은 테두리/반사/구멍/내부
 1. RGB 이미지를 HSV로 변환하고 노란/주황색 evidence mask를 만듭니다.
 2. 기존 pixel baseline은 largest component OBB를 계산하지만, `known_size`는 crop된 벽/테두리도 증거가 되므로 전체 cleaned yellow evidence를 사용합니다.
 3. yellow evidence의 depth median을 잡고 같은 거리대의 픽셀만 남깁니다. 이 단계는 D405 depth를 pose source로 직접 쓰기보다는, 장갑/소매/목걸이처럼 박스와 다른 거리대의 색상 잡음을 제거하는 filter입니다.
-4. 남은 evidence depth와 카메라 intrinsics로 박스의 실제 크기 `0.505 m x 0.335 m`가 이미지에서 몇 pixel이어야 하는지 계산합니다.
-5. mask edge에서 Hough line segment를 찾고, line 방향을 `mod 180` 기준으로 cluster합니다. 가장 강한 line cluster 방향을 박스의 `long_axis` yaw로 둡니다.
+4. 남은 evidence depth와 카메라 intrinsics로 박스의 실제 크기 `0.505 m x 0.335 m`가 이미지에서 몇 pixel이어야 하는지 계산합니다. D405 머리 고정각 top-view에서는 짧은 축이 원근으로 압축되어 보이므로 `top_plane_short_projection_scale`로 top-plane 예상 short 길이를 따로 둡니다.
+5. mask edge에서 Hough line segment를 찾고, line 방향을 `mod 180` 기준으로 cluster합니다. 각 line에는 주변 depth median을 붙여서, 아래 벽면 edge와 top rim edge를 구분할 수 있게 합니다. 가장 강한 line cluster 방향을 박스의 `long_axis` yaw로 둡니다.
 6. `long_axis`에 수직인 축을 `short_axis`로 둡니다. 이 축은 박스 짧은 방향이며, 양팔 그리퍼가 양쪽 긴 벽을 잡기 위해 서로 모여드는 방향입니다.
-7. `long_axis`, `short_axis`, depth 기반 예상 pixel 길이, 관측된 rim line 쌍을 조합해 고정 크기 rectangle model을 fitting합니다.
-8. model perimeter가 실제 mask edge와 얼마나 맞는지, line consensus가 얼마나 강한지, center가 이미지 안에 있는지를 confidence score와 failure reason으로 남깁니다.
+7. `short_axis` 방향 line pair는 depth ordering을 봐서 먼 뒤쪽 top rim과 가까운 앞쪽 top rim 조합을 선호합니다. 중간에 더 가까운 top-rim 후보가 있는데 더 아래쪽 wall edge를 선택하는 경우에는 벌점을 줍니다.
+8. 관측 line pair 간격이 top-plane 예상 short 길이보다 과하게 길면, 그 pair를 그대로 믿지 않고 뒤쪽 top rim에서 예상 short 길이만큼만 내려오도록 clamp합니다. 이 보정은 `support.short_axis_pair_support.top_plane_extent_clamped`에 남습니다.
+9. model perimeter가 실제 mask edge와 얼마나 맞는지, line consensus가 얼마나 강한지, center가 이미지 안에 있는지를 confidence score와 failure reason으로 남깁니다.
 
 축 이름은 다음 의미입니다.
 
@@ -547,6 +548,8 @@ debug overlay 색:
 - 노랑 점: `known_size.center_image`
 - 청록 화살표: known long axis
 - 자홍 화살표: known short axis
+
+overlay 좌상단에 `clamp`가 붙으면, 해당 프레임은 앞쪽 wall edge가 top-plane보다 아래로 잡히는 것을 막기 위해 `known_size` rectangle의 short 길이를 실측 top-plane 예상 길이로 제한했다는 뜻입니다.
 
 ## Offline Demo
 
