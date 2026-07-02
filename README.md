@@ -93,9 +93,28 @@ cd ~/box_perception
 git pull
 ```
 
-### 2. Python venv
+### 2. Python environment
 
-Jetson Ubuntu 22.04 / JetPack 6 계열에서는 apt에 `python3.12`가 없을 수 있습니다. 이 경우 **Python 3.10 venv를 권장**합니다. `python -V`가 `Python 3.13.x`로 나오면 Jetson aarch64용 `pyrealsense2` wheel이 잡히지 않을 수 있으므로 venv를 3.10으로 다시 만듭니다.
+Jetson Ubuntu 22.04 / JetPack 6 계열에서는 apt에 `python3.12`가 없을 수 있습니다. conda를 쓰면 이 문제를 피할 수 있으므로, conda가 있으면 **Python 3.12 conda env**를 권장합니다. `python -V`가 `Python 3.13.x`로 나오면 Jetson aarch64용 `pyrealsense2` wheel이 잡히지 않을 수 있으므로 새 환경을 만듭니다.
+
+Conda 경로:
+
+```bash
+cd ~/box_perception
+conda create -n box-perception python=3.12 -y
+conda activate box-perception
+python -V
+
+python -m pip install --upgrade pip
+python -m pip install "numpy<2" pyrealsense2
+
+# preview/replay/tests에서 OpenCV가 필요하면 설치
+conda install -c conda-forge opencv -y
+```
+
+`python -V`는 `Python 3.12.x`여야 합니다. conda 환경에서 `pip install pyrealsense2`가 실패하면 먼저 `python -m pip debug --verbose | grep -m1 aarch64`로 현재 pip가 aarch64 wheel tag를 보는지 확인합니다.
+
+Conda를 쓰지 않는 경우에는 apt에서 구할 수 있는 **Python 3.10 venv**가 가장 안정적입니다.
 
 ```bash
 cd ~/box_perception
@@ -108,7 +127,7 @@ python -m pip install --upgrade pip
 python -m pip install "numpy<2" opencv-python
 ```
 
-`python -V`는 `Python 3.10.x`여야 합니다. 이미 `.venvs` 같은 다른 이름의 venv를 쓰고 있어도 상관없지만, 그 venv가 Python 3.13이면 새 Python 3.10 venv를 만들어야 합니다. Python 3.12를 별도로 설치해 둔 환경이라면 3.12 venv도 사용할 수 있지만, apt에 없으면 3.10으로 진행하는 쪽이 가장 안정적입니다.
+venv 경로에서는 `python -V`가 `Python 3.10.x`여야 합니다. 이미 `.venvs` 같은 다른 이름의 venv를 쓰고 있어도 상관없지만, 그 venv가 Python 3.13이면 새 Python 3.10 venv를 만들어야 합니다.
 
 Jetson에서 apt OpenCV를 쓸 때는 `opencv-python` wheel 대신 system OpenCV가 잡히는 편이 나을 수 있습니다. 이 경우 `--system-site-packages` venv에서 아래 확인만 통과하면 됩니다.
 
@@ -154,7 +173,11 @@ sudo apt-get install -y \
   librealsense2-dev
 
 cd ~/box_perception
-source .venv/bin/activate
+# conda 환경이면:
+conda activate box-perception
+
+# venv 환경이면:
+# source .venv/bin/activate
 python -V
 python -m pip install pyrealsense2
 ```
