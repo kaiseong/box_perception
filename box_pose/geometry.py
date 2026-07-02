@@ -53,7 +53,7 @@ class PixelBoxEstimate:
     confidence: Confidence
     yaw_mod_180: float
     long_axis_image: tuple[float, float]
-    grasp_axis_image: tuple[float, float]
+    short_axis_image: tuple[float, float]
     failure_reasons: tuple[str, ...]
 
     def to_dict(self) -> dict[str, Any]:
@@ -65,7 +65,7 @@ class PixelBoxEstimate:
                 "yaw_mod_180": self.yaw_mod_180,
                 "yaw_frame": "image",
                 "long_axis_image": list(self.long_axis_image),
-                "grasp_axis_image": list(self.grasp_axis_image),
+                "short_axis_image": list(self.short_axis_image),
                 "failure_reasons": list(self.failure_reasons),
             }
         )
@@ -76,9 +76,9 @@ class MetricBoxEstimate:
     camera_T_box: np.ndarray | None
     t5_T_box: np.ndarray | None
     long_axis_camera: tuple[float, float, float] | None
-    grasp_axis_camera: tuple[float, float, float] | None
+    short_axis_camera: tuple[float, float, float] | None
     long_axis_t5: tuple[float, float, float] | None
-    grasp_axis_t5: tuple[float, float, float] | None
+    short_axis_t5: tuple[float, float, float] | None
     yaw_mod_180: float | None
     yaw_frame: str
     long_length_m: float | None
@@ -92,9 +92,9 @@ class MetricBoxEstimate:
                 "camera_T_box": None if self.camera_T_box is None else self.camera_T_box.tolist(),
                 "t5_T_box": None if self.t5_T_box is None else self.t5_T_box.tolist(),
                 "long_axis_camera": None if self.long_axis_camera is None else list(self.long_axis_camera),
-                "grasp_axis_camera": None if self.grasp_axis_camera is None else list(self.grasp_axis_camera),
+                "short_axis_camera": None if self.short_axis_camera is None else list(self.short_axis_camera),
                 "long_axis_t5": None if self.long_axis_t5 is None else list(self.long_axis_t5),
-                "grasp_axis_t5": None if self.grasp_axis_t5 is None else list(self.grasp_axis_t5),
+                "short_axis_t5": None if self.short_axis_t5 is None else list(self.short_axis_t5),
                 "yaw_mod_180": self.yaw_mod_180,
                 "yaw_frame": self.yaw_frame,
                 "long_length_m": self.long_length_m,
@@ -111,7 +111,7 @@ class KnownSizeBoxEstimate:
     center_top_camera_m: tuple[float, float, float] | None
     yaw_mod_180: float | None
     long_axis_image: tuple[float, float] | None
-    grasp_axis_image: tuple[float, float] | None
+    short_axis_image: tuple[float, float] | None
     model_corners: tuple[tuple[float, float], ...] | None
     model_long_length_px: float | None
     model_short_length_px: float | None
@@ -134,7 +134,7 @@ class KnownSizeBoxEstimate:
                 "yaw_mod_180": self.yaw_mod_180,
                 "yaw_frame": "image",
                 "long_axis_image": None if self.long_axis_image is None else list(self.long_axis_image),
-                "grasp_axis_image": None if self.grasp_axis_image is None else list(self.grasp_axis_image),
+                "short_axis_image": None if self.short_axis_image is None else list(self.short_axis_image),
                 "model_corners": None
                 if self.model_corners is None
                 else [list(corner) for corner in self.model_corners],
@@ -210,7 +210,7 @@ def estimate_pixel_box(
         confidence=confidence,
         yaw_mod_180=float(yaw),
         long_axis_image=tuple(float(v) for v in long_axis),
-        grasp_axis_image=tuple(float(v) for v in short_axis),
+        short_axis_image=tuple(float(v) for v in short_axis),
         failure_reasons=confidence.reasons,
     )
 
@@ -378,7 +378,7 @@ def estimate_known_size_box(
         center_top_camera_m=None if center_camera is None else tuple(float(v) for v in center_camera),
         yaw_mod_180=float(yaw % 180.0),
         long_axis_image=tuple(float(v) for v in u_axis),
-        grasp_axis_image=tuple(float(v) for v in v_axis),
+        short_axis_image=tuple(float(v) for v in v_axis),
         model_corners=tuple(tuple(float(v) for v in corner) for corner in corners),
         model_long_length_px=float(long_len_px),
         model_short_length_px=float(short_len_px),
@@ -475,9 +475,9 @@ def estimate_metric_box(
         camera_T_box=camera_T_box,
         t5_T_box=t5_T_box,
         long_axis_camera=tuple(float(v) for v in long_axis),
-        grasp_axis_camera=tuple(float(v) for v in short_axis),
+        short_axis_camera=tuple(float(v) for v in short_axis),
         long_axis_t5=long_t5,
-        grasp_axis_t5=short_t5,
+        short_axis_t5=short_t5,
         yaw_mod_180=float(yaw),
         yaw_frame=yaw_frame,
         long_length_m=float(long_len),
@@ -1029,9 +1029,9 @@ def _metric_failure(yaw_frame: str, reason: str) -> MetricBoxEstimate:
         camera_T_box=None,
         t5_T_box=None,
         long_axis_camera=None,
-        grasp_axis_camera=None,
+        short_axis_camera=None,
         long_axis_t5=None,
-        grasp_axis_t5=None,
+        short_axis_t5=None,
         yaw_mod_180=None,
         yaw_frame=yaw_frame,
         long_length_m=None,
@@ -1056,7 +1056,7 @@ def _known_size_failure(
         center_top_camera_m=None,
         yaw_mod_180=None,
         long_axis_image=None,
-        grasp_axis_image=None,
+        short_axis_image=None,
         model_corners=None,
         model_long_length_px=None,
         model_short_length_px=None,

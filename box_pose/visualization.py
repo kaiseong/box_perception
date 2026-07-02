@@ -18,13 +18,13 @@ def draw_pixel_estimate(image_bgr: np.ndarray, estimate: PixelBoxEstimate) -> np
     corners = np.asarray(estimate.pixel_obb["corners"], dtype=np.int32).reshape((-1, 1, 2))
     center = np.asarray(estimate.pixel_obb["center"], dtype=np.float64)
     long_axis = np.asarray(estimate.long_axis_image, dtype=np.float64)
-    grasp_axis = np.asarray(estimate.grasp_axis_image, dtype=np.float64)
+    short_axis = np.asarray(estimate.short_axis_image, dtype=np.float64)
     axis_length = min(max(float(estimate.pixel_obb["short_length_px"]) * 0.25, 25.0), 120.0)
 
     cv2.drawContours(image, [corners], -1, (0, 255, 0), 3)
     cv2.circle(image, tuple(np.rint(center).astype(int)), 5, (255, 255, 255), -1)
     _draw_arrow(image, center, center + long_axis * axis_length, (255, 0, 0), "long")
-    _draw_arrow(image, center, center + grasp_axis * axis_length, (0, 0, 255), "grasp")
+    _draw_arrow(image, center, center + short_axis * axis_length, (0, 0, 255), "short")
 
     text = f"yaw={estimate.yaw_mod_180:.1f} conf={estimate.confidence.ok}"
     cv2.putText(image, text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 3, cv2.LINE_AA)
@@ -47,12 +47,12 @@ def draw_known_size_estimate(image_bgr: np.ndarray, estimate: KnownSizeBoxEstima
     cv2.drawContours(image, [corners], -1, (255, 0, 255), 3)
     cv2.circle(image, tuple(np.rint(center).astype(int)), 6, (0, 255, 255), -1)
 
-    if estimate.long_axis_image is not None and estimate.grasp_axis_image is not None:
+    if estimate.long_axis_image is not None and estimate.short_axis_image is not None:
         long_axis = np.asarray(estimate.long_axis_image, dtype=np.float64)
-        grasp_axis = np.asarray(estimate.grasp_axis_image, dtype=np.float64)
+        short_axis = np.asarray(estimate.short_axis_image, dtype=np.float64)
         axis_length = min(max(float(estimate.model_short_length_px or 120.0) * 0.25, 25.0), 130.0)
         _draw_arrow(image, center, center + long_axis * axis_length, (255, 255, 0), "known long")
-        _draw_arrow(image, center, center + grasp_axis * axis_length, (255, 0, 255), "known grasp")
+        _draw_arrow(image, center, center + short_axis * axis_length, (255, 0, 255), "known short")
 
     yaw = float("nan") if estimate.yaw_mod_180 is None else float(estimate.yaw_mod_180)
     text = f"known yaw={yaw:.1f} conf={estimate.confidence.ok} score={estimate.confidence.score:.2f}"

@@ -30,7 +30,7 @@ D405 RGB
   -> all yellow evidence에서 depth band로 장갑/소매/목걸이 같은 다른 노란 물체 제거
   -> rim/edge Hough line으로 long-axis yaw 추정
   -> 실제 박스 크기의 rectangle model을 부분 관측에 fitting
-  -> center_image, center_top_camera_m, yaw, confidence, reasons 출력
+  -> center_image, center_top_camera_m, yaw, short_axis, confidence, reasons 출력
 
 D405 depth
   -> 모든 픽셀을 그대로 pose에 쓰지 않음
@@ -42,6 +42,25 @@ D405 depth는 너무 가깝거나 멀 때, 얇은 테두리/반사/구멍/내부
 
 `camera-to-T5` transform과 table/top-plane calibration이 들어오기 전까지 `center_top_camera_m`은 depth reference로 backproject한 임시 camera-frame 값입니다. 로봇으로 넘길 최종 좌표는 이후 외부 calibration으로 변환해야 합니다.
 
+### 최신 `known_size` 알고리즘
+
+최신 경로는 "보이는 yellow mask의 bbox 중심"을 박스 중심으로 보지 않습니다. crop되면 bbox 중심은 실제 박스 중심과 달라질 수 있기 때문입니다. 대신 박스 실측 크기와 rim line 방향을 이용해, 원래 크기의 박스 footprint가 어디에 있어야 하는지를 맞춥니다.
+
+1. RGB 이미지를 HSV로 변환하고 노란/주황색 evidence mask를 만듭니다.
+2. 기존 pixel baseline은 largest component OBB를 계산하지만, `known_size`는 crop된 벽/테두리도 증거가 되므로 전체 cleaned yellow evidence를 사용합니다.
+3. yellow evidence의 depth median을 잡고 같은 거리대의 픽셀만 남깁니다. 이 단계는 D405 depth를 pose source로 직접 쓰기보다는, 장갑/소매/목걸이처럼 박스와 다른 거리대의 색상 잡음을 제거하는 filter입니다.
+4. 남은 evidence depth와 카메라 intrinsics로 박스의 실제 크기 `0.505 m x 0.335 m`가 이미지에서 몇 pixel이어야 하는지 계산합니다.
+5. mask edge에서 Hough line segment를 찾고, line 방향을 `mod 180` 기준으로 cluster합니다. 가장 강한 line cluster 방향을 박스의 `long_axis` yaw로 둡니다.
+6. `long_axis`에 수직인 축을 `short_axis`로 둡니다. 이 축은 박스 짧은 방향이며, 양팔 그리퍼가 양쪽 긴 벽을 잡기 위해 서로 모여드는 방향입니다.
+7. `long_axis`, `short_axis`, depth 기반 예상 pixel 길이, 관측된 rim line 쌍을 조합해 고정 크기 rectangle model을 fitting합니다.
+8. model perimeter가 실제 mask edge와 얼마나 맞는지, line consensus가 얼마나 강한지, center가 이미지 안에 있는지를 confidence score와 failure reason으로 남깁니다.
+
+축 이름은 다음 의미입니다.
+
+- `long_axis`: 박스의 긴 변 방향입니다. 현재 yaw는 이 축 기준으로 출력합니다.
+- `short_axis`: `long_axis`에 수직인 짧은 변 방향입니다. 로봇 양손이 박스 양쪽 긴 벽을 잡으려면 end-effector들이 이 축을 따라 박스 중심 쪽으로 모입니다.
+- `short_axis`는 잡는 면의 길이 방향이 아니라, 두 end-effector가 서로 접근하는 방향입니다.
+
 frame별 주요 출력:
 
 ```json
@@ -51,6 +70,8 @@ frame별 주요 출력:
     "center_top_camera_m": [-0.01, 0.12, 0.43],
     "yaw_mod_180": 3.2,
     "yaw_frame": "image",
+    "long_axis_image": [1.0, 0.0],
+    "short_axis_image": [0.0, 1.0],
     "box_size_m": {"long": 0.505, "short": 0.335, "height": 0.195},
     "projection_plane": "box_top_plane",
     "confidence": {"ok": true, "score": 0.86, "reasons": []}
@@ -525,7 +546,7 @@ debug overlay 색:
 - 자홍: `known_size` rectangle model
 - 노랑 점: `known_size.center_image`
 - 청록 화살표: known long axis
-- 자홍 화살표: known grasp/short axis
+- 자홍 화살표: known short axis
 
 ## Offline Demo
 

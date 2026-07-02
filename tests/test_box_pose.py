@@ -73,7 +73,7 @@ class BoxPoseTests(unittest.TestCase):
         self.assertTrue(estimate.confidence.ok, estimate.failure_reasons)
         self.assertGreater(estimate.pixel_obb["long_length_px"], estimate.pixel_obb["short_length_px"])
         self.assertGreaterEqual(estimate.pixel_obb["aspect_ratio"], 1.25)
-        self.assertAlmostEqual(float(np.dot(estimate.long_axis_image, estimate.grasp_axis_image)), 0.0, places=6)
+        self.assertAlmostEqual(float(np.dot(estimate.long_axis_image, estimate.short_axis_image)), 0.0, places=6)
 
     def test_near_square_returns_low_confidence(self) -> None:
         mask = rotated_rectangle_mask((140, 140), (60, 56), 15)
@@ -137,7 +137,7 @@ class BoxPoseTests(unittest.TestCase):
         self.assertGreater(stats.dominant_area, 0)
         self.assertTrue(np.isfinite(estimate.yaw_mod_180))
         self.assertTrue(np.all(np.isfinite(estimate.long_axis_image)))
-        self.assertTrue(np.all(np.isfinite(estimate.grasp_axis_image)))
+        self.assertTrue(np.all(np.isfinite(estimate.short_axis_image)))
         self.assertIn("pixel_obb", estimate.to_dict())
 
     def test_metric_projection_returns_camera_transform_and_axes(self) -> None:

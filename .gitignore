@@ -13,6 +13,8 @@ env/
 .omx/
 
 recordings/
+RESULT/
+COMPARE/
 *.svo
 *.svo2
 *.whl
