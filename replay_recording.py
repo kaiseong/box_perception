@@ -19,7 +19,10 @@ VIEW_ROTATIONS = ("none", "cw90", "ccw90", "180")
 class AnalysisDependencies:
     cv2: Any
     camera_intrinsics_cls: Any
+    average_rim_planes: Any
+    discover_rim_plane: Any
     estimate_known_size_box: Any
+    estimate_plane_box: Any
     estimate_metric_box: Any
     estimate_pixel_box: Any
     evaluate_still_frame_spread: Any
@@ -50,6 +53,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-mask", action="store_true", help="Save binary masks next to debug overlays.")
     parser.add_argument("--no-metric", action="store_true", help="Skip depth/intrinsics metric estimation.")
     parser.add_argument("--no-known-size", action="store_true", help="Skip fixed-size cropped-box fitting.")
+    parser.add_argument(
+        "--known-size-method",
+        choices=("plane", "image"),
+        default="plane",
+        help=(
+            "known_size estimation path. plane fits the fixed-size rectangle in metric space on the "
+            "calibrated rim plane and falls back to the previous image-space estimator when needed. "
+            "image forces the previous image-space estimator."
+        ),
+    )
     parser.add_argument("--box-long-m", type=float, default=0.505, help="Known box long-side length in meters.")
     parser.add_argument("--box-short-m", type=float, default=0.335, help="Known box short-side length in meters.")
     parser.add_argument("--box-height-m", type=float, default=0.195, help="Known box height in meters.")
@@ -72,7 +85,10 @@ def load_analysis_dependencies() -> AnalysisDependencies:
 
         from box_pose import (
             CameraIntrinsics,
+            average_rim_planes,
+            discover_rim_plane,
             estimate_known_size_box,
+            estimate_plane_box,
             estimate_metric_box,
             estimate_pixel_box,
             evaluate_still_frame_spread,
@@ -89,7 +105,10 @@ def load_analysis_dependencies() -> AnalysisDependencies:
     return AnalysisDependencies(
         cv2=cv2,
         camera_intrinsics_cls=CameraIntrinsics,
+        average_rim_planes=average_rim_planes,
+        discover_rim_plane=discover_rim_plane,
         estimate_known_size_box=estimate_known_size_box,
+        estimate_plane_box=estimate_plane_box,
         estimate_metric_box=estimate_metric_box,
         estimate_pixel_box=estimate_pixel_box,
         evaluate_still_frame_spread=evaluate_still_frame_spread,
@@ -220,6 +239,8 @@ def analyze_frame(
     save_mask: bool,
     run_metric: bool,
     run_known_size: bool,
+    known_size_method: str,
+    rim_plane: tuple[Any, Any] | None,
     view_rotation: str,
     box_long_m: float,
     box_short_m: float,
@@ -246,15 +267,35 @@ def analyze_frame(
 
     known_size_estimate = None
     if run_known_size and intrinsics is not None and depth is not None:
-        known_size_estimate = deps.estimate_known_size_box(
-            evidence_mask,
-            depth,
-            intrinsics,
-            box_long_m=box_long_m,
-            box_short_m=box_short_m,
-            box_height_m=box_height_m,
-        )
+        method_used = known_size_method
+        plane_failure: list[str] = []
+        if known_size_method == "plane":
+            known_size_estimate = deps.estimate_plane_box(
+                evidence_mask,
+                depth,
+                intrinsics,
+                box_long_m=box_long_m,
+                box_short_m=box_short_m,
+                box_height_m=box_height_m,
+                rim_plane=rim_plane,
+            )
+            if known_size_estimate.center_top_camera_m is None:
+                plane_failure = list(known_size_estimate.failure_reasons)
+                known_size_estimate = None
+                method_used = "image_fallback"
+        if known_size_estimate is None:
+            known_size_estimate = deps.estimate_known_size_box(
+                evidence_mask,
+                depth,
+                intrinsics,
+                box_long_m=box_long_m,
+                box_short_m=box_short_m,
+                box_height_m=box_height_m,
+            )
         known_size = known_size_estimate.to_dict()
+        known_size["method"] = method_used
+        if method_used == "image_fallback":
+            known_size["plane_failure_reasons"] = plane_failure
         known_size["mask_stats"] = evidence_stats.to_dict()
         result["known_size"] = known_size
 
@@ -283,6 +324,41 @@ def analyze_frame(
         deps.cv2.imwrite(str(mask_dir / f"frame_{int(record['frame_id']):06d}_evidence_mask.png"), evidence_mask)
 
     return result
+
+
+def calibrate_rim_plane(
+    deps: AnalysisDependencies,
+    *,
+    session_dir: Path,
+    records: list[dict[str, Any]],
+    intrinsics: Any,
+    view_rotation: str,
+    box_short_m: float,
+    max_accepted: int = 12,
+) -> dict[str, Any] | None:
+    """Discover the setup-constant rim plane from frames where the top is visible.
+
+    Near cropped frames are often dominated by wall planes. `discover_rim_plane`
+    rejects those using the known 335 mm short-side footprint, so the accepted
+    frames can be averaged into one session-level plane.
+    """
+
+    accepted: list[dict[str, Any]] = []
+    for record in records:
+        image = rotate_array_for_view(load_rgb_frame(session_dir, record, deps.cv2), view_rotation)
+        depth = rotate_array_for_view(load_depth_frame(session_dir, record), view_rotation)
+        evidence_mask, _ = deps.segment_yellow_box(image, keep_largest_component=False)
+        plane = deps.discover_rim_plane(evidence_mask, depth, intrinsics, box_short_m=box_short_m)
+        if plane is not None:
+            plane["frame_id"] = int(record["frame_id"])
+            accepted.append(plane)
+        if len(accepted) >= max_accepted:
+            break
+    if not accepted:
+        return None
+    calibration = deps.average_rim_planes(accepted)
+    calibration["accepted_frame_ids"] = [plane["frame_id"] for plane in accepted]
+    return calibration
 
 
 def summarize_results(results: list[dict[str, Any]], evaluate_still_frame_spread: Any | None = None) -> dict[str, Any]:
@@ -384,7 +460,7 @@ def main() -> int:
 
     view_rotation = resolve_view_rotation(manifest, args.view_rotation)
     intrinsics = None
-    if not args.no_metric:
+    if not args.no_metric or not args.no_known_size:
         raw_width, raw_height = image_size_from_manifest_or_record(manifest, records[0])
         raw_intrinsics = deps.camera_intrinsics_cls.from_mapping(manifest["intrinsics"])
         intrinsics = rotate_intrinsics_for_view(
@@ -394,6 +470,27 @@ def main() -> int:
             rotation=view_rotation,
             intrinsics_cls=deps.camera_intrinsics_cls,
         )
+
+    rim_plane = None
+    rim_plane_calibration = None
+    if not args.no_known_size and args.known_size_method == "plane" and intrinsics is not None:
+        rim_plane_calibration = calibrate_rim_plane(
+            deps,
+            session_dir=session_dir,
+            records=records,
+            intrinsics=intrinsics,
+            view_rotation=view_rotation,
+            box_short_m=args.box_short_m,
+        )
+        if rim_plane_calibration is not None:
+            rim_plane = (rim_plane_calibration["normal"], rim_plane_calibration["point"])
+            print(
+                "Calibrated rim plane from "
+                f"{rim_plane_calibration['frames_used']} frames, "
+                f"offset spread {rim_plane_calibration['offset_spread_m'] * 1000.0:.1f} mm"
+            )
+        else:
+            print("Rim plane calibration failed; falling back to per-frame plane discovery.")
 
     frame_records_path = output_dir / "frames.jsonl"
     results: list[dict[str, Any]] = []
@@ -410,6 +507,8 @@ def main() -> int:
                 save_mask=save_debug and args.save_mask,
                 run_metric=not args.no_metric,
                 run_known_size=not args.no_known_size,
+                known_size_method=args.known_size_method,
+                rim_plane=rim_plane,
                 view_rotation=view_rotation,
                 box_long_m=args.box_long_m,
                 box_short_m=args.box_short_m,
@@ -419,6 +518,8 @@ def main() -> int:
             frame_file.write(json.dumps(result, sort_keys=True) + "\n")
 
     summary = summarize_results(results, deps.evaluate_still_frame_spread)
+    if rim_plane_calibration is not None:
+        summary["rim_plane_calibration"] = rim_plane_calibration
     write_json(output_dir / "summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
     print(f"Wrote {frame_records_path}")
