@@ -5,11 +5,11 @@ This variant keeps the recorded START_TO_PICKING hand height and hand
 orientation, but shifts only x/y from the latest camera-estimated box center.
 
 Default sequence:
-  1. ready -> ready_to_picking       (joint position control)
-  2. live vision at that pose        (D405 + rim-plane estimator, usable center frames)
-  3. vision_pre_push                 (Cartesian impedance control)
+  1. ready                           (joint position control)
+  2. live vision at ready pose       (D405 + rim-plane estimator, usable center frames)
+  3. vision_pre_push                 (START_TO_PICKING z/rotation, vision x/y)
   4. inward y-axis push              (Cartesian impedance control)
-  5. lift                            (Cartesian impedance control)
+  5. lift                            (dual-target Cartesian control)
 
 Pass --pre-push-only to stop at the pose just before the inward y-axis push.
 
@@ -18,9 +18,11 @@ Vision input, one of:
     LIVE_VISION_FRAMES_NEEDED usable center frames; aborts if not enough).
   - --vision-json <path>: latest record of inference.py --print-json output.
   - --box-center-camera X Y Z: manual center_top_camera_m.
-All are in the cw90 analysis camera frame (see --view-rotation) and are
-transformed to link_torso_5/T5 before building the arm targets. The detected
-box yaw is printed for reference but NOT commanded in this stage-1 script.
+All are in the cw90 analysis camera frame (see --view-rotation). They are
+transformed to base for vision_pre_push so the x/y correction is
+table-horizontal and the START_TO_PICKING base-frame EEF z/rotation stay fixed.
+The detected box yaw is printed for reference but NOT commanded in this
+stage-1 script.
 """
 
 from __future__ import annotations
@@ -46,14 +48,23 @@ FT_MONITOR_RATE = 10.0
 DYN_LINK_NAMES = ["base", "link_torso_5", "ee_right", "ee_left", "link_head_2"]
 BASE_INDEX, TORSO_INDEX, EE_RIGHT_INDEX, EE_LEFT_INDEX, HEAD2_INDEX = 0, 1, 2, 3, 4
 
+# ---- Vision pre-push Cartesian positioning parameters ----
+# Use base for pre-push so x/y corrections are table-horizontal even when the
+# torso is pitched. START_TO_PICKING supplies the target EEF z and rotation.
+VISION_PRE_PUSH_REFERENCE_LINK = "base"
+VISION_PRE_PUSH_REFERENCE_INDEX = BASE_INDEX
+
 # ---- Cartesian impedance "push inward" parameters ----
-IMPEDANCE_REFERENCE_LINK = "link_torso_5"
+# Keep the push in base as well. With the current fixed torso posture, base +/-
+# y is the intended inward grip direction, and base z stays invariant when the
+# pre-push x target changes.
+IMPEDANCE_REFERENCE_LINK = "base"
 PUSH_DISTANCE = 0.1
 IMPEDANCE_TRANSLATION_WEIGHT = [500.0, 1000.0, 500.0]
 IMPEDANCE_ROTATION_WEIGHT = [50.0, 50.0, 50.0]
 PUSH_HOLD_TIME = 3.0
 
-# ---- Cartesian impedance lift parameters ----
+# ---- Cartesian lift parameters ----
 IMPEDANCE_LIFT_REFERENCE_LINK = "base"
 LIFT_HEIGHT = 0.15
 LIFT_MINIMUM_TIME = 5.0
@@ -128,7 +139,6 @@ T_T5_FROM_HEAD2_STATIC = make_transform(T5_TO_HEAD1_ZERO_HEAD0_XYZ_M) @ make_tra
     _rot_y(HEAD_1_PITCH_RAD_STATIC),
 )
 CAMERA_TO_T5_STATIC = T_T5_FROM_HEAD2_STATIC @ T_HEAD2_FROM_CAMERA
-T5_TO_CAMERA_STATIC = invert_transform(CAMERA_TO_T5_STATIC)
 
 
 def raw_camera_from_view_rotation_transform(view_rotation: str) -> np.ndarray:
@@ -185,12 +195,88 @@ def compute_camera_to_t5_for_view_rotation(
     )
 
 
-def transform_camera_point_to_t5(point_camera_m: Any, camera_to_t5: Any = None) -> np.ndarray:
-    """Transform one 3D camera-frame point into link_torso_5/T5 coordinates."""
-    T = CAMERA_TO_T5_STATIC if camera_to_t5 is None else np.asarray(camera_to_t5, dtype=np.float64)
+def compute_t5_to_base_transform(
+    dyn_model: Any,
+    dyn_state: Any,
+    q: Any,
+) -> np.ndarray:
+    """Return the current T5->base transform."""
+    dyn_state.set_q(q)
+    dyn_model.compute_forward_kinematics(dyn_state)
+    return np.asarray(
+        dyn_model.compute_transformation(dyn_state, BASE_INDEX, TORSO_INDEX),
+        dtype=np.float64,
+    )
+
+
+def compute_camera_to_base_for_view_rotation(
+    view_rotation: str,
+    dyn_model: Any,
+    dyn_state: Any,
+    q: Any,
+) -> np.ndarray:
+    """Return camera(view)->base for the current robot state."""
+    camera_to_t5 = compute_camera_to_t5_for_view_rotation(
+        view_rotation,
+        dyn_model,
+        dyn_state,
+        q,
+    )
+    return compute_t5_to_base_transform(dyn_model, dyn_state, q) @ camera_to_t5
+
+
+def transform_camera_point_to_base(
+    point_camera_m: Any,
+    camera_to_base: Any,
+) -> np.ndarray:
+    """Transform one 3D camera-frame point into the base/table-horizontal frame."""
+    T = np.asarray(camera_to_base, dtype=np.float64)
     p_camera = np.ones(4, dtype=np.float64)
     p_camera[:3] = np.asarray(point_camera_m, dtype=np.float64)
     return (T @ p_camera)[:3]
+
+
+def build_dual_target_cartesian_command(
+    *,
+    reference_link: str,
+    right_target: np.ndarray,
+    left_target: np.ndarray,
+    minimum_time: float,
+    hold_time: float,
+) -> Any:
+    """Build one synchronized arm-only command with independent EEF targets.
+
+    Rotation, crop offset, or asymmetric hand placement should be handled by
+    computing different `right_target` / `left_target` transforms. They are sent
+    together in one RobotCommand, but as right/left arm-component commands so
+    torso and head are not used to satisfy the Cartesian targets.
+    """
+    def arm_cartesian_command(link_name: str, target: np.ndarray) -> Any:
+        command = (
+            rby.CartesianCommandBuilder()
+            .add_target(
+                reference_link,
+                link_name,
+                target,
+                LIFT_LINEAR_VELOCITY_LIMIT,
+                LIFT_ANGULAR_VELOCITY_LIMIT,
+                LIFT_LINEAR_ACCELERATION_LIMIT,
+            )
+            .set_minimum_time(minimum_time)
+        )
+        if hold_time > 0.0:
+            command = command.set_command_header(
+                rby.CommandHeaderBuilder().set_control_hold_time(hold_time)
+            )
+        return command
+
+    return rby.RobotCommandBuilder().set_command(
+        rby.ComponentBasedCommandBuilder().set_body_command(
+            rby.BodyComponentBasedCommandBuilder()
+            .set_right_arm_command(arm_cartesian_command("ee_right", right_target))
+            .set_left_arm_command(arm_cartesian_command("ee_left", left_target))
+        )
+    )
 
 
 VISION_APPROACH_MINIMUM_TIME = 1.0
@@ -241,7 +327,6 @@ START_TO_PICKING = {
 
 JOINT_SEQUENCE = [
     ("ready", READY),
-    ("ready_to_picking", READY_TO_PICKING),
 ]
 
 
@@ -441,19 +526,27 @@ def start_to_picking_reference_targets(
     robot_model: Any,
     q_template: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """FK of recorded START_TO_PICKING EEF poses in the T5/link_torso_5 frame."""
+    """FK of recorded START_TO_PICKING EEF poses in the pre-push reference frame."""
     q_start = q_for_recorded_pose(robot_model, q_template, START_TO_PICKING)
     dyn_state.set_q(q_start)
     dyn_model.compute_forward_kinematics(dyn_state)
-    T_t5_right = np.asarray(
-        dyn_model.compute_transformation(dyn_state, TORSO_INDEX, EE_RIGHT_INDEX),
+    T_ref_right = np.asarray(
+        dyn_model.compute_transformation(
+            dyn_state,
+            VISION_PRE_PUSH_REFERENCE_INDEX,
+            EE_RIGHT_INDEX,
+        ),
         dtype=np.float64,
     ).copy()
-    T_t5_left = np.asarray(
-        dyn_model.compute_transformation(dyn_state, TORSO_INDEX, EE_LEFT_INDEX),
+    T_ref_left = np.asarray(
+        dyn_model.compute_transformation(
+            dyn_state,
+            VISION_PRE_PUSH_REFERENCE_INDEX,
+            EE_LEFT_INDEX,
+        ),
         dtype=np.float64,
     ).copy()
-    return T_t5_right, T_t5_left
+    return T_ref_right, T_ref_left
 
 
 def vision_pre_push_targets(
@@ -461,14 +554,15 @@ def vision_pre_push_targets(
     dyn_state: Any,
     robot_model: Any,
     q_template: np.ndarray,
-    box_center_t5_m: np.ndarray,
+    box_center_base_m: np.ndarray,
     *,
     midpoint_offset_xy_m: tuple[float, float] = (0.0, 0.0),
 ) -> dict[str, np.ndarray]:
     """Shift START_TO_PICKING hand targets so their midpoint matches the box center.
 
-    z and rotation are copied from the recorded START_TO_PICKING FK. Only x/y
-    receive the same delta on both hands, preserving the recorded hand spacing.
+    z and rotation are copied from the recorded START_TO_PICKING FK in base.
+    Only base x/y receive the same delta on both hands, preserving recorded
+    hand spacing while avoiding T5-pitch-induced vertical drift.
     """
     T_right_ref, T_left_ref = start_to_picking_reference_targets(
         dyn_model,
@@ -477,7 +571,7 @@ def vision_pre_push_targets(
         q_template,
     )
     reference_midpoint_xy = 0.5 * (T_right_ref[:2, 3] + T_left_ref[:2, 3])
-    target_midpoint_xy = np.asarray(box_center_t5_m[:2], dtype=np.float64) + np.asarray(
+    target_midpoint_xy = np.asarray(box_center_base_m[:2], dtype=np.float64) + np.asarray(
         midpoint_offset_xy_m,
         dtype=np.float64,
     )
@@ -502,7 +596,7 @@ def build_vision_pre_push_command(
     dyn_state: Any,
     robot_model: Any,
     q_template: np.ndarray,
-    box_center_t5_m: np.ndarray,
+    box_center_base_m: np.ndarray,
     *,
     approach_time: float,
     hold_time: float,
@@ -514,7 +608,7 @@ def build_vision_pre_push_command(
         dyn_state,
         robot_model,
         q_template,
-        box_center_t5_m,
+        box_center_base_m,
         midpoint_offset_xy_m=midpoint_offset_xy_m,
     )
 
@@ -528,7 +622,8 @@ def build_vision_pre_push_command(
             "only after checking the vision estimate."
         )
 
-    print("[vision_pre_push] box center in T5:", np.asarray(box_center_t5_m, dtype=np.float64))
+    print("[vision_pre_push] reference frame:", VISION_PRE_PUSH_REFERENCE_LINK)
+    print("[vision_pre_push] box center in base:", np.asarray(box_center_base_m, dtype=np.float64))
     print(
         "[vision_pre_push] hand midpoint xy "
         f"{targets['reference_midpoint_xy']} -> {targets['target_midpoint_xy']} "
@@ -540,39 +635,17 @@ def build_vision_pre_push_command(
         "| left target xyz:",
         targets["left_target"][:3, 3],
     )
-    print("[vision_pre_push] z and rotation are inherited from recorded START_TO_PICKING.")
+    print(
+        "[vision_pre_push] base-frame z and rotation are inherited from "
+        "recorded START_TO_PICKING; only base x/y are shifted."
+    )
 
-    def arm_cartesian_impedance(link_name: str, T_target: np.ndarray) -> Any:
-        return (
-            rby.CartesianImpedanceControlCommandBuilder()
-            .set_command_header(
-                rby.CommandHeaderBuilder().set_control_hold_time(hold_time)
-            )
-            .add_target(
-                IMPEDANCE_REFERENCE_LINK,
-                link_name,
-                T_target,
-                LIFT_LINEAR_VELOCITY_LIMIT,
-                LIFT_ANGULAR_VELOCITY_LIMIT,
-                LIFT_LINEAR_ACCELERATION_LIMIT,
-                LIFT_ANGULAR_ACCELERATION_LIMIT,
-            )
-            .set_joint_stiffness(LIFT_JOINT_STIFFNESS)
-            .set_joint_damping_ratio(LIFT_JOINT_DAMPING_RATIO)
-            .set_joint_torque_limit(LIFT_JOINT_TORQUE_LIMIT)
-            .set_minimum_time(approach_time)
-        )
-
-    return rby.RobotCommandBuilder().set_command(
-        rby.ComponentBasedCommandBuilder().set_body_command(
-            rby.BodyComponentBasedCommandBuilder()
-            .set_right_arm_command(
-                arm_cartesian_impedance("ee_right", targets["right_target"])
-            )
-            .set_left_arm_command(
-                arm_cartesian_impedance("ee_left", targets["left_target"])
-            )
-        )
+    return build_dual_target_cartesian_command(
+        reference_link=VISION_PRE_PUSH_REFERENCE_LINK,
+        right_target=targets["right_target"],
+        left_target=targets["left_target"],
+        minimum_time=approach_time,
+        hold_time=hold_time,
     )
 
 
@@ -677,13 +750,13 @@ def build_dual_arm_impedance_command(
 
 
 def build_impedance_push_command(dyn_model: Any, dyn_state: Any, q: Any) -> Any:
-    """Push both hands inward to grip the box, expressed in link_torso_5."""
+    """Push both hands inward to grip the box, expressed in base."""
     return build_dual_arm_impedance_command(
         dyn_model,
         dyn_state,
         q,
         reference_link=IMPEDANCE_REFERENCE_LINK,
-        ref_index=TORSO_INDEX,
+        ref_index=BASE_INDEX,
         inward=PUSH_DISTANCE,
         lift=0.0,
         translation_weight=IMPEDANCE_TRANSLATION_WEIGHT,
@@ -693,7 +766,12 @@ def build_impedance_push_command(dyn_model: Any, dyn_state: Any, q: Any) -> Any:
 
 
 def build_impedance_lift_command(dyn_model: Any, dyn_state: Any, q: Any) -> Any:
-    """Raise both hands straight up by LIFT_HEIGHT along base +z."""
+    """Raise both hands straight up by LIFT_HEIGHT along base +z.
+
+    The public name is kept for existing call sites. The implementation sends
+    independent right/left Cartesian arm-component commands in one RobotCommand
+    so the torso stays fixed while both hands receive synchronized targets.
+    """
     dyn_state.set_q(q)
     dyn_model.compute_forward_kinematics(dyn_state)
     T_base2right = dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_RIGHT_INDEX)
@@ -708,33 +786,12 @@ def build_impedance_lift_command(dyn_model: Any, dyn_state: Any, q: Any) -> Any:
         f"  (over {LIFT_MINIMUM_TIME:.0f}s)"
     )
 
-    def arm_cartesian_impedance(link_name: str, T_target: np.ndarray) -> Any:
-        return (
-            rby.CartesianImpedanceControlCommandBuilder()
-            .set_command_header(
-                rby.CommandHeaderBuilder().set_control_hold_time(LIFT_HOLD_TIME)
-            )
-            .add_target(
-                IMPEDANCE_LIFT_REFERENCE_LINK,
-                link_name,
-                T_target,
-                LIFT_LINEAR_VELOCITY_LIMIT,
-                LIFT_ANGULAR_VELOCITY_LIMIT,
-                LIFT_LINEAR_ACCELERATION_LIMIT,
-                LIFT_ANGULAR_ACCELERATION_LIMIT,
-            )
-            .set_joint_stiffness(LIFT_JOINT_STIFFNESS)
-            .set_joint_damping_ratio(LIFT_JOINT_DAMPING_RATIO)
-            .set_joint_torque_limit(LIFT_JOINT_TORQUE_LIMIT)
-            .set_minimum_time(LIFT_MINIMUM_TIME)
-        )
-
-    return rby.RobotCommandBuilder().set_command(
-        rby.ComponentBasedCommandBuilder().set_body_command(
-            rby.BodyComponentBasedCommandBuilder()
-            .set_right_arm_command(arm_cartesian_impedance("ee_right", T_right_target))
-            .set_left_arm_command(arm_cartesian_impedance("ee_left", T_left_target))
-        )
+    return build_dual_target_cartesian_command(
+        reference_link=IMPEDANCE_LIFT_REFERENCE_LINK,
+        right_target=T_right_target,
+        left_target=T_left_target,
+        minimum_time=LIFT_MINIMUM_TIME,
+        hold_time=LIFT_HOLD_TIME,
     )
 
 
@@ -815,7 +872,7 @@ def main(
             print(f"[picking] reached '{name}'.")
 
         q = robot.get_state().position
-        camera_to_t5 = compute_camera_to_t5_for_view_rotation(
+        camera_to_base = compute_camera_to_base_for_view_rotation(
             view_rotation,
             dyn_model,
             dyn_state,
@@ -824,7 +881,7 @@ def main(
 
         long_axis_camera = None
         if box_center_camera_m is None:
-            # Live capture AT this pose, so the FK-based camera->T5 above and
+            # Live capture AT this pose, so the FK-based camera->base above and
             # the measurement share the exact same posture.
             print("[vision] live capture from D405 ...")
             live = capture_box_live(
@@ -847,19 +904,22 @@ def main(
                 f"| modes={sorted(set(live['modes']))}"
             )
 
-        box_center_t5_m = transform_camera_point_to_t5(box_center_camera_m, camera_to_t5)
+        box_center_base_m = transform_camera_point_to_base(
+            box_center_camera_m,
+            camera_to_base,
+        )
         print(f"[vision] view_rotation={view_rotation}")
         print("[vision] center_top_camera_m:", np.asarray(box_center_camera_m, dtype=np.float64))
-        print("[vision] camera(view)->T5 transform:")
-        print(camera_to_t5)
-        print("[vision] center_top_t5_m:", box_center_t5_m)
+        print("[vision] camera(view)->base transform:")
+        print(camera_to_base)
+        print("[vision] center_top_base_m:", box_center_base_m)
         if long_axis_camera is not None:
-            axis_t5 = np.asarray(camera_to_t5, dtype=np.float64)[:3, :3] @ np.asarray(
+            axis_base = np.asarray(camera_to_base, dtype=np.float64)[:3, :3] @ np.asarray(
                 long_axis_camera, dtype=np.float64
             )
-            yaw_t5_deg = float(np.degrees(np.arctan2(axis_t5[1], axis_t5[0])) % 180.0)
+            yaw_base_deg = float(np.degrees(np.arctan2(axis_base[1], axis_base[0])) % 180.0)
             print(
-                f"[vision] box yaw in T5 (long axis, mod 180): {yaw_t5_deg:.1f} deg "
+                f"[vision] box yaw in base (long axis, mod 180): {yaw_base_deg:.1f} deg "
                 "-- stage 1: printed only, NOT commanded."
             )
 
@@ -869,7 +929,7 @@ def main(
             dyn_state,
             robot_model,
             q,
-            box_center_t5_m,
+            box_center_base_m,
             approach_time=approach_time,
             hold_time=hold_time,
             max_reference_xy_shift_m=max_reference_xy_shift_m,
@@ -970,7 +1030,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs=2,
         default=(0.0, 0.0),
         metavar=("DX", "DY"),
-        help="Optional T5-frame x/y offset added to the transformed box center.",
+        help="Optional base-frame x/y offset added to the transformed box center.",
     )
     parser.add_argument(
         "--live-vision-frames",
