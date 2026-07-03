@@ -53,6 +53,7 @@ BASE_INDEX, TORSO_INDEX, EE_RIGHT_INDEX, EE_LEFT_INDEX, HEAD2_INDEX = 0, 1, 2, 3
 # torso is pitched. START_TO_PICKING supplies the target EEF z and rotation.
 VISION_PRE_PUSH_REFERENCE_LINK = "base"
 VISION_PRE_PUSH_REFERENCE_INDEX = BASE_INDEX
+VISION_PRE_PUSH_HAND_Y_MARGIN_M = 0.05
 
 # ---- Cartesian impedance "push inward" parameters ----
 # Keep the push in base as well. With the current fixed torso posture, base +/-
@@ -561,8 +562,8 @@ def vision_pre_push_targets(
     """Shift START_TO_PICKING hand targets so their midpoint matches the box center.
 
     z and rotation are copied from the recorded START_TO_PICKING FK in base.
-    Only base x/y receive the same delta on both hands, preserving recorded
-    hand spacing while avoiding T5-pitch-induced vertical drift.
+    The midpoint receives the vision x/y delta, then each hand is opened farther
+    along base y to give the box extra pre-grasp clearance.
     """
     T_right_ref, T_left_ref = start_to_picking_reference_targets(
         dyn_model,
@@ -581,6 +582,14 @@ def vision_pre_push_targets(
     T_left_target = T_left_ref.copy()
     T_right_target[:2, 3] += xy_delta
     T_left_target[:2, 3] += xy_delta
+    right_y_direction = np.sign(T_right_ref[1, 3] - reference_midpoint_xy[1])
+    left_y_direction = np.sign(T_left_ref[1, 3] - reference_midpoint_xy[1])
+    if right_y_direction == 0.0:
+        right_y_direction = -1.0
+    if left_y_direction == 0.0:
+        left_y_direction = 1.0
+    T_right_target[1, 3] += right_y_direction * VISION_PRE_PUSH_HAND_Y_MARGIN_M
+    T_left_target[1, 3] += left_y_direction * VISION_PRE_PUSH_HAND_Y_MARGIN_M
 
     return {
         "right_target": T_right_target,
@@ -588,6 +597,7 @@ def vision_pre_push_targets(
         "reference_midpoint_xy": reference_midpoint_xy,
         "target_midpoint_xy": target_midpoint_xy,
         "xy_delta": xy_delta,
+        "hand_y_margin_m": VISION_PRE_PUSH_HAND_Y_MARGIN_M,
     }
 
 
@@ -636,8 +646,12 @@ def build_vision_pre_push_command(
         targets["left_target"][:3, 3],
     )
     print(
+        "[vision_pre_push] extra y clearance:",
+        f"{targets['hand_y_margin_m']:.3f} m per hand",
+    )
+    print(
         "[vision_pre_push] base-frame z and rotation are inherited from "
-        "recorded START_TO_PICKING; only base x/y are shifted."
+        "recorded START_TO_PICKING; base x/y midpoint is shifted and y spacing is widened."
     )
 
     return build_dual_target_cartesian_command(
