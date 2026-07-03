@@ -14,7 +14,7 @@ The script stops at the pose just before the inward y-axis push. Pass
 
 Vision input, one of:
   - default: LIVE capture from the D405 at the pre-push pose (median over
-    LIVE_VISION_FRAMES_NEEDED confident frames; aborts if not enough).
+    LIVE_VISION_FRAMES_NEEDED usable center frames; aborts if not enough).
   - --vision-json <path>: latest record of inference.py --print-json output.
   - --box-center-camera X Y Z: manual center_top_camera_m.
 All are in the cw90 analysis camera frame (see --view-rotation) and are
@@ -73,6 +73,11 @@ CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS = 1280, 720, 30
 # The box is static, so a few confident frames (median) reject one-off noise.
 LIVE_VISION_FRAMES_NEEDED = 5
 LIVE_VISION_TIMEOUT_SEC = 10.0
+LIVE_VISION_MAX_CENTER_SPREAD_M = 0.025
+LIVE_VISION_CENTER_ONLY_ALLOWED_REASONS = {
+    "long_axis_center_underconstrained",
+    "yaw_from_extent_fallback",
+}
 
 
 def latest_json_record_from_path(path: str | Path) -> dict[str, Any]:
@@ -127,13 +132,34 @@ def box_center_camera_from_record(record: dict[str, Any], *, allow_unreliable: b
     return point
 
 
-def capture_box_live(view_rotation: str) -> dict[str, Any] | None:
+def live_estimate_center_mode(estimate: Any) -> tuple[bool, str]:
+    """Return whether an estimate is usable for center-only pre-push motion."""
+    if estimate.center_top_camera_m is None:
+        return False, "no_center"
+    if estimate.confidence.ok:
+        return True, "confidence_ok"
+    reasons = set(estimate.failure_reasons)
+    if reasons and reasons.issubset(LIVE_VISION_CENTER_ONLY_ALLOWED_REASONS):
+        return True, "center_only:" + ",".join(sorted(reasons))
+    return False, ",".join(estimate.failure_reasons[:2]) or "low_confidence"
+
+
+def capture_box_live(
+    view_rotation: str,
+    *,
+    frames_needed: int = LIVE_VISION_FRAMES_NEEDED,
+    timeout_sec: float = LIVE_VISION_TIMEOUT_SEC,
+    max_center_spread_m: float = LIVE_VISION_MAX_CENTER_SPREAD_M,
+) -> dict[str, Any] | None:
     """Detect the box from the live D405 at the current posture.
 
     Runs the rim-plane estimator with the stored plane calibration and keeps
-    only confidence-ok frames; returns the per-axis median center (analysis
-    camera frame), the long-axis direction, and the frame count, or None when
-    not enough confident frames arrive within the timeout.
+    confidence-ok frames are preferred. For this stage-1 motion, yaw is not
+    commanded, so frames whose only issue is an underconstrained long-axis
+    center are also accepted as center-only candidates and checked by a
+    multi-frame center-spread gate. Returns the per-axis median center
+    (analysis camera frame), optional long-axis direction, and frame count, or
+    None when not enough usable frames arrive within the timeout.
     """
     import time
 
@@ -168,9 +194,10 @@ def capture_box_live(view_rotation: str) -> dict[str, Any] | None:
 
     centers: list[Any] = []
     long_axes: list[Any] = []
-    deadline = time.monotonic() + LIVE_VISION_TIMEOUT_SEC
+    modes: list[str] = []
+    deadline = time.monotonic() + float(timeout_sec)
     try:
-        while len(centers) < LIVE_VISION_FRAMES_NEEDED and time.monotonic() < deadline:
+        while len(centers) < int(frames_needed) and time.monotonic() < deadline:
             frames = align.process(pipeline.wait_for_frames())
             color = frames.get_color_frame()
             depth = frames.get_depth_frame()
@@ -182,20 +209,37 @@ def capture_box_live(view_rotation: str) -> dict[str, Any] | None:
             )
             mask, _ = segment_yellow_box(image, keep_largest_component=False)
             estimate = estimate_plane_box(mask, depth_m, intrinsics, rim_plane=rim_plane)
-            if estimate.center_top_camera_m is not None and estimate.confidence.ok:
+            usable, mode = live_estimate_center_mode(estimate)
+            if usable:
                 centers.append(estimate.center_top_camera_m)
-                long_axes.append(estimate.support["long_axis_camera"])
-            elif estimate.failure_reasons:
-                print(f"[vision] frame rejected: {','.join(estimate.failure_reasons[:2])}")
+                modes.append(mode)
+                if estimate.confidence.ok:
+                    long_axes.append(estimate.support["long_axis_camera"])
+                elif len(centers) == 1 or len(centers) % 3 == 0:
+                    print(f"[vision] accepted center-only frame: {mode}")
+            else:
+                print(f"[vision] frame rejected: {mode}")
     finally:
         pipeline.stop()
 
-    if len(centers) < LIVE_VISION_FRAMES_NEEDED:
+    if len(centers) < int(frames_needed):
         return None
+    center_array = np.asarray(centers, dtype=np.float64)
+    center_median = np.median(center_array, axis=0)
+    center_spread_m = float(np.max(np.linalg.norm(center_array - center_median, axis=1)))
+    if center_spread_m > float(max_center_spread_m):
+        print(
+            "[vision] FAILED: live center spread too large "
+            f"({center_spread_m:.3f} m > {max_center_spread_m:.3f} m)."
+        )
+        return None
+
     return {
-        "center_camera_m": np.median(np.asarray(centers, dtype=np.float64), axis=0),
-        "long_axis_camera": np.median(np.asarray(long_axes, dtype=np.float64), axis=0),
+        "center_camera_m": center_median,
+        "center_spread_m": center_spread_m,
+        "long_axis_camera": None if not long_axes else np.median(np.asarray(long_axes, dtype=np.float64), axis=0),
         "frames_used": len(centers),
+        "modes": modes,
     }
 
 
@@ -378,6 +422,9 @@ def main(
     hold_time: float,
     max_reference_xy_shift_m: float | None,
     midpoint_offset_xy_m: tuple[float, float],
+    live_vision_frames_needed: int,
+    live_vision_timeout_sec: float,
+    live_center_spread_m: float,
     continue_pick: bool,
 ) -> bool:
     robot = rby.create_robot(address, model)
@@ -427,17 +474,26 @@ def main(
         if box_center_camera_m is None:
             # Live capture AT this pose, so the FK-based camera->T5 above and
             # the measurement share the exact same posture.
-            print("[vision] live capture from D405 (confident frames only) ...")
-            live = capture_box_live(view_rotation)
+            print("[vision] live capture from D405 ...")
+            live = capture_box_live(
+                view_rotation,
+                frames_needed=live_vision_frames_needed,
+                timeout_sec=live_vision_timeout_sec,
+                max_center_spread_m=live_center_spread_m,
+            )
             if live is None:
                 print(
-                    "[vision] FAILED: not enough confident frames within "
-                    f"{LIVE_VISION_TIMEOUT_SEC:.0f}s. Aborting before contact."
+                    "[vision] FAILED: not enough usable center frames within "
+                    f"{live_vision_timeout_sec:.0f}s. Aborting before contact."
                 )
                 return done
             box_center_camera_m = live["center_camera_m"]
             long_axis_camera = live["long_axis_camera"]
-            print(f"[vision] confident frames used: {live['frames_used']}")
+            print(
+                f"[vision] usable frames used: {live['frames_used']} "
+                f"| center spread={live['center_spread_m'] * 1000.0:.1f} mm "
+                f"| modes={sorted(set(live['modes']))}"
+            )
 
         box_center_t5_m = transform_camera_point_to_t5(box_center_camera_m, camera_to_t5)
         print(f"[vision] view_rotation={view_rotation}")
@@ -565,6 +621,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional T5-frame x/y offset added to the transformed box center.",
     )
     parser.add_argument(
+        "--live-vision-frames",
+        type=int,
+        default=LIVE_VISION_FRAMES_NEEDED,
+        help="Number of usable live center frames to median before moving.",
+    )
+    parser.add_argument(
+        "--live-vision-timeout-sec",
+        type=float,
+        default=LIVE_VISION_TIMEOUT_SEC,
+        help="Maximum live D405 capture time before aborting.",
+    )
+    parser.add_argument(
+        "--live-center-spread-m",
+        type=float,
+        default=LIVE_VISION_MAX_CENTER_SPREAD_M,
+        help="Abort if accepted live center candidates spread more than this.",
+    )
+    parser.add_argument(
         "--continue-pick",
         action="store_true",
         help="After reaching pre-push, continue with inward y push and lift.",
@@ -588,6 +662,9 @@ if __name__ == "__main__":
             hold_time=float(args.hold_time),
             max_reference_xy_shift_m=max_shift,
             midpoint_offset_xy_m=tuple(float(v) for v in args.midpoint_offset_xy_m),
+            live_vision_frames_needed=int(args.live_vision_frames),
+            live_vision_timeout_sec=float(args.live_vision_timeout_sec),
+            live_center_spread_m=float(args.live_center_spread_m),
             continue_pick=bool(args.continue_pick),
         )
         else 1
