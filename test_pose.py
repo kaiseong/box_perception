@@ -43,7 +43,7 @@ DEFAULT_SERVO = ".*"
 DEFAULT_MODE = "full-pick"
 DEFAULT_HOLD_SEC = 1.0
 DEFAULT_PRIORITY = 1
-DEFAULT_BOX_CENTER_OFFSET_X_M = 0.0
+DEFAULT_BOX_X_OFFSET = 0.0
 
 
 @dataclass(frozen=True)
@@ -145,7 +145,7 @@ def build_demo_vision_pre_push_command(
     dyn_state: object,
     robot_model: object,
     q: np.ndarray,
-    box_center_offset_x_m: float,
+    box_x_offset: float,
 ) -> object:
     right_ref, left_ref = start_to_picking_reference_targets(
         dyn_model,
@@ -155,7 +155,7 @@ def build_demo_vision_pre_push_command(
     )
     midpoint_xy = 0.5 * (right_ref[:2, 3] + left_ref[:2, 3])
     box_center_base_m = np.array(
-        [midpoint_xy[0] + box_center_offset_x_m, midpoint_xy[1], 0.0],
+        [midpoint_xy[0] + box_x_offset, midpoint_xy[1], 0.0],
         dtype=np.float64,
     )
     print(
@@ -163,7 +163,7 @@ def build_demo_vision_pre_push_command(
         "center_base_xy="
         f"{np.array2string(box_center_base_m[:2], precision=3)} "
         f"(reference_midpoint_xy={np.array2string(midpoint_xy, precision=3)}, "
-        f"offset_x={box_center_offset_x_m:+.3f} m)"
+        f"box_x_offset={box_x_offset:+.3f} m)"
     )
     return build_vision_pre_push_command(
         dyn_model,
@@ -173,7 +173,7 @@ def build_demo_vision_pre_push_command(
         box_center_base_m,
         approach_time=VISION_APPROACH_MINIMUM_TIME,
         hold_time=VISION_APPROACH_HOLD_TIME,
-        max_reference_xy_shift_m=max(0.001, abs(box_center_offset_x_m) + 0.001),
+        max_reference_xy_shift_m=max(0.001, abs(box_x_offset) + 0.001),
         midpoint_offset_xy_m=(0.0, 0.0),
     )
 
@@ -208,9 +208,11 @@ def main() -> int:
     parser.add_argument("--hold-sec", type=float, default=DEFAULT_HOLD_SEC)
     parser.add_argument("--priority", type=int, default=DEFAULT_PRIORITY)
     parser.add_argument(
+        "--box-x-offset",
         "--box-center-offset-x-m",
+        dest="box_x_offset",
         type=float,
-        default=DEFAULT_BOX_CENTER_OFFSET_X_M,
+        default=DEFAULT_BOX_X_OFFSET,
         help=(
             "Base-frame x offset added to the demo box center used by full-pick "
             "vision_pre_push. Positive values move both hand targets along +x."
@@ -238,7 +240,7 @@ def main() -> int:
         "[defaults] "
         f"address={args.address} model={args.model} mode={args.mode} "
         f"minimum_time={args.minimum_time} hold_sec={args.hold_sec} "
-        f"box_center_offset_x_m={args.box_center_offset_x_m:+.3f}"
+        f"box_x_offset={args.box_x_offset:+.3f}"
     )
     print("[sequence]", " -> ".join(item.name for item in sequence))
     if mode_runs_push_lift(args.mode):
@@ -282,7 +284,7 @@ def main() -> int:
                 dyn_state,
                 robot_model,
                 q,
-                float(args.box_center_offset_x_m),
+                float(args.box_x_offset),
             ),
             "vision_pre_push_demo",
             int(args.priority),

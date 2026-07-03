@@ -1033,7 +1033,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional base-frame x/y offset added to the transformed box center.",
     )
     parser.add_argument(
+        "--box-x-offset",
         "--box-center-offset-x-m",
+        dest="box_x_offset",
         type=float,
         default=0.0,
         help=(
@@ -1078,7 +1080,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def combined_midpoint_offset_xy(args: argparse.Namespace) -> tuple[float, float]:
     """Return the final base-frame grasp midpoint offset."""
     midpoint_dx, midpoint_dy = (float(v) for v in args.midpoint_offset_xy_m)
-    return midpoint_dx + float(args.box_center_offset_x_m), midpoint_dy
+    return midpoint_dx + float(args.box_x_offset), midpoint_dy
 
 
 if __name__ == "__main__":
