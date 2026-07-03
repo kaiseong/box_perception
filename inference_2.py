@@ -3,11 +3,11 @@
 
 Live mode (D405 attached):
 
-    python inference.py --config config/rim_plane.json
+    python inference_2.py --config config_2/rim_plane.json
 
 Replay mode (no camera, for testing the same code path offline):
 
-    python inference.py --replay recordings/inference_test_3
+    python inference_2.py --replay recordings/d405_center_visible
 
 By default only confident estimates are drawn: frames whose confidence is not
 ok show the failure reasons and keep the last confident pose as a gray ghost
@@ -43,7 +43,7 @@ from replay_recording import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Live/replay box pose inference and visualization.")
-    parser.add_argument("--config", default="config/rim_plane.json", help="Stored rim plane calibration JSON.")
+    parser.add_argument("--config", default="config_2/rim_plane.json", help="Stored rim plane calibration JSON.")
     parser.add_argument("--replay", help="Recording session directory to replay instead of a live camera.")
     parser.add_argument("--stride", type=int, default=1, help="Replay frame stride.")
     parser.add_argument("--serial-number", help="RealSense serial number when several cameras are attached.")
