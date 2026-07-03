@@ -266,8 +266,8 @@ READY_TO_PICKING = {
 #       The values below are kept only as a reference for the approximate target.
 START_TO_PICKING = {
     "torso":     [0.000,  0.000,  0.000,  0.349,  0.000,  0.000],
-    "right_arm": [-0.171, -0.841, -0.153, -1.511, -2.403,  1.743,  3.2],
-    "left_arm":  [-0.171,  0.841,  0.153, -1.511,  2.403,  1.743, -3.2],
+    "right_arm": [-0.171, -0.841, -0.153, -1.511, -2.403,  1.743,  0.3],
+    "left_arm":  [-0.171,  0.841,  0.153, -1.511,  2.403,  1.743, -0.3],
     "head":      [0.000,  0.436],
 }
 
