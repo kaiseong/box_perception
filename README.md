@@ -84,6 +84,7 @@ box_pose/
 
 recording.py            D405 RGB/depth/intrinsics/timestamp 녹화 CLI
 replay_recording.py     녹화 session replay 및 frame별 분석
+inference.py            D405 live 추론 + RGB overlay + stdout JSONL
 demo_offline.py         단일 이미지 offline demo
 tests/                  unit tests
 ```
@@ -480,6 +481,45 @@ PY
 
 이 값은 로봇과 책상/박스 배치에 따라 바뀌므로 threshold로 하드코딩하지 않습니다. 대신 frame마다 depth 품질을 confidence에 반영합니다.
 
+## Live Inference
+
+로봇이 박스 앞 접근을 끝내고 정지한 뒤 live 추론을 실행합니다. 첫 `--init-frames` 동안 rim plane prior를 초기화하고, 이후에는 매 frame마다 `known_size` plane estimator로 중심/yaw를 추정합니다.
+
+```bash
+python inference.py \
+  --width 1280 \
+  --height 720 \
+  --fps 30 \
+  --view-rotation cw90 \
+  --init-frames 15 \
+  --preview
+```
+
+기본 동작:
+
+- depth를 color frame에 align합니다.
+- raw D405 frame을 분석 좌표계로 `cw90` 회전합니다.
+- startup burst에서 rim plane prior를 만듭니다.
+- startup plane init이 실패해도 종료하지 않고 per-frame plane discovery로 계속 추론합니다.
+- OpenCV window에는 RGB overlay를 표시합니다.
+- stdout에는 frame마다 JSON 한 줄을 출력합니다. init/status/warning 로그는 JSON 파싱을 방해하지 않도록 stderr로 보냅니다.
+
+stdout JSONL 예:
+
+```json
+{"ok": true, "center_top_camera_m": [0.01, 0.04, 0.4], "yaw_mod_180": 12.3, "long_axis_camera": [1.0, 0.0, 0.0], "short_axis_camera": [0.0, -0.7, 0.7]}
+```
+
+주요 옵션:
+
+- `--no-preview`: GUI 없이 stdout JSONL만 출력
+- `--max-frames N`: N개 frame 분석 후 종료
+- `--serial-number SERIAL`: 여러 RealSense가 있을 때 카메라 지정
+- `--disable-emitter`, `--laser-power VALUE`: D405 depth sensor 설정
+- `--no-image-fallback`: plane fitting 실패 시 image-space fallback을 끕니다
+
+출력 pose는 아직 camera frame 기준입니다. `camera-to-T5`, ROS, State Machine 직접 연동은 이 스크립트 범위에 포함하지 않았습니다.
+
 ## Replay
 
 녹화 세션을 offline 환경에서 다시 분석합니다.
@@ -562,11 +602,11 @@ python demo_offline.py pallet_box.png
 ## Tests
 
 ```bash
-python -m py_compile demo_offline.py recording.py replay_recording.py box_pose/*.py tests/*.py
+python -m py_compile demo_offline.py recording.py replay_recording.py inference.py box_pose/*.py tests/*.py
 python -m unittest discover -s tests -v
 ```
 
-RealSense 카메라 없이도 unit tests는 돌아가야 합니다. 실제 D405 접근은 `recording.py` runtime에서만 `pyrealsense2`를 import합니다.
+RealSense 카메라 없이도 unit tests는 돌아가야 합니다. 실제 D405 접근은 `recording.py`와 `inference.py` runtime에서만 `pyrealsense2`를 import합니다.
 
 ## Troubleshooting
 

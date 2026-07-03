@@ -1,0 +1,31 @@
+{
+  "comment": "D405 카메라 좌표계(분석 방향, cw90 회전 적용) 기준 박스 rim 평면. 카메라 마운트/책상 높이/박스/추종 시 torso 자세가 바뀌지 않는 한 유효.",
+  "frame": "d405_color_analysis_cw90",
+  "normal": [
+    0.004276739040013395,
+    -0.7052930437024778,
+    -0.7089029778524552
+  ],
+  "point": [
+    -0.0013360753411285416,
+    0.22033718567907384,
+    0.22146494773230108
+  ],
+  "box_size_m": {
+    "long": 0.505,
+    "short": 0.335,
+    "height": 0.195
+  },
+  "derived_from_sessions": [
+    "d405_center_visible",
+    "d405_left_crop",
+    "d405_right_crop",
+    "d405_yaw_plus",
+    "d405_yaw_minus"
+  ],
+  "cross_session_spread": {
+    "angle_deg": 0.55,
+    "offset_mm": 1.4
+  },
+  "created": "2026-07-03"
+}
