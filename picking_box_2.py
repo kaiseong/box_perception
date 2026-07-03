@@ -41,9 +41,6 @@ np.set_printoptions(precision=3, suppress=True, floatmode="fixed")
 # Time (seconds) the robot takes to reach each joint pose.
 MINIMUM_TIME = 2.0
 
-# Rate (Hz) at which the FT-sensor monitoring callback is invoked.
-FT_MONITOR_RATE = 10.0
-
 # Link indices into the dynamics state (order MUST match DYN_LINK_NAMES below).
 DYN_LINK_NAMES = ["base", "link_torso_5", "ee_right", "ee_left", "link_head_2"]
 BASE_INDEX, TORSO_INDEX, EE_RIGHT_INDEX, EE_LEFT_INDEX, HEAD2_INDEX = 0, 1, 2, 3, 4
@@ -695,9 +692,18 @@ def build_pose_command(pose: dict[str, list[float]], minimum_time: float) -> Any
     )
 
 
-def send_once(robot: Any, builder: Any) -> bool:
-    """Send a single command and return whether it finished successfully."""
-    feedback = robot.send_command(builder).get()
+def print_stage(stage: str, message: str) -> None:
+    """Print the currently active picking stage immediately."""
+    print(f"[stage] {stage} | {message}", flush=True)
+
+
+def send_stage(robot: Any, builder: Any, stage: str) -> bool:
+    """Send a command and leave a clear log while waiting for completion."""
+    print_stage(stage, "sending command")
+    command = robot.send_command(builder)
+    print_stage(stage, "waiting for finish_code")
+    feedback = command.get()
+    print_stage(stage, f"finish_code={feedback.finish_code}")
     return feedback.finish_code == rby.RobotCommandFeedback.FinishCode.Ok
 
 
@@ -809,31 +815,6 @@ def build_impedance_lift_command(dyn_model: Any, dyn_state: Any, q: Any) -> Any:
     )
 
 
-class FTMonitor:
-    """Monitor both arm force magnitudes through robot state callbacks."""
-
-    def __init__(self) -> None:
-        self.samples = 0
-        self.peak_force_right = 0.0
-        self.peak_force_left = 0.0
-
-    def callback(self, robot_state: Any) -> None:
-        ft_right = robot_state.ft_sensor_right
-        ft_left = robot_state.ft_sensor_left
-
-        force_right = float(np.linalg.norm(ft_right.force))
-        force_left = float(np.linalg.norm(ft_left.force))
-
-        self.samples += 1
-        self.peak_force_right = max(self.peak_force_right, force_right)
-        self.peak_force_left = max(self.peak_force_left, force_left)
-
-        print(
-            f"[FT] right | force {ft_right.force} |F|={force_right:6.2f}N "
-            f"  ||  left | force {ft_left.force} |F|={force_left:6.2f}N "
-        )
-
-
 def main(
     *,
     address: str,
@@ -873,17 +854,15 @@ def main(
     dyn_model = robot.get_dynamics()
     dyn_state = dyn_model.make_state(DYN_LINK_NAMES, robot_model.robot_joint_names)
 
-    ft_monitor = FTMonitor()
-    robot.start_state_update(ft_monitor.callback, FT_MONITOR_RATE)
-
     done = False
     try:
         for name, pose in JOINT_SEQUENCE:
-            print(f"[picking] moving to '{name}' (joint position) ...")
-            if not send_once(robot, build_pose_command(pose, MINIMUM_TIME)):
-                print(f"[picking] FAILED while moving to '{name}'. Aborting.")
+            stage = f"1/5 {name}"
+            print_stage(stage, "joint position move")
+            if not send_stage(robot, build_pose_command(pose, MINIMUM_TIME), stage):
+                print_stage(stage, "FAILED; aborting")
                 return done
-            print(f"[picking] reached '{name}'.")
+            print_stage(stage, "reached")
 
         q = robot.get_state().position
         camera_to_base = compute_camera_to_base_for_view_rotation(
@@ -897,7 +876,7 @@ def main(
         if box_center_camera_m is None:
             # Live capture AT this pose, so the FK-based camera->base above and
             # the measurement share the exact same posture.
-            print("[vision] live capture from D405 ...")
+            print_stage("2/5 live_vision", "capturing D405 frames")
             live = capture_box_live(
                 view_rotation,
                 frames_needed=live_vision_frames_needed,
@@ -905,18 +884,22 @@ def main(
                 max_center_spread_m=live_center_spread_m,
             )
             if live is None:
-                print(
-                    "[vision] FAILED: not enough usable center frames within "
-                    f"{live_vision_timeout_sec:.0f}s. Aborting before contact."
+                print_stage(
+                    "2/5 live_vision",
+                    "FAILED: not enough usable center frames within "
+                    f"{live_vision_timeout_sec:.0f}s; aborting before contact",
                 )
                 return done
             box_center_camera_m = live["center_camera_m"]
             long_axis_camera = live["long_axis_camera"]
-            print(
-                f"[vision] usable frames used: {live['frames_used']} "
+            print_stage(
+                "2/5 live_vision",
+                f"done; usable frames={live['frames_used']} "
                 f"| center spread={live['center_spread_m'] * 1000.0:.1f} mm "
-                f"| modes={sorted(set(live['modes']))}"
+                f"| modes={sorted(set(live['modes']))}",
             )
+        else:
+            print_stage("2/5 live_vision", "skipped; using supplied center_top_camera_m")
 
         box_center_base_m = transform_camera_point_to_base(
             box_center_camera_m,
@@ -937,7 +920,7 @@ def main(
                 "-- stage 1: printed only, NOT commanded."
             )
 
-        print("[picking] moving to vision-adjusted pre-push pose ...")
+        print_stage("3/5 vision_pre_push", "building target")
         command = build_vision_pre_push_command(
             dyn_model,
             dyn_state,
@@ -949,42 +932,42 @@ def main(
             max_reference_xy_shift_m=max_reference_xy_shift_m,
             midpoint_offset_xy_m=midpoint_offset_xy_m,
         )
-        if not send_once(robot, command):
-            print("[picking] FAILED during vision-adjusted pre-push motion. Aborting.")
+        if not send_stage(robot, command, "3/5 vision_pre_push"):
+            print_stage("3/5 vision_pre_push", "FAILED; aborting")
             return done
-        print("[picking] reached vision-adjusted pre-push pose.")
+        print_stage("3/5 vision_pre_push", "reached")
 
         if not continue_pick:
             done = True
-            print("[picking] stopped before inward y-axis push. done = True")
+            print_stage("3/5 vision_pre_push", "pre-push-only stop; done=True")
             return done
 
-        print("[picking] pushing EEF inward with Cartesian impedance control ...")
+        print_stage("4/5 inward_push", "building target")
         q = robot.get_state().position
-        if not send_once(robot, build_impedance_push_command(dyn_model, dyn_state, q)):
-            print("[picking] FAILED during Cartesian impedance push. Aborting.")
+        if not send_stage(
+            robot,
+            build_impedance_push_command(dyn_model, dyn_state, q),
+            "4/5 inward_push",
+        ):
+            print_stage("4/5 inward_push", "FAILED; aborting")
             return done
-        print("[picking] Cartesian impedance push done.")
+        print_stage("4/5 inward_push", "done")
 
-        print("[picking] lifting the box ...")
+        print_stage("5/5 lift", "building target")
         q = robot.get_state().position
-        if not send_once(robot, build_impedance_lift_command(dyn_model, dyn_state, q)):
-            print("[picking] FAILED during lift. Aborting.")
+        if not send_stage(robot, build_impedance_lift_command(dyn_model, dyn_state, q), "5/5 lift"):
+            print_stage("5/5 lift", "FAILED; aborting")
             return done
-        print("[picking] box lifted.")
+        print_stage("5/5 lift", "done")
 
         done = True
         print("=" * 60)
         print(f"[picking] picking motion COMPLETED. done = {done}")
         print("=" * 60)
         return done
-    finally:
-        robot.stop_state_update()
-        print(
-            f"[FT] monitoring stopped. samples={ft_monitor.samples}, "
-            f"peak |F| right={ft_monitor.peak_force_right:.2f}N, "
-            f"left={ft_monitor.peak_force_left:.2f}N"
-        )
+    except KeyboardInterrupt:
+        print_stage("interrupted", "KeyboardInterrupt while waiting in the last printed stage")
+        raise
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
