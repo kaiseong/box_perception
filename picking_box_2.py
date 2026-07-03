@@ -1033,6 +1033,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional base-frame x/y offset added to the transformed box center.",
     )
     parser.add_argument(
+        "--box-center-offset-x-m",
+        type=float,
+        default=0.0,
+        help=(
+            "Additional base-frame x offset for the grasp midpoint. "
+            "This is added on top of --midpoint-offset-xy-m DX."
+        ),
+    )
+    parser.add_argument(
         "--live-vision-frames",
         type=int,
         default=LIVE_VISION_FRAMES_NEEDED,
@@ -1066,10 +1075,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def combined_midpoint_offset_xy(args: argparse.Namespace) -> tuple[float, float]:
+    """Return the final base-frame grasp midpoint offset."""
+    midpoint_dx, midpoint_dy = (float(v) for v in args.midpoint_offset_xy_m)
+    return midpoint_dx + float(args.box_center_offset_x_m), midpoint_dy
+
+
 if __name__ == "__main__":
     args = parse_args()
     center_camera = resolve_box_center_camera(args)
     max_shift = None if args.allow_large_vision_shift else float(args.max_reference_xy_shift_m)
+    midpoint_offset_xy = combined_midpoint_offset_xy(args)
+    if any(abs(v) > 1e-12 for v in midpoint_offset_xy):
+        print(f"[vision_pre_push] configured base-frame grasp offset xy: {midpoint_offset_xy}")
     raise SystemExit(
         0
         if main(
@@ -1081,7 +1099,7 @@ if __name__ == "__main__":
             approach_time=float(args.approach_time),
             hold_time=float(args.hold_time),
             max_reference_xy_shift_m=max_shift,
-            midpoint_offset_xy_m=tuple(float(v) for v in args.midpoint_offset_xy_m),
+            midpoint_offset_xy_m=midpoint_offset_xy,
             live_vision_frames_needed=int(args.live_vision_frames),
             live_vision_timeout_sec=float(args.live_vision_timeout_sec),
             live_center_spread_m=float(args.live_center_spread_m),
