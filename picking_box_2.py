@@ -598,6 +598,51 @@ def vision_pre_push_targets(
     }
 
 
+def rotation_error_deg(current: np.ndarray, target: np.ndarray) -> float:
+    """Return angular difference from current orientation to target orientation."""
+    R_delta = np.asarray(target[:3, :3], dtype=np.float64) @ np.asarray(
+        current[:3, :3], dtype=np.float64
+    ).T
+    cos_angle = float(np.clip((np.trace(R_delta) - 1.0) * 0.5, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cos_angle)))
+
+
+def print_current_to_target_delta(
+    *,
+    label: str,
+    dyn_model: Any,
+    dyn_state: Any,
+    q: Any,
+    ref_index: int,
+    right_target: np.ndarray,
+    left_target: np.ndarray,
+) -> None:
+    """Print current EEF pose, target pose, and delta before sending a command."""
+    dyn_state.set_q(q)
+    dyn_model.compute_forward_kinematics(dyn_state)
+    current_right = np.asarray(
+        dyn_model.compute_transformation(dyn_state, ref_index, EE_RIGHT_INDEX),
+        dtype=np.float64,
+    )
+    current_left = np.asarray(
+        dyn_model.compute_transformation(dyn_state, ref_index, EE_LEFT_INDEX),
+        dtype=np.float64,
+    )
+
+    for arm_name, current, target in (
+        ("right", current_right, right_target),
+        ("left", current_left, left_target),
+    ):
+        delta_xyz = np.asarray(target[:3, 3] - current[:3, 3], dtype=np.float64)
+        print(
+            f"[{label}] {arm_name} current xyz: {current[:3, 3]} -> "
+            f"target xyz: {target[:3, 3]} | delta={delta_xyz} "
+            f"| |delta|={np.linalg.norm(delta_xyz):.3f} m | "
+            f"rotation_delta={rotation_error_deg(current, target):.1f} deg",
+            flush=True,
+        )
+
+
 def build_vision_pre_push_command(
     dyn_model: Any,
     dyn_state: Any,
@@ -645,6 +690,15 @@ def build_vision_pre_push_command(
     print(
         "[vision_pre_push] extra y clearance:",
         f"{targets['hand_y_margin_m']:.3f} m per hand",
+    )
+    print_current_to_target_delta(
+        label="vision_pre_push",
+        dyn_model=dyn_model,
+        dyn_state=dyn_state,
+        q=q_template,
+        ref_index=VISION_PRE_PUSH_REFERENCE_INDEX,
+        right_target=targets["right_target"],
+        left_target=targets["left_target"],
     )
     print(
         "[vision_pre_push] base-frame z and rotation are inherited from "
