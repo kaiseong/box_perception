@@ -6,11 +6,12 @@ orientation, but shifts only x/y from the latest camera-estimated box center.
 
 Default sequence:
   1. ready -> ready_to_picking       (joint position control)
-  2. live vision at that pose        (D405 + rim-plane estimator, confident frames only)
+  2. live vision at that pose        (D405 + rim-plane estimator, usable center frames)
   3. vision_pre_push                 (Cartesian impedance control)
+  4. inward y-axis push              (Cartesian impedance control)
+  5. lift                            (Cartesian impedance control)
 
-The script stops at the pose just before the inward y-axis push. Pass
---continue-pick to run the existing inward push and lift after that.
+Pass --pre-push-only to stop at the pose just before the inward y-axis push.
 
 Vision input, one of:
   - default: LIVE capture from the D405 at the pre-push pose (median over
@@ -638,10 +639,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=LIVE_VISION_MAX_CENTER_SPREAD_M,
         help="Abort if accepted live center candidates spread more than this.",
     )
+    parser.set_defaults(continue_pick=True)
     parser.add_argument(
         "--continue-pick",
+        dest="continue_pick",
         action="store_true",
-        help="After reaching pre-push, continue with inward y push and lift.",
+        help="After reaching pre-push, continue with inward y push and lift. This is now the default.",
+    )
+    parser.add_argument(
+        "--pre-push-only",
+        dest="continue_pick",
+        action="store_false",
+        help="Stop after the vision-adjusted pre-push pose, before y-axis inward push.",
     )
     return parser.parse_args(argv)
 
