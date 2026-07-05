@@ -88,117 +88,30 @@ LIFT_JOINT_TORQUE_LIMIT = [50.0] * 7            # Nm (must exceed the holding to
 PUSH_HOLD_TIME = 3.0
 LIFT_HOLD_TIME = 100.0
 
-# ---- Vision extrinsic: D405 camera frame into T5/link_torso_5 frame ----
-# Matrix naming below uses target_from_source convention:
-#   p_target = T_TARGET_FROM_SOURCE @ [p_source_x, p_source_y, p_source_z, 1]
-#
-# User-measured D405 extrinsic: x,y,z [m], roll,pitch,yaw [deg], Euler ZYX.
-# The mount frame is link_head_2, i.e. AFTER the head_1 pitch joint: with the
-# recorded D405 data the box rim-plane normal maps to world vertical within
-# 0.3 deg through link_head_2, but is off by exactly the head_1 angle (25.2 deg
-# at head_1 = 0.436 rad) through link_head_1 -- the camera pitches with head_1.
-# (link_head_1 and link_head_2 coincide at head_1 = 0, so a mount measurement
-# taken at zero pitch is identical in both frames.)
-HEAD2_TO_CAMERA_XYZ_RPY_ZYX_DEG = np.array(
-    [0.023, 0.0, 0.066, 0.0, 90.0, 0.0],
-    dtype=np.float64,
+# ---- Vision extrinsic: shared single source of truth (camera_extrinsics.py).
+# Names are re-exported here so existing importers keep working.
+from camera_extrinsics import (  # noqa: F401  (re-exported for importers)
+    CAMERA_TO_T5_STATIC,
+    HEAD2_TO_CAMERA_XYZ_RPY_ZYX_DEG,
+    HEAD_1_PITCH_RAD_STATIC,
+    T5_TO_CAMERA_STATIC,
+    T5_TO_HEAD1_ZERO_HEAD0_XYZ_M,
+    T_HEAD2_FROM_CAMERA,
+    T_T5_FROM_HEAD2_STATIC,
+    camera_to_t5_for_view_rotation,
+    invert_transform,
+    make_transform,
+    raw_camera_from_view_rotation_transform,
+    rotation_from_euler_zyx_deg,
+    transform_camera_point_to_t5,
+    transform_from_xyz_rpy_zyx_deg,
 )
-
-# Static URDF fallback for model=rby1a/model.urdf when head_0 = 0:
-#   link_torso_5 -> link_head_0: xyz=(0.022, 0.0, 0.120073451525)
-#   link_head_0  -> link_head_1: xyz=(0.0,   0.0, 0.080)   (head_0 revolute, z)
-#   link_head_1  -> link_head_2: xyz=(0.0,   0.0, 0.0)     (head_1 revolute, y)
-T5_TO_HEAD1_ZERO_HEAD0_XYZ_M = np.array([0.022, 0.0, 0.200073451525], dtype=np.float64)
-# head_1 pitch used by every recorded pose below ("head": [0.000, 0.436]).
-HEAD_1_PITCH_RAD_STATIC = 0.436
-
-
-def _rot_x(theta):
-    c, s = np.cos(theta), np.sin(theta)
-    return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]], dtype=np.float64)
-
-
-def _rot_y(theta):
-    c, s = np.cos(theta), np.sin(theta)
-    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=np.float64)
-
-
-def _rot_z(theta):
-    c, s = np.cos(theta), np.sin(theta)
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
-
-
-def rotation_from_euler_zyx_deg(roll_deg, pitch_deg, yaw_deg):
-    """Return R = Rz(yaw) @ Ry(pitch) @ Rx(roll), angles in degrees."""
-    roll, pitch, yaw = np.deg2rad([roll_deg, pitch_deg, yaw_deg])
-    return _rot_z(yaw) @ _rot_y(pitch) @ _rot_x(roll)
-
-
-def make_transform(translation, rotation=None):
-    T = np.eye(4, dtype=np.float64)
-    if rotation is not None:
-        T[:3, :3] = np.asarray(rotation, dtype=np.float64)
-    T[:3, 3] = np.asarray(translation, dtype=np.float64)
-    return T
-
-
-def transform_from_xyz_rpy_zyx_deg(xyz_rpy_deg):
-    x, y, z, roll_deg, pitch_deg, yaw_deg = np.asarray(xyz_rpy_deg, dtype=np.float64)
-    return make_transform(
-        [x, y, z],
-        rotation_from_euler_zyx_deg(roll_deg, pitch_deg, yaw_deg),
-    )
-
-
-def invert_transform(T):
-    T = np.asarray(T, dtype=np.float64)
-    T_inv = np.eye(4, dtype=np.float64)
-    R = T[:3, :3]
-    t = T[:3, 3]
-    T_inv[:3, :3] = R.T
-    T_inv[:3, 3] = -R.T @ t
-    return T_inv
-
-
-# Pose of camera frame expressed in link_head_2 coordinates. It maps
-# camera-frame points into head_2: p_head2 = T_HEAD2_FROM_CAMERA @ p_camera.
-T_HEAD2_FROM_CAMERA = transform_from_xyz_rpy_zyx_deg(HEAD2_TO_CAMERA_XYZ_RPY_ZYX_DEG)
-
-# Static camera->T5 transform for the recorded posture (head_0 = 0,
-# head_1 = HEAD_1_PITCH_RAD_STATIC): p_t5 = CAMERA_TO_T5_STATIC @ p_camera.
-T_T5_FROM_HEAD2_STATIC = make_transform(T5_TO_HEAD1_ZERO_HEAD0_XYZ_M) @ make_transform(
-    [0.0, 0.0, 0.0], _rot_y(HEAD_1_PITCH_RAD_STATIC)
+from camera_extrinsics import (
+    compute_camera_to_t5_for_view_rotation as _compute_camera_to_t5_for_view_rotation,
 )
-CAMERA_TO_T5_STATIC = T_T5_FROM_HEAD2_STATIC @ T_HEAD2_FROM_CAMERA
-T5_TO_CAMERA_STATIC = invert_transform(CAMERA_TO_T5_STATIC)
-
-
-def raw_camera_from_view_rotation_transform(view_rotation):
-    """Return transform from rotated analysis camera frame to raw camera frame."""
-    normalized = str(view_rotation).lower()
-    T = np.eye(4, dtype=np.float64)
-    if normalized in ("none", "raw"):
-        return T
-    if normalized == "cw90":
-        T[:3, :3] = _rot_z(-np.pi / 2.0)
-        return T
-    if normalized == "ccw90":
-        T[:3, :3] = _rot_z(np.pi / 2.0)
-        return T
-    if normalized == "180":
-        T[:3, :3] = _rot_z(np.pi)
-        return T
-    raise ValueError(f"unsupported view_rotation: {view_rotation!r}")
-
-
-def camera_to_t5_for_view_rotation(camera_to_t5, view_rotation):
-    """Adapt a raw camera->T5 transform for inference output in a rotated view.
-
-    `inference.py` rotates RGB/depth and intrinsics before backprojection, so
-    center_top_camera_m is expressed in that rotated analysis camera frame.
-    """
-    return np.asarray(camera_to_t5, dtype=np.float64) @ raw_camera_from_view_rotation_transform(view_rotation)
-
+from camera_extrinsics import (
+    compute_camera_to_t5_transform as _compute_camera_to_t5_transform,
+)
 
 # Transform to use directly with inference.py's default --view-rotation cw90
 # output: p_t5 = CAMERA_CW90_VIEW_TO_T5_STATIC @ p_center_top_camera_m.
@@ -206,37 +119,16 @@ CAMERA_CW90_VIEW_TO_T5_STATIC = camera_to_t5_for_view_rotation(CAMERA_TO_T5_STAT
 
 
 def compute_camera_to_t5_transform(dyn_model=None, dyn_state=None, q=None):
-    """Return camera->T5 transform for the current robot state.
-
-    When dynamics inputs are provided, link_torso_5 -> link_head_2 comes from FK
-    so the head_0 yaw and head_1 pitch are respected. Without dynamics inputs,
-    the static URDF transform for the recorded posture (head_0 = 0, head_1 =
-    HEAD_1_PITCH_RAD_STATIC) is returned.
-    """
-    if dyn_model is None and dyn_state is None and q is None:
-        return CAMERA_TO_T5_STATIC.copy()
-    if dyn_model is None or dyn_state is None or q is None:
-        raise ValueError("dyn_model, dyn_state, and q must be provided together.")
-
-    dyn_state.set_q(q)
-    dyn_model.compute_forward_kinematics(dyn_state)
-    T_t5_from_head2 = dyn_model.compute_transformation(dyn_state, TORSO_INDEX, HEAD2_INDEX)
-    return np.asarray(T_t5_from_head2, dtype=np.float64) @ T_HEAD2_FROM_CAMERA
-
-
-def compute_camera_to_t5_for_view_rotation(view_rotation, dyn_model=None, dyn_state=None, q=None):
-    return camera_to_t5_for_view_rotation(
-        compute_camera_to_t5_transform(dyn_model, dyn_state, q),
-        view_rotation,
+    """camera->T5 for the current state, bound to this script's link indices."""
+    return _compute_camera_to_t5_transform(
+        dyn_model, dyn_state, q, torso_index=TORSO_INDEX, head2_index=HEAD2_INDEX
     )
 
 
-def transform_camera_point_to_t5(point_camera_m, camera_to_t5=None):
-    """Transform one 3D camera-frame point into link_torso_5/T5 coordinates."""
-    T = CAMERA_TO_T5_STATIC if camera_to_t5 is None else np.asarray(camera_to_t5, dtype=np.float64)
-    p_camera = np.ones(4, dtype=np.float64)
-    p_camera[:3] = np.asarray(point_camera_m, dtype=np.float64)
-    return (T @ p_camera)[:3]
+def compute_camera_to_t5_for_view_rotation(view_rotation, dyn_model=None, dyn_state=None, q=None):
+    return _compute_camera_to_t5_for_view_rotation(
+        view_rotation, dyn_model, dyn_state, q, torso_index=TORSO_INDEX, head2_index=HEAD2_INDEX
+    )
 
 
 # ========================================================================================

@@ -91,7 +91,26 @@ def iter_replay_frames(args: argparse.Namespace):
         yield int(record["frame_id"]), image, depth, intrinsics
 
 
-def iter_live_frames(args: argparse.Namespace):
+def iter_live_frames(
+    args: argparse.Namespace | None = None,
+    *,
+    width: int = 1280,
+    height: int = 720,
+    fps: int = 30,
+    serial_number: str | None = None,
+    view_rotation: str = "cw90",
+):
+    """Yield (frame_id, image, depth_m, intrinsics) from the live D405.
+
+    The single shared D405 open/align/rotate path: inference_2.py's live mode
+    and picking_box_2.py's capture both consume this generator, so camera
+    settings only exist here. Closing the generator stops the pipeline.
+    """
+    if args is not None:
+        width, height, fps = args.width, args.height, args.fps
+        serial_number = args.serial_number
+        view_rotation = args.view_rotation
+
     try:
         import pyrealsense2 as rs
     except ImportError as exc:  # pragma: no cover - camera runtime only
@@ -99,10 +118,10 @@ def iter_live_frames(args: argparse.Namespace):
 
     pipeline = rs.pipeline()
     rs_config = rs.config()
-    if args.serial_number:
-        rs_config.enable_device(args.serial_number)
-    rs_config.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, args.fps)
-    rs_config.enable_stream(rs.stream.depth, args.width, args.height, rs.format.z16, args.fps)
+    if serial_number:
+        rs_config.enable_device(serial_number)
+    rs_config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+    rs_config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
     profile = pipeline.start(rs_config)
     align = rs.align(rs.stream.color)
     depth_scale = float(profile.get_device().first_depth_sensor().get_depth_scale())
@@ -111,9 +130,9 @@ def iter_live_frames(args: argparse.Namespace):
     raw_intrinsics = CameraIntrinsics(fx=float(raw.fx), fy=float(raw.fy), cx=float(raw.ppx), cy=float(raw.ppy))
     intrinsics = rotate_intrinsics_for_view(
         raw_intrinsics,
-        width=args.width,
-        height=args.height,
-        rotation=args.view_rotation,
+        width=width,
+        height=height,
+        rotation=view_rotation,
         intrinsics_cls=CameraIntrinsics,
     )
 
@@ -125,9 +144,9 @@ def iter_live_frames(args: argparse.Namespace):
             depth = frames.get_depth_frame()
             if not color or not depth:
                 continue
-            image = rotate_array_for_view(np.asanyarray(color.get_data()), args.view_rotation)
+            image = rotate_array_for_view(np.asanyarray(color.get_data()), view_rotation)
             depth_m = rotate_array_for_view(
-                np.asanyarray(depth.get_data()).astype(np.float32) * depth_scale, args.view_rotation
+                np.asanyarray(depth.get_data()).astype(np.float32) * depth_scale, view_rotation
             )
             yield frame_id, image, depth_m, intrinsics
             frame_id += 1

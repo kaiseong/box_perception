@@ -68,117 +68,20 @@ LIFT_HEIGHT = 0.15
 LIFT_MINIMUM_TIME = 5.0
 LIFT_LINEAR_VELOCITY_LIMIT = 0.1
 LIFT_ANGULAR_VELOCITY_LIMIT = float(np.pi / 4)
-LIFT_LINEAR_ACCELERATION_LIMIT = 0.5
-LIFT_ANGULAR_ACCELERATION_LIMIT = float(np.pi)
+LIFT_LINEAR_ACCELERATION_LIMIT = 0.5   # m/s^2 (CartesianImpedance add_target)
+LIFT_ANGULAR_ACCELERATION_LIMIT = float(np.pi)  # rad/s^2
 LIFT_JOINT_STIFFNESS = [100.0] * 7
 LIFT_JOINT_DAMPING_RATIO = 1.0
 LIFT_JOINT_TORQUE_LIMIT = [50.0] * 7
 LIFT_HOLD_TIME = 100.0
+# CartesianCommandBuilder.add_target's last argument is a DIMENSIONLESS scaling
+# of the internal Cartesian acceleration limits (0.5 = half), NOT m/s^2.
+CARTESIAN_ACCELERATION_LIMIT_SCALING = 0.5
 
-# ---- Vision extrinsic: D405 camera frame into T5/link_torso_5 frame ----
-HEAD2_TO_CAMERA_XYZ_RPY_ZYX_DEG = np.array(
-    [0.023, 0.0, 0.066, 0.0, 90.0, 0.0],
-    dtype=np.float64,
+# ---- Vision extrinsic: shared single source of truth (camera_extrinsics.py) ----
+from camera_extrinsics import (
+    compute_camera_to_t5_for_view_rotation as _compute_camera_to_t5_for_view_rotation,
 )
-T5_TO_HEAD1_ZERO_HEAD0_XYZ_M = np.array([0.022, 0.0, 0.200073451525], dtype=np.float64)
-HEAD_1_PITCH_RAD_STATIC = 0.436
-
-
-def _rot_x(theta: float) -> np.ndarray:
-    c, s = np.cos(theta), np.sin(theta)
-    return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]], dtype=np.float64)
-
-
-def _rot_y(theta: float) -> np.ndarray:
-    c, s = np.cos(theta), np.sin(theta)
-    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=np.float64)
-
-
-def _rot_z(theta: float) -> np.ndarray:
-    c, s = np.cos(theta), np.sin(theta)
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
-
-
-def rotation_from_euler_zyx_deg(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
-    """Return R = Rz(yaw) @ Ry(pitch) @ Rx(roll), angles in degrees."""
-    roll, pitch, yaw = np.deg2rad([roll_deg, pitch_deg, yaw_deg])
-    return _rot_z(yaw) @ _rot_y(pitch) @ _rot_x(roll)
-
-
-def make_transform(translation: Any, rotation: Any = None) -> np.ndarray:
-    T = np.eye(4, dtype=np.float64)
-    if rotation is not None:
-        T[:3, :3] = np.asarray(rotation, dtype=np.float64)
-    T[:3, 3] = np.asarray(translation, dtype=np.float64)
-    return T
-
-
-def transform_from_xyz_rpy_zyx_deg(xyz_rpy_deg: Any) -> np.ndarray:
-    x, y, z, roll_deg, pitch_deg, yaw_deg = np.asarray(xyz_rpy_deg, dtype=np.float64)
-    return make_transform(
-        [x, y, z],
-        rotation_from_euler_zyx_deg(roll_deg, pitch_deg, yaw_deg),
-    )
-
-
-def invert_transform(T: Any) -> np.ndarray:
-    T = np.asarray(T, dtype=np.float64)
-    T_inv = np.eye(4, dtype=np.float64)
-    R = T[:3, :3]
-    t = T[:3, 3]
-    T_inv[:3, :3] = R.T
-    T_inv[:3, 3] = -R.T @ t
-    return T_inv
-
-
-T_HEAD2_FROM_CAMERA = transform_from_xyz_rpy_zyx_deg(HEAD2_TO_CAMERA_XYZ_RPY_ZYX_DEG)
-T_T5_FROM_HEAD2_STATIC = make_transform(T5_TO_HEAD1_ZERO_HEAD0_XYZ_M) @ make_transform(
-    [0.0, 0.0, 0.0],
-    _rot_y(HEAD_1_PITCH_RAD_STATIC),
-)
-CAMERA_TO_T5_STATIC = T_T5_FROM_HEAD2_STATIC @ T_HEAD2_FROM_CAMERA
-
-
-def raw_camera_from_view_rotation_transform(view_rotation: str) -> np.ndarray:
-    """Return transform from rotated analysis camera frame to raw camera frame."""
-    normalized = str(view_rotation).lower()
-    T = np.eye(4, dtype=np.float64)
-    if normalized in ("none", "raw"):
-        return T
-    if normalized == "cw90":
-        T[:3, :3] = _rot_z(-np.pi / 2.0)
-        return T
-    if normalized == "ccw90":
-        T[:3, :3] = _rot_z(np.pi / 2.0)
-        return T
-    if normalized == "180":
-        T[:3, :3] = _rot_z(np.pi)
-        return T
-    raise ValueError(f"unsupported view_rotation: {view_rotation!r}")
-
-
-def camera_to_t5_for_view_rotation(camera_to_t5: Any, view_rotation: str) -> np.ndarray:
-    """Adapt a raw camera->T5 transform for inference output in a rotated view."""
-    return np.asarray(camera_to_t5, dtype=np.float64) @ raw_camera_from_view_rotation_transform(
-        view_rotation
-    )
-
-
-def compute_camera_to_t5_transform(
-    dyn_model: Any = None,
-    dyn_state: Any = None,
-    q: Any = None,
-) -> np.ndarray:
-    """Return camera->T5 transform for the current robot state."""
-    if dyn_model is None and dyn_state is None and q is None:
-        return CAMERA_TO_T5_STATIC.copy()
-    if dyn_model is None or dyn_state is None or q is None:
-        raise ValueError("dyn_model, dyn_state, and q must be provided together.")
-
-    dyn_state.set_q(q)
-    dyn_model.compute_forward_kinematics(dyn_state)
-    T_t5_from_head2 = dyn_model.compute_transformation(dyn_state, TORSO_INDEX, HEAD2_INDEX)
-    return np.asarray(T_t5_from_head2, dtype=np.float64) @ T_HEAD2_FROM_CAMERA
 
 
 def compute_camera_to_t5_for_view_rotation(
@@ -187,9 +90,9 @@ def compute_camera_to_t5_for_view_rotation(
     dyn_state: Any = None,
     q: Any = None,
 ) -> np.ndarray:
-    return camera_to_t5_for_view_rotation(
-        compute_camera_to_t5_transform(dyn_model, dyn_state, q),
-        view_rotation,
+    """camera(view)->T5, bound to this script's dynamics-state link indices."""
+    return _compute_camera_to_t5_for_view_rotation(
+        view_rotation, dyn_model, dyn_state, q, torso_index=TORSO_INDEX, head2_index=HEAD2_INDEX
     )
 
 
@@ -258,7 +161,7 @@ def build_dual_target_cartesian_command(
                 target,
                 LIFT_LINEAR_VELOCITY_LIMIT,
                 LIFT_ANGULAR_VELOCITY_LIMIT,
-                LIFT_LINEAR_ACCELERATION_LIMIT,
+                CARTESIAN_ACCELERATION_LIMIT_SCALING,
             )
             .set_minimum_time(minimum_time)
         )
@@ -306,13 +209,6 @@ READY = {
     "torso": [0.000, 0.000, 0.000, 0.349, 0.000, 0.000],
     "right_arm": [0.0, -0.96, -0.524, -1.221, -2.443, 1.134, 0.0],
     "left_arm": [-0.0, 0.96, 0.524, -1.221, 2.443, 1.134, 0.0],
-    "head": [0.000, 0.436],
-}
-
-READY_TO_PICKING = {
-    "torso": [0.000, 0.000, 0.000, 0.349, 0.000, 0.000],
-    "right_arm": [-0.111, -0.987, -0.205, -1.463, -2.454, 1.744, 0.50],
-    "left_arm": [-0.111, 0.987, 0.205, -1.463, 2.454, 1.744, -0.50],
     "head": [0.000, 0.436],
 }
 
@@ -364,9 +260,19 @@ def latest_json_record_from_path(path: str | Path) -> dict[str, Any]:
 
 def box_center_camera_from_record(record: dict[str, Any], *, allow_unreliable: bool) -> np.ndarray:
     """Extract center_top_camera_m from inference.py output."""
-    if not allow_unreliable and record.get("ok") is False:
-        reasons = record.get("failure_reasons") or record.get("plane_failure_reasons") or []
-        raise ValueError(f"vision record is not ok; refusing to move. reasons={reasons}")
+    # inference_2.py --print-json emits {"reliable": ..., "reasons": [...]};
+    # replay frames.jsonl nests it as known_size.confidence.ok. Support both.
+    reliable = record.get("reliable", record.get("ok"))
+    if reliable is None and isinstance(record.get("known_size"), dict):
+        reliable = record["known_size"].get("confidence", {}).get("ok")
+    if not allow_unreliable and reliable is not True:
+        reasons = (
+            record.get("reasons")
+            or record.get("failure_reasons")
+            or record.get("plane_failure_reasons")
+            or []
+        )
+        raise ValueError(f"vision record is not reliable; refusing to move. reasons={reasons}")
 
     center = record.get("center_top_camera_m")
     if center is None and isinstance(record.get("known_size"), dict):
@@ -398,6 +304,9 @@ def capture_box_live(
     frames_needed: int = LIVE_VISION_FRAMES_NEEDED,
     timeout_sec: float = LIVE_VISION_TIMEOUT_SEC,
     max_center_spread_m: float = LIVE_VISION_MAX_CENTER_SPREAD_M,
+    visualize: bool = False,
+    camera_to_base: Any = None,
+    run_forever: bool = False,
 ) -> dict[str, Any] | None:
     """Detect the box from the live D405 at the current posture.
 
@@ -408,67 +317,93 @@ def capture_box_live(
     multi-frame center-spread gate. Returns the per-axis median center
     (analysis camera frame), optional long-axis direction, and frame count, or
     None when not enough usable frames arrive within the timeout.
+
+    With visualize=True an OpenCV window shows each frame with the fitted box
+    and, when camera_to_base is given, the base-frame x/y/yaw the robot would
+    act on -- exactly what the grasp-reach experiments need. run_forever=True
+    streams until q/ESC without collecting a result (observation mode).
     """
     import time
 
     import cv2
 
     cv2.setNumThreads(1)
-    import pyrealsense2 as rs
 
     if str(BOX_PERCEPTION_ROOT) not in sys.path:
         sys.path.insert(0, str(BOX_PERCEPTION_ROOT))
-    from box_pose import CameraIntrinsics, estimate_plane_box, segment_yellow_box
-    from replay_recording import rotate_array_for_view, rotate_intrinsics_for_view
+    from box_pose import estimate_plane_box, segment_yellow_box
+    from box_pose.visualization import draw_known_size_estimate
+    from inference_2 import iter_live_frames
 
     rim_cfg = json.loads(RIM_PLANE_CONFIG.read_text(encoding="utf-8"))
     rim_plane = (rim_cfg["normal"], rim_cfg["point"])
 
-    pipeline = rs.pipeline()
-    rs_config = rs.config()
-    rs_config.enable_stream(rs.stream.color, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.bgr8, CAMERA_FPS)
-    rs_config.enable_stream(rs.stream.depth, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.z16, CAMERA_FPS)
-    profile = pipeline.start(rs_config)
-    align = rs.align(rs.stream.color)
-    depth_scale = float(profile.get_device().first_depth_sensor().get_depth_scale())
-    raw = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
-    intrinsics = rotate_intrinsics_for_view(
-        CameraIntrinsics(fx=float(raw.fx), fy=float(raw.fy), cx=float(raw.ppx), cy=float(raw.ppy)),
-        width=CAMERA_WIDTH,
-        height=CAMERA_HEIGHT,
-        rotation=view_rotation,
-        intrinsics_cls=CameraIntrinsics,
-    )
-
+    T_base = None if camera_to_base is None else np.asarray(camera_to_base, dtype=np.float64)
+    window_name = "picking_box_2 vision (q/ESC to close)"
     centers: list[Any] = []
     long_axes: list[Any] = []
     modes: list[str] = []
-    deadline = time.monotonic() + float(timeout_sec)
+    quit_requested = False
+    long_axis_unconstrained = False
+    deadline = time.monotonic() + (float("inf") if run_forever else float(timeout_sec))
+    frames = iter_live_frames(
+        width=CAMERA_WIDTH, height=CAMERA_HEIGHT, fps=CAMERA_FPS, view_rotation=view_rotation
+    )
     try:
-        while len(centers) < int(frames_needed) and time.monotonic() < deadline:
-            frames = align.process(pipeline.wait_for_frames())
-            color = frames.get_color_frame()
-            depth = frames.get_depth_frame()
-            if not color or not depth:
-                continue
-            image = rotate_array_for_view(np.asanyarray(color.get_data()), view_rotation)
-            depth_m = rotate_array_for_view(
-                np.asanyarray(depth.get_data()).astype(np.float32) * depth_scale, view_rotation
-            )
+        for _, image, depth_m, intrinsics in frames:
+            if not (run_forever or len(centers) < int(frames_needed)):
+                break
+            if time.monotonic() >= deadline:
+                break
             mask, _ = segment_yellow_box(image, keep_largest_component=False)
             estimate = estimate_plane_box(mask, depth_m, intrinsics, rim_plane=rim_plane)
             usable, mode = live_estimate_center_mode(estimate)
-            if usable:
-                centers.append(estimate.center_top_camera_m)
-                modes.append(mode)
-                if estimate.confidence.ok:
-                    long_axes.append(estimate.support["long_axis_camera"])
-                elif len(centers) == 1 or len(centers) % 3 == 0:
-                    print(f"[vision] accepted center-only frame: {mode}")
-            else:
-                print(f"[vision] frame rejected: {mode}")
+            if not run_forever:
+                if usable:
+                    centers.append(estimate.center_top_camera_m)
+                    modes.append(mode)
+                    axis = estimate.support.get("long_axis_camera")
+                    if axis is not None:
+                        long_axes.append(axis)
+                    if not estimate.confidence.ok:
+                        # The long-axis center of this frame is a visible-span
+                        # midpoint, not a measurement; remember to drop that
+                        # axis from the commanded correction.
+                        if "long_axis_center_underconstrained" in estimate.failure_reasons:
+                            long_axis_unconstrained = True
+                        if len(centers) == 1 or len(centers) % 3 == 0:
+                            print(f"[vision] accepted center-only frame: {mode}")
+                else:
+                    print(f"[vision] frame rejected: {mode}")
+
+            if visualize:
+                vis = draw_known_size_estimate(image.copy(), estimate)
+                status_color = (30, 160, 30) if usable else (40, 40, 220)
+                lines = [(f"{'USABLE' if usable else 'REJECTED'}: {mode}", status_color)]
+                if T_base is not None and estimate.center_top_camera_m is not None:
+                    center_base = (T_base @ np.append(estimate.center_top_camera_m, 1.0))[:3]
+                    text = f"base x={center_base[0] * 100:+.1f}cm  y={center_base[1] * 100:+.1f}cm"
+                    long_axis = estimate.support.get("long_axis_camera")
+                    if long_axis is not None:
+                        axis_base = T_base[:3, :3] @ np.asarray(long_axis, dtype=np.float64)
+                        yaw_base = float(np.degrees(np.arctan2(axis_base[1], axis_base[0])) % 180.0)
+                        text += f"  yaw={yaw_base:.1f}deg"
+                    lines.append((text, (255, 255, 255)))
+                for i, (text, color) in enumerate(lines):
+                    y_pos = 34 + 32 * i
+                    cv2.putText(vis, text, (12, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 4, cv2.LINE_AA)
+                    cv2.putText(vis, text, (12, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2, cv2.LINE_AA)
+                cv2.imshow(window_name, vis)
+                if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+                    quit_requested = True
+                    break
     finally:
-        pipeline.stop()
+        frames.close()  # stops the RealSense pipeline (generator finally)
+        if visualize:
+            cv2.destroyAllWindows()
+
+    if run_forever or (quit_requested and len(centers) < int(frames_needed)):
+        return None
 
     if len(centers) < int(frames_needed):
         return None
@@ -486,6 +421,7 @@ def capture_box_live(
         "center_camera_m": center_median,
         "center_spread_m": center_spread_m,
         "long_axis_camera": None if not long_axes else np.median(np.asarray(long_axes, dtype=np.float64), axis=0),
+        "long_axis_unconstrained": long_axis_unconstrained,
         "frames_used": len(centers),
         "modes": modes,
     }
@@ -555,12 +491,18 @@ def vision_pre_push_targets(
     box_center_base_m: np.ndarray,
     *,
     midpoint_offset_xy_m: tuple[float, float] = (0.0, 0.0),
+    drop_delta_axis_base_xy: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Shift START_TO_PICKING hand targets so their midpoint matches the box center.
 
     z and rotation are copied from the recorded START_TO_PICKING FK in base.
     The midpoint receives the vision x/y delta, then each hand is opened farther
     along base y to give the box extra pre-grasp clearance.
+
+    When the live capture flags the box long axis as underconstrained (both
+    short sides cropped), the detected center along that axis is a visible-span
+    midpoint, not a measurement; `drop_delta_axis_base_xy` names that direction
+    and its component is removed from the correction instead of being trusted.
     """
     T_right_ref, T_left_ref = start_to_picking_reference_targets(
         dyn_model,
@@ -574,6 +516,15 @@ def vision_pre_push_targets(
         dtype=np.float64,
     )
     xy_delta = target_midpoint_xy - reference_midpoint_xy
+    dropped_delta_m = 0.0
+    if drop_delta_axis_base_xy is not None:
+        axis = np.asarray(drop_delta_axis_base_xy, dtype=np.float64)
+        norm = float(np.linalg.norm(axis))
+        if norm > 1e-9:
+            axis = axis / norm
+            dropped_delta_m = float(xy_delta @ axis)
+            xy_delta = xy_delta - dropped_delta_m * axis
+            target_midpoint_xy = reference_midpoint_xy + xy_delta
 
     T_right_target = T_right_ref.copy()
     T_left_target = T_left_ref.copy()
@@ -594,6 +545,7 @@ def vision_pre_push_targets(
         "reference_midpoint_xy": reference_midpoint_xy,
         "target_midpoint_xy": target_midpoint_xy,
         "xy_delta": xy_delta,
+        "dropped_delta_m": dropped_delta_m,
         "hand_y_margin_m": VISION_PRE_PUSH_HAND_Y_MARGIN_M,
     }
 
@@ -654,6 +606,7 @@ def build_vision_pre_push_command(
     hold_time: float,
     max_reference_xy_shift_m: float | None,
     midpoint_offset_xy_m: tuple[float, float],
+    drop_delta_axis_base_xy: np.ndarray | None = None,
 ) -> Any:
     targets = vision_pre_push_targets(
         dyn_model,
@@ -662,7 +615,14 @@ def build_vision_pre_push_command(
         q_template,
         box_center_base_m,
         midpoint_offset_xy_m=midpoint_offset_xy_m,
+        drop_delta_axis_base_xy=drop_delta_axis_base_xy,
     )
+    if targets["dropped_delta_m"]:
+        print(
+            "[vision_pre_push] long axis underconstrained: dropped "
+            f"{targets['dropped_delta_m']:+.3f} m of correction along it "
+            "(that direction keeps the recorded pose)."
+        )
 
     xy_delta = targets["xy_delta"]
     xy_shift = float(np.linalg.norm(xy_delta))
@@ -824,14 +784,19 @@ def build_dual_arm_impedance_command(
 
 
 def build_impedance_push_command(dyn_model: Any, dyn_state: Any, q: Any) -> Any:
-    """Push both hands inward to grip the box, expressed in base."""
+    """Push both hands inward to grip the box, expressed in base.
+
+    The pre-push pose opened each hand VISION_PRE_PUSH_HAND_Y_MARGIN_M wider
+    than the recorded contact pose, so the inward travel adds that margin back;
+    otherwise the commanded penetration (grip preload) would be halved.
+    """
     return build_dual_arm_impedance_command(
         dyn_model,
         dyn_state,
         q,
         reference_link=IMPEDANCE_REFERENCE_LINK,
         ref_index=BASE_INDEX,
-        inward=PUSH_DISTANCE,
+        inward=PUSH_DISTANCE + VISION_PRE_PUSH_HAND_Y_MARGIN_M,
         lift=0.0,
         translation_weight=IMPEDANCE_TRANSLATION_WEIGHT,
         hold_time=PUSH_HOLD_TIME,
@@ -840,11 +805,12 @@ def build_impedance_push_command(dyn_model: Any, dyn_state: Any, q: Any) -> Any:
 
 
 def build_impedance_lift_command(dyn_model: Any, dyn_state: Any, q: Any) -> Any:
-    """Raise both hands straight up by LIFT_HEIGHT along base +z.
+    """Raise both hands straight up by LIFT_HEIGHT along base +z, compliantly.
 
-    The public name is kept for existing call sites. The implementation sends
-    independent right/left Cartesian arm-component commands in one RobotCommand
-    so the torso stays fixed while both hands receive synchronized targets.
+    Uses per-arm CartesianImpedanceControlCommand (timed trajectory + joint
+    stiffness/damping/torque limit) so the box keeps being HELD while it rises:
+    a pure position-control lift maintains no inward preload once the push
+    command's hold expires, and the box can slip.
     """
     dyn_state.set_q(q)
     dyn_model.compute_forward_kinematics(dyn_state)
@@ -857,15 +823,32 @@ def build_impedance_lift_command(dyn_model: Any, dyn_state: Any, q: Any) -> Any:
     print(
         f"[lift] right EEF z: {T_base2right[2, 3]:+.3f} -> {T_right_target[2, 3]:+.3f} m"
         f"  |  left EEF z: {T_base2left[2, 3]:+.3f} -> {T_left_target[2, 3]:+.3f} m"
-        f"  (over {LIFT_MINIMUM_TIME:.0f}s)"
+        f"  (over {LIFT_MINIMUM_TIME:.0f}s, Cartesian impedance)"
     )
 
-    return build_dual_target_cartesian_command(
-        reference_link=IMPEDANCE_LIFT_REFERENCE_LINK,
-        right_target=T_right_target,
-        left_target=T_left_target,
-        minimum_time=LIFT_MINIMUM_TIME,
-        hold_time=LIFT_HOLD_TIME,
+    def arm_cartesian_impedance(link_name: str, T_target: np.ndarray) -> Any:
+        return (
+            rby.CartesianImpedanceControlCommandBuilder()
+            .set_command_header(
+                rby.CommandHeaderBuilder().set_control_hold_time(LIFT_HOLD_TIME)
+            )
+            .add_target(
+                IMPEDANCE_LIFT_REFERENCE_LINK, link_name, T_target,
+                LIFT_LINEAR_VELOCITY_LIMIT, LIFT_ANGULAR_VELOCITY_LIMIT,
+                LIFT_LINEAR_ACCELERATION_LIMIT, LIFT_ANGULAR_ACCELERATION_LIMIT,
+            )
+            .set_joint_stiffness(LIFT_JOINT_STIFFNESS)
+            .set_joint_damping_ratio(LIFT_JOINT_DAMPING_RATIO)
+            .set_joint_torque_limit(LIFT_JOINT_TORQUE_LIMIT)
+            .set_minimum_time(LIFT_MINIMUM_TIME)
+        )
+
+    return rby.RobotCommandBuilder().set_command(
+        rby.ComponentBasedCommandBuilder().set_body_command(
+            rby.BodyComponentBasedCommandBuilder()
+            .set_right_arm_command(arm_cartesian_impedance("ee_right", T_right_target))
+            .set_left_arm_command(arm_cartesian_impedance("ee_left", T_left_target))
+        )
     )
 
 
@@ -884,6 +867,8 @@ def main(
     live_vision_timeout_sec: float,
     live_center_spread_m: float,
     continue_pick: bool,
+    visualize: bool,
+    visualize_only: bool,
 ) -> bool:
     robot = rby.create_robot(address, model)
     robot.connect()
@@ -910,6 +895,22 @@ def main(
 
     done = False
     try:
+        if visualize_only:
+            # Observation mode: no motion commands. Stream the live estimate
+            # with base-frame x/y/yaw at the CURRENT posture until q/ESC.
+            q = robot.get_state().position
+            camera_to_base = compute_camera_to_base_for_view_rotation(
+                view_rotation, dyn_model, dyn_state, q
+            )
+            print_stage("visualize_only", "streaming; robot will NOT move (quit with q/ESC)")
+            capture_box_live(
+                view_rotation,
+                visualize=True,
+                camera_to_base=camera_to_base,
+                run_forever=True,
+            )
+            return True
+
         for name, pose in JOINT_SEQUENCE:
             stage = f"1/5 {name}"
             print_stage(stage, "joint position move")
@@ -927,6 +928,7 @@ def main(
         )
 
         long_axis_camera = None
+        drop_delta_axis_base_xy = None
         if box_center_camera_m is None:
             # Live capture AT this pose, so the FK-based camera->base above and
             # the measurement share the exact same posture.
@@ -936,6 +938,8 @@ def main(
                 frames_needed=live_vision_frames_needed,
                 timeout_sec=live_vision_timeout_sec,
                 max_center_spread_m=live_center_spread_m,
+                visualize=visualize,
+                camera_to_base=camera_to_base,
             )
             if live is None:
                 print_stage(
@@ -952,6 +956,22 @@ def main(
                 f"| center spread={live['center_spread_m'] * 1000.0:.1f} mm "
                 f"| modes={sorted(set(live['modes']))}",
             )
+            if live["long_axis_unconstrained"]:
+                if long_axis_camera is None:
+                    print_stage(
+                        "2/5 live_vision",
+                        "FAILED: long axis underconstrained and no axis direction; aborting",
+                    )
+                    return done
+                axis_base = np.asarray(camera_to_base, dtype=np.float64)[:3, :3] @ np.asarray(
+                    long_axis_camera, dtype=np.float64
+                )
+                drop_delta_axis_base_xy = axis_base[:2]
+                print_stage(
+                    "2/5 live_vision",
+                    "long axis underconstrained (both short sides cropped); its "
+                    "correction component will be dropped",
+                )
         else:
             print_stage("2/5 live_vision", "skipped; using supplied center_top_camera_m")
 
@@ -985,6 +1005,7 @@ def main(
             hold_time=hold_time,
             max_reference_xy_shift_m=max_reference_xy_shift_m,
             midpoint_offset_xy_m=midpoint_offset_xy_m,
+            drop_delta_axis_base_xy=drop_delta_axis_base_xy,
         )
         if not send_stage(robot, command, "3/5 vision_pre_push"):
             print_stage("3/5 vision_pre_push", "FAILED; aborting")
@@ -1112,6 +1133,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=LIVE_VISION_MAX_CENTER_SPREAD_M,
         help="Abort if accepted live center candidates spread more than this.",
     )
+    parser.add_argument(
+        "--visualize",
+        action="store_true",
+        help="Show a live window during vision capture with the fitted box and base-frame x/y/yaw.",
+    )
+    parser.add_argument(
+        "--visualize-only",
+        action="store_true",
+        help="Observation mode: stream the visualization at the current posture, send NO motion commands.",
+    )
     parser.set_defaults(continue_pick=True)
     parser.add_argument(
         "--continue-pick",
@@ -1129,9 +1160,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def combined_midpoint_offset_xy(args: argparse.Namespace) -> tuple[float, float]:
-    """Return the final base-frame grasp midpoint offset."""
+    """Return the final base-frame grasp midpoint offset.
+
+    --box-x-offset and --midpoint-offset-xy-m DX set the same quantity, so
+    giving both is refused instead of silently summing them.
+    """
     midpoint_dx, midpoint_dy = (float(v) for v in args.midpoint_offset_xy_m)
-    return midpoint_dx + float(args.box_x_offset), midpoint_dy
+    box_dx = float(args.box_x_offset)
+    if abs(midpoint_dx) > 1e-12 and abs(box_dx) > 1e-12:
+        raise SystemExit(
+            "Use either --box-x-offset or --midpoint-offset-xy-m DX, not both "
+            f"(got {box_dx:+.3f} and {midpoint_dx:+.3f})."
+        )
+    return midpoint_dx + box_dx, midpoint_dy
 
 
 if __name__ == "__main__":
@@ -1157,6 +1198,8 @@ if __name__ == "__main__":
             live_vision_timeout_sec=float(args.live_vision_timeout_sec),
             live_center_spread_m=float(args.live_center_spread_m),
             continue_pick=bool(args.continue_pick),
+            visualize=bool(args.visualize or args.visualize_only),
+            visualize_only=bool(args.visualize_only),
         )
         else 1
     )
