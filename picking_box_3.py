@@ -66,6 +66,13 @@ IMPEDANCE_REFERENCE_LINK = "link_torso_5"
 PUSH_DISTANCE = 0.10
 IMPEDANCE_TRANSLATION_WEIGHT = [500.0, 1000.0, 500.0]
 IMPEDANCE_ROTATION_WEIGHT = [50.0, 50.0, 50.0]
+# ImpedanceControlCommandBuilder has no trajectory minimum_time in the SDK
+# examples. Ramp the target itself over this duration to avoid a spring target
+# jump that slams into the box.
+PUSH_RAMP_TIME = 2.0
+PUSH_STREAM_PERIOD_SEC = 1.0 / 30.0
+PUSH_STREAM_COMMAND_HOLD_TIME = 1.0
+PUSH_STREAM_PRIORITY = 1
 PUSH_HOLD_TIME = 3.0
 
 # ---- Cartesian lift parameters ----
@@ -1825,7 +1832,14 @@ def build_dual_arm_impedance_command(
     )
 
 
-def build_impedance_push_command(dyn_model: Any, dyn_state: Any, q: Any) -> Any:
+def build_impedance_push_command(
+    dyn_model: Any,
+    dyn_state: Any,
+    q: Any,
+    *,
+    inward: float = PUSH_DISTANCE,
+    hold_time: float = PUSH_HOLD_TIME,
+) -> Any:
     """Push both hands inward to grip the box, expressed in link_torso_5.
 
     The pre-push pose already opened each hand wider for approach clearance.
@@ -1837,12 +1851,104 @@ def build_impedance_push_command(dyn_model: Any, dyn_state: Any, q: Any) -> Any:
         q,
         reference_link=IMPEDANCE_REFERENCE_LINK,
         ref_index=TORSO_INDEX,
-        inward=PUSH_DISTANCE,
+        inward=float(inward),
         lift=0.0,
         translation_weight=IMPEDANCE_TRANSLATION_WEIGHT,
-        hold_time=PUSH_HOLD_TIME,
+        hold_time=float(hold_time),
         label="push",
     )
+
+
+def stream_impedance_push_stage(
+    robot: Any,
+    dyn_model: Any,
+    dyn_state: Any,
+    q: Any,
+    *,
+    ramp_time_sec: float = PUSH_RAMP_TIME,
+    hold_time_sec: float = PUSH_HOLD_TIME,
+    stream_period_sec: float = PUSH_STREAM_PERIOD_SEC,
+    stage: str = "5/6 inward_push",
+) -> bool:
+    """Ramp the inward impedance target instead of jumping it in one command."""
+    q0 = np.asarray(q, dtype=np.float64).copy()
+    period = max(0.01, float(stream_period_sec))
+    ramp_time = max(0.0, float(ramp_time_sec))
+    hold_time = max(0.0, float(hold_time_sec))
+    ramp_command_hold_time = max(period * 2.0, float(PUSH_STREAM_COMMAND_HOLD_TIME))
+
+    try:
+        stream = robot.create_command_stream(priority=PUSH_STREAM_PRIORITY)
+    except Exception as exc:  # pragma: no cover - SDK/hardware dependent
+        print_stage(stage, f"failed to create push command stream: {exc}")
+        return False
+
+    def send_progress(progress: float, *, command_hold_time: float) -> float:
+        clamped = float(np.clip(progress, 0.0, 1.0))
+        stream.send_command(
+            build_impedance_push_command(
+                dyn_model,
+                dyn_state,
+                q0,
+                inward=PUSH_DISTANCE * clamped,
+                hold_time=command_hold_time,
+            )
+        )
+        return clamped
+
+    print_stage(
+        stage,
+        f"streaming impedance target ramp over {ramp_time:.2f}s "
+        f"to inward={PUSH_DISTANCE:.3f}m at {1.0 / period:.1f}Hz",
+    )
+    start = time.monotonic()
+    next_send = start
+    next_log = start + COMMAND_WAIT_LOG_INTERVAL_SEC
+    sends = 0
+    last_progress = 0.0
+
+    if ramp_time <= 0.0:
+        last_progress = send_progress(1.0, command_hold_time=hold_time)
+        sends += 1
+    else:
+        last_progress = send_progress(0.0, command_hold_time=ramp_command_hold_time)
+        sends += 1
+        next_send = start + period
+        deadline = start + ramp_time
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_send:
+                progress = min(1.0, max(0.0, (now - start) / ramp_time))
+                last_progress = send_progress(
+                    progress,
+                    command_hold_time=ramp_command_hold_time,
+                )
+                sends += 1
+                next_send = now + period
+
+            now = time.monotonic()
+            if now >= next_log:
+                elapsed = min(ramp_time, max(0.0, now - start))
+                print_stage(
+                    stage,
+                    f"ramping ({elapsed:.1f}/{ramp_time:.1f}s, "
+                    f"progress={last_progress * 100.0:.0f}%, sends={sends})",
+                )
+                next_log = now + COMMAND_WAIT_LOG_INTERVAL_SEC
+
+            sleep_sec = min(0.005, max(0.0, min(next_send, deadline) - time.monotonic()))
+            if sleep_sec > 0.0:
+                time.sleep(sleep_sec)
+
+    if last_progress < 1.0:
+        send_progress(1.0, command_hold_time=hold_time)
+        sends += 1
+
+    print_stage(stage, f"ramp complete; holding final push target for {hold_time:.2f}s")
+    if hold_time > 0.0:
+        time.sleep(hold_time)
+    print_stage(stage, f"done; stream sends={sends}")
+    return True
 
 
 def build_impedance_lift_command(dyn_model: Any, dyn_state: Any, q: Any) -> Any:
@@ -1908,6 +2014,7 @@ def main(
     live_vision_timeout_sec: float,
     live_center_spread_m: float,
     continue_pick: bool,
+    push_ramp_time_sec: float,
     visualize: bool,
     visualize_only: bool,
     gripper_open: bool,
@@ -2187,21 +2294,19 @@ def main(
             print_stage("4/6 vision_pre_push", "pre-push-only stop; done=True")
             return done
 
-        print_stage("5/6 inward_push", "building target")
+        print_stage("5/6 inward_push", "building ramped target stream")
         q = robot.get_state().position
-        if not send_stage(
+        if not stream_impedance_push_stage(
             robot,
-            build_impedance_push_command(dyn_model, dyn_state, q),
-            "5/6 inward_push",
-            timeout_sec=stage_timeout_sec(
-                PUSH_HOLD_TIME,
-                min_timeout_sec=min_command_timeout_sec,
-                margin_sec=command_timeout_margin_sec,
-            ),
+            dyn_model,
+            dyn_state,
+            q,
+            ramp_time_sec=push_ramp_time_sec,
+            hold_time_sec=PUSH_HOLD_TIME,
+            stage="5/6 inward_push",
         ):
             print_stage("5/6 inward_push", "FAILED; aborting")
             return done
-        print_stage("5/6 inward_push", "done")
 
         print_stage("6/6 lift", "building target")
         q = robot.get_state().position
@@ -2452,6 +2557,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_false",
         help="Stop after the vision-adjusted pre-push pose, before y-axis inward push.",
     )
+    parser.add_argument(
+        "--push-ramp-time-sec",
+        type=float,
+        default=PUSH_RAMP_TIME,
+        help=(
+            "Time to ramp the inward impedance push target from 0 to full PUSH_DISTANCE. "
+            "Increase this if the grippers hit the box too hard."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -2495,6 +2609,8 @@ if __name__ == "__main__":
         raise SystemExit("--mobile-base-vision-frames must be positive")
     if args.mobile_base_vision_timeout_sec <= 0.0:
         raise SystemExit("--mobile-base-vision-timeout-sec must be positive")
+    if args.push_ramp_time_sec < 0.0:
+        raise SystemExit("--push-ramp-time-sec must be non-negative")
     center_camera = resolve_box_center_camera(args)
     max_shift = None if args.allow_large_vision_shift else float(args.max_reference_xy_shift_m)
     midpoint_offset_xy = combined_midpoint_offset_xy(args)
@@ -2516,6 +2632,7 @@ if __name__ == "__main__":
             live_vision_timeout_sec=float(args.live_vision_timeout_sec),
             live_center_spread_m=float(args.live_center_spread_m),
             continue_pick=bool(args.continue_pick),
+            push_ramp_time_sec=float(args.push_ramp_time_sec),
             visualize=bool(args.visualize or args.visualize_only),
             visualize_only=bool(args.visualize_only),
             gripper_open=bool(args.gripper_open),

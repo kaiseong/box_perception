@@ -158,6 +158,179 @@ class PickingBox3MobileAlignTests(unittest.TestCase):
         self.assertLessEqual(pb3.MOBILE_BASE_STREAM_PERIOD_SEC, 1.0 / 30.0 + 1e-9)
         self.assertGreaterEqual(pb3.MOBILE_BASE_COMMAND_HOLD_TIME_SEC, 2.0)
 
+    def test_impedance_push_stream_ramps_target_to_full_inward_distance(self) -> None:
+        class FakeHeaderBuilder:
+            def __init__(self) -> None:
+                self.control_hold_time = None
+
+            def set_control_hold_time(self, value: float):
+                self.control_hold_time = float(value)
+                return self
+
+        class FakeImpedanceControlCommandBuilder:
+            def __init__(self) -> None:
+                self.header = None
+                self.reference_link_name = None
+                self.link_name = None
+                self.translation_weight = None
+                self.rotation_weight = None
+                self.transformation = None
+
+            def set_command_header(self, header):
+                self.header = header
+                return self
+
+            def set_reference_link_name(self, name: str):
+                self.reference_link_name = name
+                return self
+
+            def set_link_name(self, name: str):
+                self.link_name = name
+                return self
+
+            def set_translation_weight(self, weight):
+                self.translation_weight = list(weight)
+                return self
+
+            def set_rotation_weight(self, weight):
+                self.rotation_weight = list(weight)
+                return self
+
+            def set_transformation(self, transformation):
+                self.transformation = np.asarray(transformation, dtype=np.float64)
+                return self
+
+        class FakeBodyComponentBasedCommandBuilder:
+            def __init__(self) -> None:
+                self.right_arm_command = None
+                self.left_arm_command = None
+
+            def set_right_arm_command(self, command):
+                self.right_arm_command = command
+                return self
+
+            def set_left_arm_command(self, command):
+                self.left_arm_command = command
+                return self
+
+        class FakeComponentBasedCommandBuilder:
+            def __init__(self) -> None:
+                self.body_command = None
+
+            def set_body_command(self, command):
+                self.body_command = command
+                return self
+
+        class FakeRobotCommandBuilder:
+            def __init__(self) -> None:
+                self.command = None
+
+            def set_command(self, command):
+                self.command = command
+                return self
+
+        class FakeStream:
+            def __init__(self) -> None:
+                self.sent = []
+
+            def send_command(self, builder) -> None:
+                self.sent.append(builder.command.body_command)
+
+        class FakeRobot:
+            def __init__(self) -> None:
+                self.stream = FakeStream()
+                self.priority = None
+
+            def create_command_stream(self, *, priority: int):
+                self.priority = priority
+                return self.stream
+
+        class FakeDynState:
+            def set_q(self, q) -> None:
+                self.q = np.asarray(q, dtype=np.float64)
+
+        class FakeDynModel:
+            def compute_forward_kinematics(self, _state) -> None:
+                return None
+
+            def compute_transformation(self, _state, _ref_index: int, ee_index: int):
+                T = np.eye(4, dtype=np.float64)
+                T[0, 3] = 0.4
+                if ee_index == pb3.EE_RIGHT_INDEX:
+                    T[1, 3] = -0.3
+                elif ee_index == pb3.EE_LEFT_INDEX:
+                    T[1, 3] = 0.3
+                else:
+                    raise AssertionError(f"unexpected ee_index={ee_index}")
+                return T
+
+        class FakeClock:
+            def __init__(self) -> None:
+                self.now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+            def sleep(self, seconds: float) -> None:
+                self.now += max(0.0, float(seconds))
+
+        fake_rby = types.SimpleNamespace(
+            CommandHeaderBuilder=FakeHeaderBuilder,
+            ImpedanceControlCommandBuilder=FakeImpedanceControlCommandBuilder,
+            BodyComponentBasedCommandBuilder=FakeBodyComponentBasedCommandBuilder,
+            ComponentBasedCommandBuilder=FakeComponentBasedCommandBuilder,
+            RobotCommandBuilder=FakeRobotCommandBuilder,
+            RobotCommandFeedback=pb3.rby.RobotCommandFeedback,
+        )
+        robot = FakeRobot()
+        clock = FakeClock()
+        original_rby = pb3.rby
+        original_monotonic = pb3.time.monotonic
+        original_sleep = pb3.time.sleep
+        pb3.rby = fake_rby
+        pb3.time.monotonic = clock.monotonic
+        pb3.time.sleep = clock.sleep
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ok = pb3.stream_impedance_push_stage(
+                    robot,
+                    FakeDynModel(),
+                    FakeDynState(),
+                    np.zeros(1),
+                    ramp_time_sec=0.06,
+                    hold_time_sec=0.2,
+                    stream_period_sec=0.02,
+                    stage="stage",
+                )
+        finally:
+            pb3.rby = original_rby
+            pb3.time.monotonic = original_monotonic
+            pb3.time.sleep = original_sleep
+
+        self.assertTrue(ok)
+        self.assertEqual(robot.priority, pb3.PUSH_STREAM_PRIORITY)
+        self.assertGreaterEqual(len(robot.stream.sent), 4)
+
+        first = robot.stream.sent[0]
+        last = robot.stream.sent[-1]
+        self.assertEqual(first.right_arm_command.reference_link_name, pb3.IMPEDANCE_REFERENCE_LINK)
+        self.assertEqual(first.left_arm_command.reference_link_name, pb3.IMPEDANCE_REFERENCE_LINK)
+        np.testing.assert_allclose(first.right_arm_command.transformation[1, 3], -0.3)
+        np.testing.assert_allclose(first.left_arm_command.transformation[1, 3], 0.3)
+        np.testing.assert_allclose(
+            last.right_arm_command.transformation[1, 3],
+            -0.3 + pb3.PUSH_DISTANCE,
+        )
+        np.testing.assert_allclose(
+            last.left_arm_command.transformation[1, 3],
+            0.3 - pb3.PUSH_DISTANCE,
+        )
+        self.assertAlmostEqual(
+            first.right_arm_command.header.control_hold_time,
+            pb3.PUSH_STREAM_COMMAND_HOLD_TIME,
+        )
+        self.assertAlmostEqual(last.right_arm_command.header.control_hold_time, 0.2)
+
     def test_gripper_stop_uses_bounded_join(self) -> None:
         class FakeThread:
             def __init__(self, alive: bool) -> None:
