@@ -3,7 +3,7 @@
 
 This script is for visual motion checks in the RBY1 simulator. It does not run
 vision or FT monitoring. Default mode runs:
-ready -> vision_pre_push_demo -> inward impedance push -> lift.
+ready -> ready_to_picking -> vision_pre_push_demo -> inward impedance push -> lift.
 """
 
 from __future__ import annotations
@@ -71,7 +71,7 @@ def is_local_address(address: str) -> bool:
 
 def pose_sequence(mode: str) -> list[NamedPose]:
     if mode == "full-pick":
-        return [NamedPose("ready", READY)]
+        return [NamedPose(name, pose) for name, pose in JOINT_SEQUENCE]
     if mode == "picking2":
         return [NamedPose(name, pose) for name, pose in JOINT_SEQUENCE]
     if mode == "start-to-picking":
@@ -238,7 +238,7 @@ def main() -> int:
         ),
         default=DEFAULT_MODE,
         help=(
-            "full-pick: ready -> vision_pre_push_demo -> inward push -> lift. "
+            "full-pick: picking_box_2 joint pre-shape -> vision_pre_push_demo -> inward push -> lift. "
             "start-to-picking: ready -> start_to_picking preview. "
             "picking2: current picking_box_2 joint sequence. "
             "start-only: start_to_picking pose only."

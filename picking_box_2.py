@@ -6,10 +6,11 @@ orientation, but shifts only x/y from the latest camera-estimated box center.
 
 Default sequence:
   1. ready                           (joint position control)
-  2. live vision at ready pose       (D405 + rim-plane estimator, usable center frames)
-  3. vision_pre_push                 (START_TO_PICKING z/rotation, vision x/y)
-  4. inward y-axis push              (Cartesian impedance control)
-  5. lift                            (dual-target Cartesian control)
+  2. ready_to_picking                (joint pre-shape to avoid elbow-up IK)
+  3. live vision at pre-shape pose   (D405 + rim-plane estimator, usable center frames)
+  4. vision_pre_push                 (START_TO_PICKING z/rotation, vision x/y)
+  5. inward y-axis push              (Cartesian impedance control)
+  6. lift                            (dual-target Cartesian control)
 
 Pass --pre-push-only to stop at the pose just before the inward y-axis push.
 
@@ -223,6 +224,13 @@ READY = {
     "head": [0.000, 0.436],
 }
 
+READY_TO_PICKING = {
+    "torso": [0.000, 0.000, 0.000, 0.349, 0.000, 0.000],
+    "right_arm": [-0.111, -0.987, -0.205, -1.463, -2.454, 1.744, 0.30],
+    "left_arm": [-0.111, 0.987, 0.205, -1.463, 2.454, 1.744, -0.30],
+    "head": [0.000, 0.436],
+}
+
 START_TO_PICKING = {
     "torso": [0.000, 0.000, 0.000, 0.349, 0.000, 0.000],
     "right_arm": [-0.171, -0.841, -0.153, -1.511, -2.403, 1.743, 0.5],
@@ -230,8 +238,12 @@ START_TO_PICKING = {
     "head": [0.000, 0.436],
 }
 
+# Move near the grasping branch in joint space before the Cartesian
+# vision_pre_push target. This avoids the arm choosing an elbow-up/"hands up"
+# IK branch when commanded directly from READY.
 JOINT_SEQUENCE = [
     ("ready", READY),
+    ("ready_to_picking", READY_TO_PICKING),
 ]
 
 
