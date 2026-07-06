@@ -32,6 +32,128 @@ from picking_box_3 import (
 
 
 class PickingBox3MobileAlignTests(unittest.TestCase):
+    def test_mobile_base_stream_matches_lerobot_command_shape(self) -> None:
+        class FakeHeaderBuilder:
+            def __init__(self) -> None:
+                self.control_hold_time = None
+
+            def set_control_hold_time(self, value: float):
+                self.control_hold_time = float(value)
+                return self
+
+        class FakeSE2VelocityCommandBuilder:
+            def __init__(self) -> None:
+                self.header = None
+                self.velocity = None
+                self.angular = None
+                self.minimum_time = None
+
+            def set_command_header(self, header):
+                self.header = header
+                return self
+
+            def set_velocity(self, velocity, angular):
+                self.velocity = np.asarray(velocity, dtype=np.float64)
+                self.angular = float(angular)
+                return self
+
+            def set_minimum_time(self, minimum_time: float):
+                self.minimum_time = float(minimum_time)
+                return self
+
+        class FakeComponentBasedCommandBuilder:
+            def __init__(self) -> None:
+                self.mobility_command = None
+
+            def set_mobility_command(self, command):
+                self.mobility_command = command
+                return self
+
+        class FakeRobotCommandBuilder:
+            def __init__(self) -> None:
+                self.command = None
+
+            def set_command(self, command):
+                self.command = command
+                return self
+
+        class FakeStream:
+            def __init__(self) -> None:
+                self.sent = []
+
+            def send_command(self, builder) -> None:
+                self.sent.append(builder.command.mobility_command)
+
+        class FakeRobot:
+            def __init__(self) -> None:
+                self.stream = FakeStream()
+                self.priority = None
+
+            def create_command_stream(self, *, priority: int):
+                self.priority = priority
+                return self.stream
+
+        class FakeClock:
+            def __init__(self) -> None:
+                self.now = 0.0
+
+            def monotonic(self) -> float:
+                value = self.now
+                self.now += 0.02
+                return value
+
+            def sleep(self, seconds: float) -> None:
+                self.now += float(seconds)
+
+        fake_rby = types.SimpleNamespace(
+            CommandHeaderBuilder=FakeHeaderBuilder,
+            SE2VelocityCommandBuilder=FakeSE2VelocityCommandBuilder,
+            ComponentBasedCommandBuilder=FakeComponentBasedCommandBuilder,
+            RobotCommandBuilder=FakeRobotCommandBuilder,
+            RobotCommandFeedback=pb3.rby.RobotCommandFeedback,
+        )
+        robot = FakeRobot()
+        clock = FakeClock()
+        original_rby = pb3.rby
+        original_monotonic = pb3.time.monotonic
+        original_sleep = pb3.time.sleep
+        pb3.rby = fake_rby
+        pb3.time.monotonic = clock.monotonic
+        pb3.time.sleep = clock.sleep
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ok, status = pb3.stream_mobile_base_velocity_stage(
+                    robot,
+                    [0.02, -0.01],
+                    duration_sec=0.05,
+                    stage="stage",
+                    live_view=None,
+                    dyn_model=object(),
+                    dyn_state=object(),
+                    view_rotation="cw90",
+                    stream_period_sec=0.02,
+                    control_hold_time_sec=0.25,
+                )
+        finally:
+            pb3.rby = original_rby
+            pb3.time.monotonic = original_monotonic
+            pb3.time.sleep = original_sleep
+
+        self.assertTrue(ok)
+        self.assertEqual(status, "done")
+        self.assertEqual(robot.priority, pb3.MOBILE_BASE_STREAM_PRIORITY)
+        self.assertGreaterEqual(len(robot.stream.sent), 1 + pb3.MOBILE_BASE_STOP_REPEATS)
+
+        first = robot.stream.sent[0]
+        np.testing.assert_allclose(first.velocity, [0.02, -0.01])
+        self.assertEqual(first.angular, 0.0)
+        self.assertAlmostEqual(first.minimum_time, 0.02 * 1.01)
+        self.assertAlmostEqual(first.header.control_hold_time, 0.25)
+
+        for command in robot.stream.sent[-pb3.MOBILE_BASE_STOP_REPEATS :]:
+            np.testing.assert_allclose(command.velocity, [0.0, 0.0])
+            self.assertEqual(command.angular, 0.0)
+
     def test_gripper_stop_uses_bounded_join(self) -> None:
         class FakeThread:
             def __init__(self, alive: bool) -> None:
@@ -64,6 +186,9 @@ class PickingBox3MobileAlignTests(unittest.TestCase):
         self.assertFalse(gripper._running)
         self.assertEqual(stuck_thread.join_timeout, pb3.GRIPPER_STOP_JOIN_TIMEOUT_SEC)
         self.assertIs(gripper._thread, stuck_thread)
+
+    def test_gripper_homing_poll_interval_is_short(self) -> None:
+        self.assertLessEqual(pb3.GRIPPER_HOMING_SLEEP_SEC, 0.05)
 
     def test_setup_gripper_retries_initialize_after_tool_voltage_settle(self) -> None:
         class FakeGripper:

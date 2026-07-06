@@ -103,7 +103,7 @@ GRIPPER_DIRECTION = False
 GRIPPER_OPEN_NORMALIZED_Q = np.array([1.0, 1.0], dtype=np.float64)
 GRIPPER_HOMING_TORQUE_NM = 0.5
 GRIPPER_HOMING_STALL_COUNT = 15
-GRIPPER_HOMING_SLEEP_SEC = 0.1
+GRIPPER_HOMING_SLEEP_SEC = 0.05
 GRIPPER_POSITION_TORQUE_NM = 5.0
 GRIPPER_COMMAND_PERIOD_SEC = 0.1
 GRIPPER_SETUP_SETTLE_SEC = 0.5
@@ -127,6 +127,10 @@ MOBILE_BASE_TOTAL_TIMEOUT_SEC = 30.0
 MOBILE_BASE_MOVE_DURATION_SEC = 1.0
 MOBILE_BASE_VISION_FRAMES_NEEDED = 3
 MOBILE_BASE_VISION_TIMEOUT_SEC = 2.0
+MOBILE_BASE_STREAM_PRIORITY = 1
+MOBILE_BASE_STREAM_PERIOD_SEC = 1.0 / 15.0
+MOBILE_BASE_COMMAND_HOLD_TIME_SEC = 0.25
+MOBILE_BASE_STOP_REPEATS = 3
 # The arms only get to move if alignment ended near the target; a residual
 # error beyond this band reproduces the far-reach IK failure this script
 # exists to avoid, so the pick aborts instead of continuing.
@@ -504,12 +508,16 @@ def build_mobile_base_velocity_command(
     linear_velocity_xy_mps: Any,
     *,
     minimum_time: float,
+    control_hold_time: float = MOBILE_BASE_COMMAND_HOLD_TIME_SEC,
 ) -> Any:
-    """Build an M-model SE(2) mobile-base velocity command with zero yaw."""
+    """Build an M-model body-frame SE(2) velocity command with zero yaw."""
     velocity = np.asarray(linear_velocity_xy_mps, dtype=np.float64)
     return rby.RobotCommandBuilder().set_command(
         rby.ComponentBasedCommandBuilder().set_mobility_command(
             rby.SE2VelocityCommandBuilder()
+            .set_command_header(
+                rby.CommandHeaderBuilder().set_control_hold_time(float(control_hold_time))
+            )
             .set_minimum_time(float(minimum_time))
             .set_velocity(velocity, 0.0)
         )
@@ -1119,6 +1127,115 @@ def send_mobile_stage_with_live_view(
     return ok, "done" if ok else "finish_not_ok"
 
 
+def stream_mobile_base_velocity_stage(
+    robot: Any,
+    linear_velocity_xy_mps: Any,
+    *,
+    duration_sec: float,
+    stage: str,
+    live_view: ContinuousLiveBoxView | None,
+    dyn_model: Any,
+    dyn_state: Any,
+    view_rotation: str,
+    status_lines: list[tuple[str, tuple[int, int, int]]] | None = None,
+    stream_period_sec: float = MOBILE_BASE_STREAM_PERIOD_SEC,
+    control_hold_time_sec: float = MOBILE_BASE_COMMAND_HOLD_TIME_SEC,
+) -> tuple[bool, str]:
+    """Stream a body-frame SE2 velocity command like rby1-lerobot send_action().
+
+    rby1-lerobot does not run the wheel joints directly. It repeatedly sends
+    x.vel/y.vel/theta.vel through a priority-1 command stream. Use the same
+    pattern for short mobile-base alignment moves, then explicitly stream zero
+    velocity so the base stops before the next vision recapture.
+    """
+    velocity_xy = np.asarray(linear_velocity_xy_mps, dtype=np.float64)
+    period = max(0.01, float(stream_period_sec))
+    duration = max(0.0, float(duration_sec))
+    minimum_time = period * 1.01
+
+    print_stage(
+        stage,
+        "streaming body-frame SE2 velocity "
+        f"vel=[{velocity_xy[0]:+.3f}, {velocity_xy[1]:+.3f}]m/s "
+        f"duration={duration:.2f}s period={period:.3f}s",
+    )
+    try:
+        stream = robot.create_command_stream(priority=MOBILE_BASE_STREAM_PRIORITY)
+    except Exception as exc:  # pragma: no cover - SDK/hardware dependent
+        print_stage(stage, f"failed to create mobile command stream: {exc}")
+        return False, "stream_create_failed"
+
+    def send_velocity(v_xy: Any) -> None:
+        stream.send_command(
+            build_mobile_base_velocity_command(
+                v_xy,
+                minimum_time=minimum_time,
+                control_hold_time=control_hold_time_sec,
+            )
+        )
+
+    def refresh_live_view() -> str | None:
+        if live_view is None:
+            return None
+        q = robot.get_state().position
+        camera_to_base = compute_camera_to_base_for_view_rotation(
+            view_rotation,
+            dyn_model,
+            dyn_state,
+            q,
+        )
+        try:
+            _, _, _, _, abort_requested = live_view.process_next_frame(
+                camera_to_base=camera_to_base,
+                status_lines=status_lines,
+            )
+        except StopIteration:
+            print_stage(stage, "live vision stream ended while streaming mobility command")
+            return "stream_ended"
+        if abort_requested:
+            print_stage(stage, "visualization abort requested")
+            return "visual_abort"
+        return None
+
+    status = "done"
+    ok = True
+    sends = 0
+    try:
+        start = time.monotonic()
+        deadline = start + duration
+        next_send = start
+        next_log = start + COMMAND_WAIT_LOG_INTERVAL_SEC
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_send:
+                send_velocity(velocity_xy)
+                sends += 1
+                next_send = now + period
+
+            live_status = refresh_live_view()
+            if live_status is not None:
+                ok = False
+                status = live_status
+                break
+
+            now = time.monotonic()
+            if now >= next_log:
+                elapsed = min(duration, max(0.0, now - start))
+                print_stage(stage, f"streaming ({elapsed:.1f}/{duration:.1f}s, sends={sends})")
+                next_log = now + COMMAND_WAIT_LOG_INTERVAL_SEC
+            sleep_sec = min(0.005, max(0.0, min(next_send, deadline) - time.monotonic()))
+            if sleep_sec > 0.0:
+                time.sleep(sleep_sec)
+    finally:
+        zero = np.zeros(2, dtype=np.float64)
+        for _ in range(max(1, int(MOBILE_BASE_STOP_REPEATS))):
+            send_velocity(zero)
+            time.sleep(period)
+        print_stage(stage, f"stream stop sent; motion sends={sends}")
+
+    return ok, status
+
+
 def resolve_box_center_camera(args: argparse.Namespace) -> np.ndarray | None:
     """Return the box center from CLI inputs, or None to capture live later."""
     sources = [args.box_center_camera is not None, args.vision_json is not None]
@@ -1577,31 +1694,17 @@ def run_mobile_base_alignment(
                 f"step=[{step_xy[0]:+.3f}, {step_xy[1]:+.3f}]m "
                 f"vel=[{velocity_xy[0]:+.3f}, {velocity_xy[1]:+.3f}]m/s",
             )
-            timeout_sec = stage_timeout_sec(
-                move_time,
-                min_timeout_sec=min_command_timeout_sec,
-                margin_sec=command_timeout_margin_sec,
+            ok, move_status = stream_mobile_base_velocity_stage(
+                robot,
+                velocity_xy,
+                duration_sec=move_time,
+                stage="3/6 mobile_base_align",
+                live_view=live_view,
+                dyn_model=dyn_model,
+                dyn_state=dyn_state,
+                view_rotation=view_rotation,
+                status_lines=status_lines,
             )
-            if live_view is not None:
-                ok, move_status = send_mobile_stage_with_live_view(
-                    robot,
-                    build_mobile_base_velocity_command(velocity_xy, minimum_time=move_time),
-                    "3/6 mobile_base_align",
-                    timeout_sec=timeout_sec,
-                    live_view=live_view,
-                    dyn_model=dyn_model,
-                    dyn_state=dyn_state,
-                    view_rotation=view_rotation,
-                    status_lines=status_lines,
-                )
-            else:
-                ok = send_stage(
-                    robot,
-                    build_mobile_base_velocity_command(velocity_xy, minimum_time=move_time),
-                    "3/6 mobile_base_align",
-                    timeout_sec=timeout_sec,
-                )
-                move_status = "done" if ok else "failed"
             if not ok:
                 if move_status == "visual_abort":
                     raise UserAbortRequested("mobile alignment aborted from the live view")
