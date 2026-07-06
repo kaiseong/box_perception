@@ -146,6 +146,33 @@ MOBILE_BASE_YAW_MOVE_DURATION_SEC = 2.0
 MOBILE_BASE_YAW_VISION_FRAMES_NEEDED = 3
 MOBILE_BASE_YAW_VISION_TIMEOUT_SEC = 2.0
 MOBILE_BASE_COMBINED_COARSE_YAW_THRESHOLD_DEG = 90.0
+
+# ---- Continuous SE(2) visual servoing (default alignment mode) ----
+# Instead of move -> stop -> measure steps, every camera frame is feedback:
+# v = Kp * error, plus an omega x r feedforward that makes base rotation
+# xy-neutral (the base orbits the box), so yaw and x/y converge together in
+# ONE smooth motion. Speed caps reuse MOBILE_BASE_MAX_SPEED_MPS and
+# MOBILE_BASE_YAW_MAX_SPEED_RADPS; when a cap binds, v and omega are scaled
+# by the SAME factor so the orbit geometry is preserved.
+SERVO_ALIGN_DEFAULT = True
+SERVO_KP_XY = 0.6               # 1/s: proportional gain, tapers speed near target
+SERVO_KP_YAW = 0.8              # 1/s
+SERVO_SETTLED_FRAMES = 5        # consecutive in-tolerance frames to finish
+SERVO_TOTAL_TIMEOUT_SEC = 40.0
+SERVO_UNUSABLE_DECAY = 0.5      # velocity decay per unusable frame
+SERVO_NO_MEASUREMENT_STOP_SEC = 1.0
+SERVO_NO_MEASUREMENT_ABORT_SEC = 5.0
+SERVO_COMMAND_HOLD_TIME_SEC = 0.25
+SERVO_COMMAND_STALE_STOP_SEC = 0.35
+SERVO_FILTER_WINDOW_FRAMES = 3
+SERVO_FILTER_CENTER_OUTLIER_M = 0.03
+SERVO_FILTER_YAW_OUTLIER_DEG = 10.0
+# Divergence guard: sustained growth of the normalized error is what an
+# inverted SE(2) sign convention looks like on the very first motion; abort
+# within ~one window instead of wandering until the timeout.
+SERVO_DIVERGENCE_WINDOW_SEC = 3.0
+SERVO_DIVERGENCE_GROWTH = 1.3
+SERVO_DIVERGENCE_GRACE_SEC = 1.5
 # Budget must cover the worst realistic initial error at the capped base speed plus a
 # vision recapture per step; 8 s only allowed ~8 cm of total travel.
 MOBILE_BASE_TOTAL_TIMEOUT_SEC = 30.0
@@ -750,6 +777,253 @@ def mobile_base_combined_alignment_plan(
     }
 
 
+def servo_control_velocities(
+    error_xy_m: Any,
+    yaw_error_deg: float,
+    box_center_base_xy_m: Any,
+    *,
+    kp_xy: float = SERVO_KP_XY,
+    kp_yaw: float = SERVO_KP_YAW,
+    max_speed_mps: float = MOBILE_BASE_MAX_SPEED_MPS,
+    max_angular_speed_radps: float = MOBILE_BASE_YAW_MAX_SPEED_RADPS,
+) -> tuple[np.ndarray, float]:
+    """Return one servo (v_xy, omega) command from a fresh vision error.
+
+    v = Kp*e + omega x r feedforward. The feedforward translates the base so
+    that its rotation keeps the box FIXED in the base frame (orbit motion):
+    for a base-frame box position p, a pure rotation makes p appear to move at
+    -omega x p, so v_ff = (omega*p_y, -omega*p_x) cancels it exactly. When a
+    speed cap binds, v and omega are scaled together to keep that geometry.
+    """
+    error_xy = np.asarray(error_xy_m, dtype=np.float64).reshape(2)
+    p = np.asarray(box_center_base_xy_m, dtype=np.float64).reshape(2)
+    omega = float(kp_yaw) * float(np.deg2rad(float(yaw_error_deg)))
+    v_feedback = float(kp_xy) * error_xy
+    v_feedforward = omega * np.array([p[1], -p[0]], dtype=np.float64)
+    velocity = v_feedback + v_feedforward
+
+    scale = 1.0
+    speed = float(np.linalg.norm(velocity))
+    if speed > float(max_speed_mps) > 0.0:
+        scale = min(scale, float(max_speed_mps) / speed)
+    if abs(omega) > float(max_angular_speed_radps) > 0.0:
+        scale = min(scale, float(max_angular_speed_radps) / abs(omega))
+    return velocity * scale, omega * scale
+
+
+def servo_normalized_error(
+    error_xy_m: Any,
+    yaw_error_deg: float,
+    *,
+    x_tolerance_m: float = MOBILE_BASE_X_TOLERANCE_M,
+    y_tolerance_m: float = MOBILE_BASE_Y_TOLERANCE_M,
+    yaw_tolerance_deg: float = MOBILE_BASE_YAW_TOLERANCE_DEG,
+) -> float:
+    """Return the worst error component normalized by its tolerance (1.0 = at band)."""
+    error_xy = np.asarray(error_xy_m, dtype=np.float64).reshape(2)
+    return max(
+        abs(float(error_xy[0])) / max(1e-9, float(x_tolerance_m)),
+        abs(float(error_xy[1])) / max(1e-9, float(y_tolerance_m)),
+        abs(float(yaw_error_deg)) / max(1e-9, float(yaw_tolerance_deg)),
+    )
+
+
+class ServoDivergenceGuard:
+    """Abort signal for a feedback loop whose error grows instead of shrinking.
+
+    Compares the current normalized error against the smallest error seen up
+    to window_sec ago; sustained growth beyond the ratio (after a grace
+    period) means the commanded velocities move the base the wrong way --
+    e.g. an inverted SE(2) omega sign convention.
+    """
+
+    def __init__(
+        self,
+        *,
+        window_sec: float = SERVO_DIVERGENCE_WINDOW_SEC,
+        growth_ratio: float = SERVO_DIVERGENCE_GROWTH,
+        grace_sec: float = SERVO_DIVERGENCE_GRACE_SEC,
+    ) -> None:
+        self.window_sec = float(window_sec)
+        self.growth_ratio = float(growth_ratio)
+        self.grace_sec = float(grace_sec)
+        self._history: list[tuple[float, float]] = []
+        self._start: float | None = None
+
+    def update(self, t_sec: float, normalized_error: float) -> bool:
+        """Record one sample; True when the error has grown past the guard."""
+        t = float(t_sec)
+        err = float(normalized_error)
+        if self._start is None:
+            self._start = t
+        self._history.append((t, err))
+        cutoff = t - self.window_sec
+        while len(self._history) > 1 and self._history[1][0] <= cutoff:
+            self._history.pop(0)
+        if t - self._start < self.grace_sec:
+            return False
+        past_errors = [e for ts, e in self._history if ts <= cutoff + 1e-9]
+        if not past_errors:
+            return False
+        reference = min(past_errors)
+        return err > reference * self.growth_ratio + 0.25
+
+
+class ServoMeasurementFilter:
+    """Short-window center/yaw filter for moving-base visual servo feedback."""
+
+    def __init__(
+        self,
+        *,
+        window_frames: int = SERVO_FILTER_WINDOW_FRAMES,
+        center_outlier_m: float = SERVO_FILTER_CENTER_OUTLIER_M,
+        yaw_outlier_deg: float = SERVO_FILTER_YAW_OUTLIER_DEG,
+    ) -> None:
+        self.window_frames = max(1, int(window_frames))
+        self.center_outlier_m = float(center_outlier_m)
+        self.yaw_outlier_deg = float(yaw_outlier_deg)
+        self._centers: list[np.ndarray] = []
+        self._yaw_errors: list[float] = []
+
+    def update(
+        self,
+        center_base_m: Any,
+        yaw_error_deg: float,
+        *,
+        target_x_m: float,
+    ) -> dict[str, Any] | None:
+        """Return filtered servo feedback, or None when the sample is an outlier."""
+        center = np.asarray(center_base_m, dtype=np.float64).reshape(-1)
+        if center.shape[0] < 2 or not np.all(np.isfinite(center[:2])):
+            return None
+        if center.shape[0] == 2:
+            center = np.array([center[0], center[1], 0.0], dtype=np.float64)
+        else:
+            center = center[:3].astype(np.float64, copy=True)
+        yaw_error = float(yaw_error_deg)
+        if not np.isfinite(yaw_error):
+            return None
+
+        if len(self._centers) >= 2:
+            median_xy = np.median(np.asarray([c[:2] for c in self._centers]), axis=0)
+            median_yaw = float(np.median(np.asarray(self._yaw_errors, dtype=np.float64)))
+            center_jump = float(np.linalg.norm(center[:2] - median_xy))
+            yaw_jump = abs(float(yaw_error - median_yaw))
+            if center_jump > self.center_outlier_m or yaw_jump > self.yaw_outlier_deg:
+                return None
+
+        self._centers.append(center)
+        self._yaw_errors.append(yaw_error)
+        if len(self._centers) > self.window_frames:
+            self._centers.pop(0)
+            self._yaw_errors.pop(0)
+
+        filtered_center = np.median(np.asarray(self._centers), axis=0)
+        filtered_yaw = float(np.median(np.asarray(self._yaw_errors, dtype=np.float64)))
+        return {
+            "center_base_m": filtered_center,
+            "error_xy_m": mobile_base_alignment_error_xy(filtered_center, target_x_m=target_x_m),
+            "yaw_error_deg": filtered_yaw,
+        }
+
+
+class MobileBaseServoCommandStreamer:
+    """Send the latest SE(2) command at a fixed rate independent of vision FPS."""
+
+    def __init__(
+        self,
+        stream: Any,
+        *,
+        period_sec: float = MOBILE_BASE_STREAM_PERIOD_SEC,
+        hold_time_sec: float = SERVO_COMMAND_HOLD_TIME_SEC,
+        stale_stop_sec: float = SERVO_COMMAND_STALE_STOP_SEC,
+    ) -> None:
+        self.stream = stream
+        self.period_sec = max(1e-3, float(period_sec))
+        self.hold_time_sec = max(self.period_sec * 2.0, float(hold_time_sec))
+        self.stale_stop_sec = max(self.period_sec * 2.0, float(stale_stop_sec))
+        self._lock = threading.Lock()
+        self._velocity_xy = np.zeros(2, dtype=np.float64)
+        self._omega = 0.0
+        self._last_update = time.monotonic()
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._send_count = 0
+        self._last_error: Exception | None = None
+
+    @property
+    def send_count(self) -> int:
+        with self._lock:
+            return int(self._send_count)
+
+    @property
+    def last_error(self) -> Exception | None:
+        with self._lock:
+            return self._last_error
+
+    def start(self) -> None:
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+            self._last_update = time.monotonic()
+        self._thread = threading.Thread(target=self._run, name="mobile-base-servo-stream", daemon=True)
+        self._thread.start()
+
+    def update(self, velocity_xy: Any, omega: float) -> None:
+        velocity = np.asarray(velocity_xy, dtype=np.float64).reshape(2)
+        with self._lock:
+            self._velocity_xy = velocity.copy()
+            self._omega = float(omega)
+            self._last_update = time.monotonic()
+
+    def stop(self, *, zero_repeats: int = MOBILE_BASE_STOP_REPEATS) -> None:
+        with self._lock:
+            self._velocity_xy = np.zeros(2, dtype=np.float64)
+            self._omega = 0.0
+            self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.period_sec * 5.0))
+        for _ in range(max(1, int(zero_repeats))):
+            self._send_once(np.zeros(2, dtype=np.float64), 0.0)
+            time.sleep(self.period_sec)
+
+    def _run(self) -> None:
+        next_tick = time.monotonic()
+        while True:
+            now = time.monotonic()
+            with self._lock:
+                if not self._running:
+                    return
+                velocity = self._velocity_xy.copy()
+                omega = float(self._omega)
+                stale = now - self._last_update > self.stale_stop_sec
+            if stale:
+                velocity = np.zeros(2, dtype=np.float64)
+                omega = 0.0
+            try:
+                self._send_once(velocity, omega)
+            except Exception as exc:  # pragma: no cover - SDK/hardware dependent
+                with self._lock:
+                    self._last_error = exc
+                    self._running = False
+                return
+            next_tick += self.period_sec
+            time.sleep(max(0.0, next_tick - time.monotonic()))
+
+    def _send_once(self, velocity_xy: np.ndarray, omega: float) -> None:
+        self.stream.send_command(
+            build_mobile_base_velocity_command(
+                velocity_xy,
+                angular_velocity_radps=float(omega),
+                minimum_time=self.period_sec * 1.01,
+                control_hold_time=self.hold_time_sec,
+            )
+        )
+        with self._lock:
+            self._send_count += 1
+
+
 class UserAbortRequested(Exception):
     """Operator requested abort from the live vision window."""
 
@@ -1243,7 +1517,7 @@ def live_estimate_to_measurement(
 class ContinuousLiveBoxView:
     """Keep the D405 vision window alive during closed-loop base alignment."""
 
-    def __init__(self, view_rotation: str) -> None:
+    def __init__(self, view_rotation: str, *, show: bool = True) -> None:
         import cv2
 
         if str(BOX_PERCEPTION_ROOT) not in sys.path:
@@ -1266,6 +1540,9 @@ class ContinuousLiveBoxView:
             view_rotation=view_rotation,
         )
         self.window_name = "picking_box_5 mobile align vision (q/ESC abort)"
+        # show=False keeps the same per-frame estimation available headless
+        # (e.g. the servo loop without --visualize); no window, no abort key.
+        self.show = bool(show)
         self._closed = False
 
     def close(self) -> None:
@@ -1291,8 +1568,22 @@ class ContinuousLiveBoxView:
         mask, _ = self.segment_yellow_box(image, keep_largest_component=False)
         estimate = self.estimate_plane_box(mask, depth_m, intrinsics, rim_plane=self.rim_plane)
         usable, mode = live_estimate_center_mode(estimate)
-
         T_base = np.asarray(camera_to_base, dtype=np.float64)
+        abort_requested = self._display(image, estimate, usable, mode, T_base, status_lines)
+        return usable, mode, estimate, T_base, abort_requested
+
+    def _display(
+        self,
+        image: np.ndarray,
+        estimate: Any,
+        usable: bool,
+        mode: str,
+        T_base: np.ndarray,
+        status_lines: list[tuple[str, tuple[int, int, int]]] | None,
+    ) -> bool:
+        """Render one frame's overlay; returns True when q/ESC was pressed."""
+        if not self.show:
+            return False
         vis = self.draw_known_size_estimate(image.copy(), estimate)
         status_color = (30, 160, 30) if usable else (40, 40, 220)
         lines: list[tuple[str, tuple[int, int, int]]] = [
@@ -1335,8 +1626,53 @@ class ContinuousLiveBoxView:
             )
         self.cv2.imshow(self.window_name, vis)
         key = self.cv2.waitKey(1) & 0xFF
-        abort_requested = key in (27, ord("q"))
-        return usable, mode, estimate, T_base, abort_requested
+        return key in (27, ord("q"))
+
+    def grab_synced_estimate(
+        self,
+        robot: Any,
+        dyn_model: Any,
+        dyn_state: Any,
+        view_rotation: str,
+        *,
+        status_lines: list[tuple[str, tuple[int, int, int]]] | None = None,
+    ) -> dict[str, Any]:
+        """Grab one frame and FK the camera pose at ~capture time.
+
+        Reading q right after the frame arrives (BEFORE the ~100 ms estimator
+        run) removes most of the moving-base timing skew, which is what makes
+        measuring while the base moves viable for the servo loop.
+        """
+        _, image, depth_m, intrinsics = next(self.frames)
+        q = robot.get_state().position
+        camera_to_base = compute_camera_to_base_for_view_rotation(
+            view_rotation,
+            dyn_model,
+            dyn_state,
+            q,
+        )
+        mask, _ = self.segment_yellow_box(image, keep_largest_component=False)
+        estimate = self.estimate_plane_box(mask, depth_m, intrinsics, rim_plane=self.rim_plane)
+        usable, mode = live_estimate_center_mode(estimate)
+        T_base = np.asarray(camera_to_base, dtype=np.float64)
+        abort_requested = self._display(image, estimate, usable, mode, T_base, status_lines)
+
+        center_base = None
+        axis_base = None
+        if estimate.center_top_camera_m is not None:
+            center_base = (T_base @ np.append(estimate.center_top_camera_m, 1.0))[:3]
+        long_axis = estimate.support.get("long_axis_camera") if estimate.support else None
+        if long_axis is not None:
+            axis_base = T_base[:3, :3] @ np.asarray(long_axis, dtype=np.float64)
+        return {
+            "usable": usable,
+            "mode": mode,
+            "estimate": estimate,
+            "camera_to_base": T_base,
+            "center_base_m": center_base,
+            "long_axis_base": axis_base,
+            "abort": abort_requested,
+        }
 
     def collect_measurement(
         self,
@@ -2480,6 +2816,240 @@ def run_mobile_base_combined_servo_alignment(
         live_view.close()
 
 
+def run_mobile_base_visual_servo_alignment(
+    robot: Any,
+    dyn_model: Any,
+    dyn_state: Any,
+    view_rotation: str,
+    measurement: dict[str, Any],
+    *,
+    visualize: bool,
+    target_x_m: float,
+    x_tolerance_m: float,
+    y_tolerance_m: float,
+    yaw_tolerance_deg: float,
+    max_speed_mps: float,
+    max_angular_speed_radps: float,
+    kp_xy: float = SERVO_KP_XY,
+    kp_yaw: float = SERVO_KP_YAW,
+    settled_frames: int = SERVO_SETTLED_FRAMES,
+    total_timeout_sec: float = SERVO_TOTAL_TIMEOUT_SEC,
+    command_hold_time_sec: float = SERVO_COMMAND_HOLD_TIME_SEC,
+    command_stale_stop_sec: float = SERVO_COMMAND_STALE_STOP_SEC,
+    filter_window_frames: int = SERVO_FILTER_WINDOW_FRAMES,
+    vision_frames_needed: int,
+    vision_timeout_sec: float,
+    max_center_spread_m: float,
+    stage: str = "3-4/7 mobile_base_se2_align",
+) -> dict[str, Any] | None:
+    """Continuous SE(2) visual servoing: no stop-and-measure steps.
+
+    Every camera frame (with q read at ~capture time) is turned directly into
+    a P-control velocity with the omega x r orbit feedforward. A separate
+    fixed-rate command sender streams the latest command with a short hold time
+    so D405 processing stalls do not leave a stale nonzero command active.
+    Ends with a STATIONARY confirm measurement (median + spread
+    gate) that the caller's residual gates consume, so contact decisions never
+    rest on an in-motion sample. `measurement` seeds nothing but logging; the
+    loop trusts only its own fresh frames.
+    """
+    del measurement  # servoing must not act on a pre-motion sample
+    live_view = ContinuousLiveBoxView(view_rotation, show=visualize)
+    guard = ServoDivergenceGuard()
+    try:
+        try:
+            stream = robot.create_command_stream(priority=MOBILE_BASE_STREAM_PRIORITY)
+        except Exception as exc:  # pragma: no cover - SDK/hardware dependent
+            print_stage(stage, f"failed to create mobile command stream: {exc}")
+            return None
+
+        commander = MobileBaseServoCommandStreamer(
+            stream,
+            period_sec=MOBILE_BASE_STREAM_PERIOD_SEC,
+            hold_time_sec=command_hold_time_sec,
+            stale_stop_sec=command_stale_stop_sec,
+        )
+        measurement_filter = ServoMeasurementFilter(window_frames=filter_window_frames)
+        commander.start()
+
+        v_cmd = np.zeros(2, dtype=np.float64)
+        w_cmd = 0.0
+        settled = 0
+        outcome = "timeout"
+        start = time.monotonic()
+        deadline = start + float(total_timeout_sec)
+        last_usable = start
+        next_log = start + COMMAND_WAIT_LOG_INTERVAL_SEC
+        error_xy = np.array([float("nan"), float("nan")])
+        yaw_error: float | None = None
+
+        try:
+            while True:
+                if commander.last_error is not None:
+                    print_stage(stage, f"FAILED: mobile command stream error: {commander.last_error}")
+                    return None
+                now = time.monotonic()
+                if now >= deadline:
+                    print_stage(stage, "servo timeout; stopping for stationary confirm")
+                    outcome = "timeout"
+                    break
+
+                status_lines = [
+                    (
+                        f"servo target x={target_x_m * 100:+.1f}cm y=+0.0cm yaw=base y  "
+                        f"settled {settled}/{int(settled_frames)}",
+                        (255, 255, 255),
+                    ),
+                    (
+                        f"cmd v=[{v_cmd[0] * 100:+.1f}, {v_cmd[1] * 100:+.1f}]cm/s "
+                        f"omega={w_cmd:+.3f}rad/s",
+                        (0, 220, 255),
+                    ),
+                ]
+                try:
+                    sample = live_view.grab_synced_estimate(
+                        robot,
+                        dyn_model,
+                        dyn_state,
+                        view_rotation,
+                        status_lines=status_lines,
+                    )
+                except StopIteration:
+                    print_stage(stage, "live vision stream ended during servoing")
+                    return None
+                if sample["abort"]:
+                    raise UserAbortRequested("servo alignment aborted from the live view")
+
+                now = time.monotonic()
+                usable = (
+                    sample["usable"]
+                    and sample["center_base_m"] is not None
+                    and sample["long_axis_base"] is not None
+                )
+                if usable:
+                    raw_center_base = np.asarray(sample["center_base_m"], dtype=np.float64)
+                    raw_yaw_error = box_long_axis_base_yaw_error_deg(sample["long_axis_base"])
+                    if raw_yaw_error is None:
+                        usable = False
+                    else:
+                        filtered = measurement_filter.update(
+                            raw_center_base,
+                            raw_yaw_error,
+                            target_x_m=target_x_m,
+                        )
+                        if filtered is None:
+                            usable = False
+                        else:
+                            last_usable = now
+                            center_base = np.asarray(filtered["center_base_m"], dtype=np.float64)
+                            error_xy = np.asarray(filtered["error_xy_m"], dtype=np.float64)
+                            yaw_error = float(filtered["yaw_error_deg"])
+                if usable:
+                    aligned = (
+                        abs(float(error_xy[0])) <= float(x_tolerance_m) + 1e-9
+                        and abs(float(error_xy[1])) <= float(y_tolerance_m) + 1e-9
+                        and abs(float(yaw_error)) <= float(yaw_tolerance_deg) + 1e-9
+                    )
+                    if aligned:
+                        settled += 1
+                        v_cmd = np.zeros(2, dtype=np.float64)
+                        w_cmd = 0.0
+                        if settled >= int(settled_frames):
+                            print_stage(
+                                stage,
+                                f"servo settled: error x={error_xy[0] * 100:+.1f}cm "
+                                f"y={error_xy[1] * 100:+.1f}cm yaw={yaw_error:+.2f}deg "
+                                f"({settled} consecutive frames)",
+                            )
+                            outcome = "settled"
+                            commander.update(np.zeros(2, dtype=np.float64), 0.0)
+                            break
+                    else:
+                        settled = 0
+                        v_cmd, w_cmd = servo_control_velocities(
+                            error_xy,
+                            yaw_error,
+                            center_base[:2],
+                            kp_xy=kp_xy,
+                            kp_yaw=kp_yaw,
+                            max_speed_mps=max_speed_mps,
+                            max_angular_speed_radps=max_angular_speed_radps,
+                        )
+                        if guard.update(
+                            now,
+                            servo_normalized_error(
+                                error_xy,
+                                yaw_error,
+                                x_tolerance_m=x_tolerance_m,
+                                y_tolerance_m=y_tolerance_m,
+                                yaw_tolerance_deg=yaw_tolerance_deg,
+                            ),
+                        ):
+                            print_stage(
+                                stage,
+                                "FAILED: error keeps growing under servo commands "
+                                "(SE(2) feedback sign suspect); stopping",
+                            )
+                            return None
+                else:
+                    # No trustworthy measurement this frame: decay toward zero,
+                    # stop after a short gap, give up after a longer one.
+                    v_cmd = v_cmd * SERVO_UNUSABLE_DECAY
+                    w_cmd = w_cmd * SERVO_UNUSABLE_DECAY
+                    if now - last_usable > SERVO_NO_MEASUREMENT_STOP_SEC:
+                        v_cmd = np.zeros(2, dtype=np.float64)
+                        w_cmd = 0.0
+                    if now - last_usable > SERVO_NO_MEASUREMENT_ABORT_SEC:
+                        print_stage(
+                            stage,
+                            f"no usable vision for {SERVO_NO_MEASUREMENT_ABORT_SEC:.0f}s "
+                            "while servoing; stopping",
+                        )
+                        return None
+
+                commander.update(v_cmd, w_cmd)
+
+                now = time.monotonic()
+                if now >= next_log:
+                    yaw_text = "n/a" if yaw_error is None else f"{yaw_error:+.2f}deg"
+                    print_stage(
+                        stage,
+                        f"servoing ({now - start:.1f}/{float(total_timeout_sec):.1f}s) "
+                        f"error x={error_xy[0] * 100:+.1f}cm y={error_xy[1] * 100:+.1f}cm "
+                        f"yaw={yaw_text} settled={settled}",
+                    )
+                    next_log = now + COMMAND_WAIT_LOG_INTERVAL_SEC
+        finally:
+            # Guaranteed stop, even on exceptions/aborts; cancel_control is the
+            # backstop when the stream itself is broken.
+            try:
+                commander.stop()
+                print_stage(stage, f"servo stream stop sent; sends={commander.send_count}")
+            except Exception as exc:  # pragma: no cover - SDK/hardware dependent
+                print_stage(stage, f"stop send failed ({exc}); calling robot.cancel_control()")
+                try:
+                    robot.cancel_control()
+                except Exception as cancel_exc:
+                    print_stage(stage, f"robot.cancel_control() failed: {cancel_exc}")
+
+        # Stationary confirm: contact decisions use a settled median with the
+        # spread gate, never an in-motion sample.
+        time.sleep(0.3)
+        print_stage(stage, f"stationary confirm after servo ({outcome})")
+        return live_view.collect_measurement(
+            robot,
+            dyn_model,
+            dyn_state,
+            view_rotation,
+            frames_needed=vision_frames_needed,
+            timeout_sec=vision_timeout_sec,
+            max_center_spread_m=max_center_spread_m,
+            stage=stage,
+        )
+    finally:
+        live_view.close()
+
+
 def run_mobile_base_combined_alignment(
     robot: Any,
     dyn_model: Any,
@@ -2934,6 +3504,14 @@ def main(
     push_ramp_time_sec: float,
     visualize: bool,
     visualize_only: bool,
+    discrete_align: bool,
+    servo_kp_xy: float,
+    servo_kp_yaw: float,
+    servo_settled_frames: int,
+    servo_timeout_sec: float,
+    servo_command_hold_time_sec: float,
+    servo_command_stale_stop_sec: float,
+    servo_filter_window_frames: int,
     gripper_open: bool,
     mobile_base_yaw_align: bool,
     mobile_base_yaw_tolerance_deg: float,
@@ -3069,30 +3647,64 @@ def main(
                     f"y=0.000m±{mobile_base_y_tolerance_m:.3f}m, "
                     f"yaw≤{mobile_base_yaw_tolerance_deg:.1f}deg ({xy_policy})",
                 )
-                combined_measurement = run_mobile_base_combined_alignment(
-                    robot,
-                    dyn_model,
-                    dyn_state,
-                    view_rotation,
-                    measurement,
-                    visualize=visualize,
-                    target_x_m=mobile_base_target_x_m,
-                    x_tolerance_m=mobile_base_x_tolerance_m,
-                    y_tolerance_m=mobile_base_y_tolerance_m,
-                    yaw_tolerance_deg=mobile_base_yaw_tolerance_deg,
-                    coarse_yaw_threshold_deg=mobile_base_combined_coarse_yaw_threshold_deg,
-                    max_speed_mps=mobile_base_max_speed_mps,
-                    max_angular_speed_radps=mobile_base_yaw_max_speed_radps,
-                    max_step_m=mobile_base_max_step_m,
-                    max_step_deg=mobile_base_yaw_max_step_deg,
-                    max_iterations=max(mobile_base_max_iterations, mobile_base_yaw_max_iterations),
-                    total_timeout_sec=max(mobile_base_total_timeout_sec, mobile_base_yaw_total_timeout_sec),
-                    xy_move_duration_sec=mobile_base_move_duration_sec,
-                    yaw_move_duration_sec=mobile_base_yaw_move_duration_sec,
-                    vision_frames_needed=max(mobile_base_vision_frames_needed, mobile_base_yaw_vision_frames_needed),
-                    vision_timeout_sec=max(mobile_base_vision_timeout_sec, mobile_base_yaw_vision_timeout_sec),
-                    max_center_spread_m=live_center_spread_m,
-                )
+                if discrete_align:
+                    combined_measurement = run_mobile_base_combined_alignment(
+                        robot,
+                        dyn_model,
+                        dyn_state,
+                        view_rotation,
+                        measurement,
+                        visualize=visualize,
+                        target_x_m=mobile_base_target_x_m,
+                        x_tolerance_m=mobile_base_x_tolerance_m,
+                        y_tolerance_m=mobile_base_y_tolerance_m,
+                        yaw_tolerance_deg=mobile_base_yaw_tolerance_deg,
+                        coarse_yaw_threshold_deg=mobile_base_combined_coarse_yaw_threshold_deg,
+                        max_speed_mps=mobile_base_max_speed_mps,
+                        max_angular_speed_radps=mobile_base_yaw_max_speed_radps,
+                        max_step_m=mobile_base_max_step_m,
+                        max_step_deg=mobile_base_yaw_max_step_deg,
+                        max_iterations=max(mobile_base_max_iterations, mobile_base_yaw_max_iterations),
+                        total_timeout_sec=max(mobile_base_total_timeout_sec, mobile_base_yaw_total_timeout_sec),
+                        xy_move_duration_sec=mobile_base_move_duration_sec,
+                        yaw_move_duration_sec=mobile_base_yaw_move_duration_sec,
+                        vision_frames_needed=max(mobile_base_vision_frames_needed, mobile_base_yaw_vision_frames_needed),
+                        vision_timeout_sec=max(mobile_base_vision_timeout_sec, mobile_base_yaw_vision_timeout_sec),
+                        max_center_spread_m=live_center_spread_m,
+                    )
+                else:
+                    # Continuous visual servoing: per-frame feedback with the
+                    # omega x r orbit feedforward, divergence guard, and a
+                    # stationary confirm at the end. Works with or without the
+                    # --visualize window.
+                    combined_measurement = run_mobile_base_visual_servo_alignment(
+                        robot,
+                        dyn_model,
+                        dyn_state,
+                        view_rotation,
+                        measurement,
+                        visualize=visualize,
+                        target_x_m=mobile_base_target_x_m,
+                        x_tolerance_m=mobile_base_x_tolerance_m,
+                        y_tolerance_m=mobile_base_y_tolerance_m,
+                        yaw_tolerance_deg=mobile_base_yaw_tolerance_deg,
+                        max_speed_mps=mobile_base_max_speed_mps,
+                        max_angular_speed_radps=mobile_base_yaw_max_speed_radps,
+                        kp_xy=servo_kp_xy,
+                        kp_yaw=servo_kp_yaw,
+                        settled_frames=servo_settled_frames,
+                        total_timeout_sec=servo_timeout_sec,
+                        command_hold_time_sec=servo_command_hold_time_sec,
+                        command_stale_stop_sec=servo_command_stale_stop_sec,
+                        filter_window_frames=servo_filter_window_frames,
+                        vision_frames_needed=max(
+                            mobile_base_vision_frames_needed, mobile_base_yaw_vision_frames_needed
+                        ),
+                        vision_timeout_sec=max(
+                            mobile_base_vision_timeout_sec, mobile_base_yaw_vision_timeout_sec
+                        ),
+                        max_center_spread_m=live_center_spread_m,
+                    )
                 if combined_measurement is None:
                     print_stage(
                         "3-4/7 mobile_base_se2_align",
@@ -3726,6 +4338,56 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=COMMAND_TIMEOUT_MIN_SEC,
         help="Minimum watchdog timeout for any robot command stage.",
     )
+    parser.add_argument(
+        "--discrete-align",
+        action="store_true",
+        help=(
+            "Fall back to the step-and-measure combined alignment loop instead of the "
+            "default continuous visual servoing (for on-robot A/B comparison)."
+        ),
+    )
+    parser.add_argument(
+        "--servo-kp-xy",
+        type=float,
+        default=SERVO_KP_XY,
+        help="Continuous visual-servo proportional gain for base x/y error.",
+    )
+    parser.add_argument(
+        "--servo-kp-yaw",
+        type=float,
+        default=SERVO_KP_YAW,
+        help="Continuous visual-servo proportional gain for yaw error.",
+    )
+    parser.add_argument(
+        "--servo-settled-frames",
+        type=int,
+        default=SERVO_SETTLED_FRAMES,
+        help="Consecutive in-tolerance visual-servo frames required before stationary confirm.",
+    )
+    parser.add_argument(
+        "--servo-timeout-sec",
+        type=float,
+        default=SERVO_TOTAL_TIMEOUT_SEC,
+        help="Total wall-clock budget for default continuous visual servo alignment.",
+    )
+    parser.add_argument(
+        "--servo-command-hold-time-sec",
+        type=float,
+        default=SERVO_COMMAND_HOLD_TIME_SEC,
+        help="Short hold time for each continuous-servo SE(2) velocity command.",
+    )
+    parser.add_argument(
+        "--servo-command-stale-stop-sec",
+        type=float,
+        default=SERVO_COMMAND_STALE_STOP_SEC,
+        help="Send zero velocity if the servo command target is not refreshed for this long.",
+    )
+    parser.add_argument(
+        "--servo-filter-window-frames",
+        type=int,
+        default=SERVO_FILTER_WINDOW_FRAMES,
+        help="Median-filter window for moving-base servo center/yaw feedback.",
+    )
     parser.set_defaults(continue_pick=True)
     parser.add_argument(
         "--continue-pick",
@@ -3812,6 +4474,20 @@ if __name__ == "__main__":
         raise SystemExit("--mobile-base-vision-frames must be positive")
     if args.mobile_base_vision_timeout_sec <= 0.0:
         raise SystemExit("--mobile-base-vision-timeout-sec must be positive")
+    if args.servo_kp_xy <= 0.0:
+        raise SystemExit("--servo-kp-xy must be positive")
+    if args.servo_kp_yaw <= 0.0:
+        raise SystemExit("--servo-kp-yaw must be positive")
+    if args.servo_settled_frames <= 0:
+        raise SystemExit("--servo-settled-frames must be positive")
+    if args.servo_timeout_sec <= 0.0:
+        raise SystemExit("--servo-timeout-sec must be positive")
+    if args.servo_command_hold_time_sec <= 0.0:
+        raise SystemExit("--servo-command-hold-time-sec must be positive")
+    if args.servo_command_stale_stop_sec <= 0.0:
+        raise SystemExit("--servo-command-stale-stop-sec must be positive")
+    if args.servo_filter_window_frames <= 0:
+        raise SystemExit("--servo-filter-window-frames must be positive")
     if args.push_ramp_time_sec < 0.0:
         raise SystemExit("--push-ramp-time-sec must be non-negative")
     center_camera = resolve_box_center_camera(args)
@@ -3838,6 +4514,14 @@ if __name__ == "__main__":
             push_ramp_time_sec=float(args.push_ramp_time_sec),
             visualize=bool(args.visualize or args.visualize_only),
             visualize_only=bool(args.visualize_only),
+            discrete_align=bool(args.discrete_align),
+            servo_kp_xy=float(args.servo_kp_xy),
+            servo_kp_yaw=float(args.servo_kp_yaw),
+            servo_settled_frames=int(args.servo_settled_frames),
+            servo_timeout_sec=float(args.servo_timeout_sec),
+            servo_command_hold_time_sec=float(args.servo_command_hold_time_sec),
+            servo_command_stale_stop_sec=float(args.servo_command_stale_stop_sec),
+            servo_filter_window_frames=int(args.servo_filter_window_frames),
             gripper_open=bool(args.gripper_open),
             mobile_base_yaw_align=bool(args.mobile_base_yaw_align),
             mobile_base_yaw_tolerance_deg=float(args.mobile_base_yaw_tolerance_deg),
