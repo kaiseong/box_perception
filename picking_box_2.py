@@ -60,7 +60,8 @@ VISION_PRE_PUSH_HAND_Y_MARGIN_M = 0.05
 # intended gripper-closing direction without introducing the base-z coupling that
 # x-direction torso-frame moves would have.
 IMPEDANCE_REFERENCE_LINK = "link_torso_5"
-PUSH_DISTANCE = 0.1
+# Actual inward travel from the widened vision pre-push pose.
+PUSH_DISTANCE = 0.12
 IMPEDANCE_TRANSLATION_WEIGHT = [500.0, 1000.0, 500.0]
 IMPEDANCE_ROTATION_WEIGHT = [50.0, 50.0, 50.0]
 PUSH_HOLD_TIME = 3.0
@@ -890,19 +891,18 @@ def build_dual_arm_impedance_command(
 
 
 def build_impedance_push_command(dyn_model: Any, dyn_state: Any, q: Any) -> Any:
-    """Push both hands inward to grip the box, expressed in base.
+    """Push both hands inward to grip the box, expressed in link_torso_5.
 
-    The pre-push pose opened each hand VISION_PRE_PUSH_HAND_Y_MARGIN_M wider
-    than the recorded contact pose, so the inward travel adds that margin back;
-    otherwise the commanded penetration (grip preload) would be halved.
+    The pre-push pose already opened each hand wider for approach clearance.
+    PUSH_DISTANCE is the total inward travel from that widened pose.
     """
     return build_dual_arm_impedance_command(
         dyn_model,
         dyn_state,
         q,
         reference_link=IMPEDANCE_REFERENCE_LINK,
-        ref_index=BASE_INDEX,
-        inward=PUSH_DISTANCE + VISION_PRE_PUSH_HAND_Y_MARGIN_M,
+        ref_index=TORSO_INDEX,
+        inward=PUSH_DISTANCE,
         lift=0.0,
         translation_weight=IMPEDANCE_TRANSLATION_WEIGHT,
         hold_time=PUSH_HOLD_TIME,
