@@ -54,10 +54,11 @@ VISION_PRE_PUSH_REFERENCE_INDEX = BASE_INDEX
 VISION_PRE_PUSH_HAND_Y_MARGIN_M = 0.05
 
 # ---- Cartesian impedance "push inward" parameters ----
-# Keep the push in base as well. With the current fixed torso posture, base +/-
-# y is the intended inward grip direction, and base z stays invariant when the
-# pre-push x target changes.
-IMPEDANCE_REFERENCE_LINK = "base"
+# Use the same torso-tip reference as the baseline picking_box.py push. The
+# torso posture is fixed, and this push is only along +/- y, so it preserves the
+# intended gripper-closing direction without introducing the base-z coupling that
+# x-direction torso-frame moves would have.
+IMPEDANCE_REFERENCE_LINK = "link_torso_5"
 PUSH_DISTANCE = 0.1
 IMPEDANCE_TRANSLATION_WEIGHT = [500.0, 1000.0, 500.0]
 IMPEDANCE_ROTATION_WEIGHT = [50.0, 50.0, 50.0]
@@ -315,6 +316,7 @@ def capture_box_live(
     timeout_sec: float = LIVE_VISION_TIMEOUT_SEC,
     max_center_spread_m: float = LIVE_VISION_MAX_CENTER_SPREAD_M,
     visualize: bool = False,
+    hold_after_capture: bool = False,
     camera_to_base: Any = None,
     run_forever: bool = False,
 ) -> dict[str, Any] | None:
@@ -330,7 +332,9 @@ def capture_box_live(
 
     With visualize=True an OpenCV window shows each frame with the fitted box
     and, when camera_to_base is given, the base-frame x/y/yaw the robot would
-    act on -- exactly what the grasp-reach experiments need. run_forever=True
+    act on -- exactly what the grasp-reach experiments need. If
+    hold_after_capture=True, the live window stays up after enough usable frames
+    are captured until c/space/enter continues or q/ESC aborts. run_forever=True
     streams until q/ESC without collecting a result (observation mode).
     """
     import time
@@ -354,6 +358,7 @@ def capture_box_live(
     long_axes: list[Any] = []
     modes: list[str] = []
     quit_requested = False
+    continue_requested = False
     long_axis_unconstrained = False
     deadline = time.monotonic() + (float("inf") if run_forever else float(timeout_sec))
     frames = iter_live_frames(
@@ -361,14 +366,16 @@ def capture_box_live(
     )
     try:
         for _, image, depth_m, intrinsics in frames:
-            if not (run_forever or len(centers) < int(frames_needed)):
+            captured_enough = not run_forever and len(centers) >= int(frames_needed)
+            if captured_enough and not (visualize and hold_after_capture):
                 break
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= deadline and not (captured_enough and visualize and hold_after_capture):
                 break
             mask, _ = segment_yellow_box(image, keep_largest_component=False)
             estimate = estimate_plane_box(mask, depth_m, intrinsics, rim_plane=rim_plane)
             usable, mode = live_estimate_center_mode(estimate)
-            if not run_forever:
+            collecting = not run_forever and len(centers) < int(frames_needed)
+            if collecting:
                 if usable:
                     centers.append(estimate.center_top_camera_m)
                     modes.append(mode)
@@ -390,6 +397,11 @@ def capture_box_live(
                 vis = draw_known_size_estimate(image.copy(), estimate)
                 status_color = (30, 160, 30) if usable else (40, 40, 220)
                 lines = [(f"{'USABLE' if usable else 'REJECTED'}: {mode}", status_color)]
+                if not run_forever and len(centers) >= int(frames_needed):
+                    lines.append((
+                        "CAPTURED: press c/space/enter to continue, q/ESC to abort",
+                        (0, 220, 255),
+                    ))
                 if T_base is not None and estimate.center_top_camera_m is not None:
                     center_base = (T_base @ np.append(estimate.center_top_camera_m, 1.0))[:3]
                     text = f"base x={center_base[0] * 100:+.1f}cm  y={center_base[1] * 100:+.1f}cm"
@@ -404,15 +416,21 @@ def capture_box_live(
                     cv2.putText(vis, text, (12, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 4, cv2.LINE_AA)
                     cv2.putText(vis, text, (12, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2, cv2.LINE_AA)
                 cv2.imshow(window_name, vis)
-                if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+                key = cv2.waitKey(1) & 0xFF
+                if key in (27, ord("q")):
                     quit_requested = True
+                    break
+                if len(centers) >= int(frames_needed) and key in (ord("c"), ord(" "), 10, 13):
+                    continue_requested = True
                     break
     finally:
         frames.close()  # stops the RealSense pipeline (generator finally)
         if visualize:
             cv2.destroyAllWindows()
 
-    if run_forever or (quit_requested and len(centers) < int(frames_needed)):
+    if run_forever or quit_requested:
+        return None
+    if visualize and hold_after_capture and not continue_requested and len(centers) >= int(frames_needed):
         return None
 
     if len(centers) < int(frames_needed):
@@ -1026,6 +1044,7 @@ def main(
                 timeout_sec=live_vision_timeout_sec,
                 max_center_spread_m=live_center_spread_m,
                 visualize=visualize,
+                hold_after_capture=visualize,
                 camera_to_base=camera_to_base,
             )
             if live is None:
@@ -1248,7 +1267,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--visualize",
         action="store_true",
-        help="Show a live window during vision capture with the fitted box and base-frame x/y/yaw.",
+        help=(
+            "Show a live window during vision capture with the fitted box and base-frame x/y/yaw. "
+            "After capture, press c/space/enter to continue or q/ESC to abort."
+        ),
     )
     parser.add_argument(
         "--visualize-only",
