@@ -155,8 +155,8 @@ MOBILE_BASE_COMBINED_COARSE_YAW_THRESHOLD_DEG = 90.0
 # MOBILE_BASE_YAW_MAX_SPEED_RADPS; when a cap binds, v and omega are scaled
 # by the SAME factor so the orbit geometry is preserved.
 SERVO_ALIGN_DEFAULT = True
-SERVO_KP_XY = 1.0               # 1/s: proportional gain, tapers speed near target
-SERVO_KP_YAW = 1.2              # 1/s
+SERVO_KP_XY = 0.8               # 1/s: proportional gain, tapers speed near target
+SERVO_KP_YAW = 1.0              # 1/s
 SERVO_SETTLED_FRAMES = 5        # consecutive in-tolerance frames to finish
 SERVO_TOTAL_TIMEOUT_SEC = 40.0
 SERVO_UNUSABLE_DECAY = 0.5      # velocity decay per unusable frame
