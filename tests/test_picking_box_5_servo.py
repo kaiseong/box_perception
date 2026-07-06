@@ -116,6 +116,20 @@ class ServoControlTests(unittest.TestCase):
         self.assertIsNotNone(tripped_at)
         self.assertLess(tripped_at, 5.0)
 
+    def test_divergence_guard_ignores_single_low_expired_noise_reference(self) -> None:
+        guard = pb5.ServoDivergenceGuard(window_sec=1.0, growth_ratio=1.3, grace_sec=0.0)
+        samples = [
+            (0.0, 10.0),
+            (0.1, 9.0),
+            (0.2, 0.1),  # one-frame low outlier; must not become the sole reference
+            (0.3, 8.5),
+            (1.21, 6.0),
+            (1.31, 5.8),
+            (1.41, 5.5),
+        ]
+        for t_sec, error in samples:
+            self.assertFalse(guard.update(t_sec, error))
+
     def test_normalized_error_uses_worst_component(self) -> None:
         value = pb5.servo_normalized_error(
             [0.02, 0.0], 1.0, x_tolerance_m=0.01, y_tolerance_m=0.01, yaw_tolerance_deg=4.0
@@ -190,6 +204,32 @@ class ServoControlTests(unittest.TestCase):
         last = stream.commands[-1]
         self.assertLessEqual(float(np.linalg.norm(last["linear"])), 1e-12)
         self.assertAlmostEqual(float(last["angular"]), 0.0)
+
+    def test_command_streamer_raises_instead_of_sending_zero_when_thread_is_stuck(self) -> None:
+        class FakeStream:
+            def __init__(self) -> None:
+                self.commands: list[object] = []
+
+            def send_command(self, command: object) -> None:
+                self.commands.append(command)
+
+        class StuckThread:
+            def join(self, timeout: float | None = None) -> None:
+                self.timeout = timeout
+
+            def is_alive(self) -> bool:
+                return True
+
+        stream = FakeStream()
+        sender = pb5.MobileBaseServoCommandStreamer(stream, period_sec=0.01)
+        sender._thread = StuckThread()
+
+        with self.assertRaises(TimeoutError):
+            sender.stop(zero_repeats=3)
+        self.assertEqual(stream.commands, [])
+
+    def test_default_stale_stop_exceeds_orin_frame_jitter_budget(self) -> None:
+        self.assertGreaterEqual(pb5.SERVO_COMMAND_STALE_STOP_SEC, 0.70)
 
 
 if __name__ == "__main__":

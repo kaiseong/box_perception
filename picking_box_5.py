@@ -78,7 +78,7 @@ PUSH_RAMP_TIME = 0.5
 PUSH_STREAM_PERIOD_SEC = 1.0 / 30.0
 PUSH_STREAM_COMMAND_HOLD_TIME = 1.0
 PUSH_STREAM_PRIORITY = 1
-PUSH_HOLD_TIME = 0.5
+PUSH_HOLD_TIME = 0.2
 
 # ---- Cartesian lift parameters ----
 IMPEDANCE_LIFT_REFERENCE_LINK = "base"
@@ -132,13 +132,13 @@ MOBILE_BASE_ALIGN_DEFAULT = True
 MOBILE_BASE_TARGET_X_M = 0.45
 MOBILE_BASE_X_TOLERANCE_M = 0.01
 MOBILE_BASE_Y_TOLERANCE_M = 0.01
-MOBILE_BASE_MAX_SPEED_MPS = 0.06
+MOBILE_BASE_MAX_SPEED_MPS = 0.08
 MOBILE_BASE_MAX_STEP_M = 0.06
 MOBILE_BASE_MAX_ITERATIONS = 8
 MOBILE_BASE_YAW_ALIGN_DEFAULT = True
 MOBILE_BASE_YAW_TARGET_DEG = 90.0
 MOBILE_BASE_YAW_TOLERANCE_DEG = 4.0
-MOBILE_BASE_YAW_MAX_SPEED_RADPS = 0.15
+MOBILE_BASE_YAW_MAX_SPEED_RADPS = 0.3
 MOBILE_BASE_YAW_MAX_STEP_DEG = 20.0
 MOBILE_BASE_YAW_MAX_ITERATIONS = 8
 MOBILE_BASE_YAW_TOTAL_TIMEOUT_SEC = 30.0
@@ -155,15 +155,15 @@ MOBILE_BASE_COMBINED_COARSE_YAW_THRESHOLD_DEG = 90.0
 # MOBILE_BASE_YAW_MAX_SPEED_RADPS; when a cap binds, v and omega are scaled
 # by the SAME factor so the orbit geometry is preserved.
 SERVO_ALIGN_DEFAULT = True
-SERVO_KP_XY = 0.8               # 1/s: proportional gain, tapers speed near target
-SERVO_KP_YAW = 1.0              # 1/s
+SERVO_KP_XY = 1.0               # 1/s: proportional gain, tapers speed near target
+SERVO_KP_YAW = 1.2              # 1/s
 SERVO_SETTLED_FRAMES = 5        # consecutive in-tolerance frames to finish
 SERVO_TOTAL_TIMEOUT_SEC = 40.0
 SERVO_UNUSABLE_DECAY = 0.5      # velocity decay per unusable frame
 SERVO_NO_MEASUREMENT_STOP_SEC = 1.0
 SERVO_NO_MEASUREMENT_ABORT_SEC = 5.0
 SERVO_COMMAND_HOLD_TIME_SEC = 0.25
-SERVO_COMMAND_STALE_STOP_SEC = 0.35
+SERVO_COMMAND_STALE_STOP_SEC = 0.70
 SERVO_FILTER_WINDOW_FRAMES = 3
 SERVO_FILTER_CENTER_OUTLIER_M = 0.03
 SERVO_FILTER_YAW_OUTLIER_DEG = 10.0
@@ -173,6 +173,9 @@ SERVO_FILTER_YAW_OUTLIER_DEG = 10.0
 SERVO_DIVERGENCE_WINDOW_SEC = 3.0
 SERVO_DIVERGENCE_GROWTH = 1.3
 SERVO_DIVERGENCE_GRACE_SEC = 1.5
+SERVO_DIVERGENCE_REFERENCE_PERCENTILE = 25.0
+SERVO_DIVERGENCE_REFERENCE_MIN_SAMPLES = 3
+SERVO_DIVERGENCE_CONSECUTIVE_FRAMES = 2
 # Budget must cover the worst realistic initial error at the capped base speed plus a
 # vision recapture per step; 8 s only allowed ~8 cm of total travel.
 MOBILE_BASE_TOTAL_TIMEOUT_SEC = 30.0
@@ -831,10 +834,10 @@ def servo_normalized_error(
 class ServoDivergenceGuard:
     """Abort signal for a feedback loop whose error grows instead of shrinking.
 
-    Compares the current normalized error against the smallest error seen up
-    to window_sec ago; sustained growth beyond the ratio (after a grace
-    period) means the commanded velocities move the base the wrong way --
-    e.g. an inverted SE(2) omega sign convention.
+    Compares the current normalized error against an expired-sample baseline
+    from at least window_sec ago. A lower percentile, minimum sample count,
+    and consecutive-frame gate keep one low noisy frame from becoming the
+    sole reference for an otherwise converging motion.
     """
 
     def __init__(
@@ -843,12 +846,20 @@ class ServoDivergenceGuard:
         window_sec: float = SERVO_DIVERGENCE_WINDOW_SEC,
         growth_ratio: float = SERVO_DIVERGENCE_GROWTH,
         grace_sec: float = SERVO_DIVERGENCE_GRACE_SEC,
+        reference_percentile: float = SERVO_DIVERGENCE_REFERENCE_PERCENTILE,
+        reference_min_samples: int = SERVO_DIVERGENCE_REFERENCE_MIN_SAMPLES,
+        consecutive_frames: int = SERVO_DIVERGENCE_CONSECUTIVE_FRAMES,
     ) -> None:
         self.window_sec = float(window_sec)
         self.growth_ratio = float(growth_ratio)
         self.grace_sec = float(grace_sec)
+        self.reference_percentile = float(np.clip(reference_percentile, 0.0, 100.0))
+        self.reference_min_samples = max(1, int(reference_min_samples))
+        self.consecutive_frames = max(1, int(consecutive_frames))
         self._history: list[tuple[float, float]] = []
+        self._expired_errors: list[float] = []
         self._start: float | None = None
+        self._consecutive_divergent = 0
 
     def update(self, t_sec: float, normalized_error: float) -> bool:
         """Record one sample; True when the error has grown past the guard."""
@@ -858,15 +869,22 @@ class ServoDivergenceGuard:
             self._start = t
         self._history.append((t, err))
         cutoff = t - self.window_sec
-        while len(self._history) > 1 and self._history[1][0] <= cutoff:
-            self._history.pop(0)
+        while self._history and self._history[0][0] <= cutoff:
+            _, expired_err = self._history.pop(0)
+            self._expired_errors.append(float(expired_err))
         if t - self._start < self.grace_sec:
             return False
-        past_errors = [e for ts, e in self._history if ts <= cutoff + 1e-9]
-        if not past_errors:
+        if len(self._expired_errors) < self.reference_min_samples:
             return False
-        reference = min(past_errors)
-        return err > reference * self.growth_ratio + 0.25
+        reference = float(np.percentile(self._expired_errors, self.reference_percentile))
+        if not np.isfinite(reference):
+            return False
+        divergent = err > max(0.0, reference) * self.growth_ratio + 0.25
+        if divergent:
+            self._consecutive_divergent += 1
+        else:
+            self._consecutive_divergent = 0
+        return self._consecutive_divergent >= self.consecutive_frames
 
 
 class ServoMeasurementFilter:
@@ -984,6 +1002,8 @@ class MobileBaseServoCommandStreamer:
             self._running = False
         if self._thread is not None:
             self._thread.join(timeout=max(1.0, self.period_sec * 5.0))
+            if self._thread.is_alive():
+                raise TimeoutError("mobile-base servo stream thread did not stop before timeout")
         for _ in range(max(1, int(zero_repeats))):
             self._send_once(np.zeros(2, dtype=np.float64), 0.0)
             time.sleep(self.period_sec)
@@ -1092,8 +1112,8 @@ def build_mobile_base_velocity_command(
     )
 
 
-VISION_APPROACH_MINIMUM_TIME = 0.6
-VISION_APPROACH_HOLD_TIME = 0.4
+VISION_APPROACH_MINIMUM_TIME = 0.4
+VISION_APPROACH_HOLD_TIME = 0.2
 VISION_APPROACH_MAX_REFERENCE_XY_SHIFT_M = 0.25
 
 # ---- Live vision (default input source) ----
