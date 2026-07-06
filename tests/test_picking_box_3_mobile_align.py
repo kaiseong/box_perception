@@ -65,6 +65,58 @@ class PickingBox3MobileAlignTests(unittest.TestCase):
         self.assertEqual(stuck_thread.join_timeout, pb3.GRIPPER_STOP_JOIN_TIMEOUT_SEC)
         self.assertIs(gripper._thread, stuck_thread)
 
+    def test_setup_gripper_retries_initialize_after_tool_voltage_settle(self) -> None:
+        class FakeGripper:
+            def __init__(self) -> None:
+                self.initialize_calls: list[bool] = []
+                self.homing_called = False
+                self.open_target_called = False
+                self.started = False
+                self.min_q = np.array([0.0, 0.0])
+                self.max_q = np.array([1.0, 1.0])
+
+            def initialize(self, *, verbose: bool = True) -> bool:
+                self.initialize_calls.append(verbose)
+                return len(self.initialize_calls) >= 2
+
+            def homing(self) -> bool:
+                self.homing_called = True
+                return True
+
+            def set_open_target(self) -> bool:
+                self.open_target_called = True
+                return True
+
+            def start(self) -> None:
+                self.started = True
+
+        original_gripper = pb3.MaxOpenGripper
+        original_voltage = pb3.enable_gripper_tool_voltage
+        original_sleep = pb3.time.sleep
+        instances: list[FakeGripper] = []
+
+        def make_gripper() -> FakeGripper:
+            gripper = FakeGripper()
+            instances.append(gripper)
+            return gripper
+
+        pb3.MaxOpenGripper = make_gripper
+        pb3.enable_gripper_tool_voltage = lambda _robot: True
+        pb3.time.sleep = lambda _seconds: None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                gripper = pb3.setup_max_open_gripper(object())
+        finally:
+            pb3.MaxOpenGripper = original_gripper
+            pb3.enable_gripper_tool_voltage = original_voltage
+            pb3.time.sleep = original_sleep
+
+        self.assertIs(gripper, instances[0])
+        self.assertEqual(instances[0].initialize_calls, [True, True])
+        self.assertTrue(instances[0].homing_called)
+        self.assertTrue(instances[0].open_target_called)
+        self.assertTrue(instances[0].started)
+
     def test_visual_abort_cancels_mobile_command_without_timeout_reason(self) -> None:
         class FakeCommand:
             def __init__(self) -> None:

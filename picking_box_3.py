@@ -102,7 +102,7 @@ GRIPPER_DEVICE_IDS = (0, 1)
 GRIPPER_DIRECTION = False
 GRIPPER_OPEN_NORMALIZED_Q = np.array([1.0, 1.0], dtype=np.float64)
 GRIPPER_HOMING_TORQUE_NM = 0.5
-GRIPPER_HOMING_STALL_COUNT = 30
+GRIPPER_HOMING_STALL_COUNT = 15
 GRIPPER_HOMING_SLEEP_SEC = 0.1
 GRIPPER_POSITION_TORQUE_NM = 5.0
 GRIPPER_COMMAND_PERIOD_SEC = 0.1
@@ -265,10 +265,12 @@ class MaxOpenGripper:
                 self.max_q = np.maximum(self.max_q, q)
                 if np.array_equal(prev_q, q):
                     stall_counter += 1
-                else:
-                    stall_counter = 0
                 prev_q = q.copy()
                 if stall_counter >= GRIPPER_HOMING_STALL_COUNT:
+                    print(
+                        "[gripper] homing direction "
+                        f"{direction} limit detected; q={q}, min={self.min_q}, max={self.max_q}"
+                    )
                     direction += 1
                     stall_counter = 0
                 time.sleep(GRIPPER_HOMING_SLEEP_SEC)
@@ -347,10 +349,12 @@ def setup_max_open_gripper(robot: Any) -> MaxOpenGripper | None:
     if not enable_gripper_tool_voltage(robot):
         return None
     gripper = MaxOpenGripper()
-    print_stage("0/6 gripper_home_open", "initializing Dynamixel bus")
+    print_stage("0/6 gripper_home_open", "priming Dynamixel bus after tool voltage")
+    gripper.initialize(verbose=True)
+    time.sleep(GRIPPER_SETUP_SETTLE_SEC)
+    print_stage("0/6 gripper_home_open", "verifying Dynamixel bus")
     if not gripper.initialize(verbose=True):
         return None
-    time.sleep(GRIPPER_SETUP_SETTLE_SEC)
     print_stage("0/6 gripper_home_open", "homing both gripper fingers")
     if not gripper.homing():
         return None
