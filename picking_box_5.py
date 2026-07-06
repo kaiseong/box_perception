@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vision-adjusted pre-pick motion with mobile-base yaw/x/y alignment for RBY1 M.
+"""Vision-adjusted pre-pick motion with combined mobile-base SE(2) alignment.
 
 This variant keeps the recorded START_TO_PICKING hand height and hand
 orientation, but shifts only x/y from the latest camera-estimated box center.
@@ -8,8 +8,7 @@ Default sequence:
   0. gripper_home_open               (Dynamixel homing + continuous max-open hold)
   1. ready                           (joint position control)
   2. live vision at ready pose       (D405 + rim-plane estimator, usable center frames)
-  3. mobile_base_yaw_align           (M-model SE(2), closed loop, theta only)
-  4. mobile_base_xy_align            (M-model SE(2), closed loop, x/y only)
+  3-4. mobile_base_se2_align         (M-model SE(2), closed loop, yaw + x/y)
   5. vision_pre_push                 (START_TO_PICKING z/rotation, vision x/y)
   6. inward y-axis push              (Cartesian impedance control)
   7. lift                            (dual-target Cartesian control)
@@ -27,7 +26,9 @@ table-horizontal and the START_TO_PICKING base-frame EEF z/rotation stay fixed.
 For the current side grasp, the box long axis must be parallel to base y
 (90/270 degrees in base xy, equivalently zero error modulo 180) before
 contact. This script uses the mobile base theta axis for that yaw alignment
-and does NOT rotate the wrists in the first pass.
+and does NOT rotate the wrists in the first pass. In picking_box_5, yaw and x/y
+are handled in one closed-loop stage: while yaw is still coarse, translation is
+suppressed; once yaw is close enough, x/y/theta are corrected together.
 """
 
 from __future__ import annotations
@@ -88,7 +89,8 @@ LIFT_LINEAR_ACCELERATION_LIMIT = 0.5   # m/s^2 (CartesianImpedance add_target)
 LIFT_ANGULAR_ACCELERATION_LIMIT = float(np.pi)  # rad/s^2
 LIFT_JOINT_STIFFNESS = [300.0] * 7
 LIFT_JOINT_DAMPING_RATIO = 1.0
-LIFT_JOINT_TORQUE_LIMIT = [100.0] * 7
+# RBY1 M arm effort limits from rby1-sdk/models/rby1m/urdf/model.urdf.
+LIFT_JOINT_TORQUE_LIMIT = [70.0, 70.0, 70.0, 40.0, 10.0, 10.0, 8.0]
 LIFT_HOLD_TIME = 100.0
 # CartesianCommandBuilder.add_target's last argument is a DIMENSIONLESS scaling
 # of the internal Cartesian acceleration limits (0.5 = half), NOT m/s^2.
@@ -119,11 +121,12 @@ GRIPPER_COMMAND_PERIOD_SEC = 0.1
 GRIPPER_SETUP_SETTLE_SEC = 0.5
 GRIPPER_STOP_JOIN_TIMEOUT_SEC = 1.0
 
-# ---- Mobile base closed-loop alignment (picking_box_4) ----
+# ---- Mobile base closed-loop alignment (picking_box_5) ----
 # M model supports SE(2) x/y/theta velocity commands. The control law is
 # deliberately conservative: use vision, move/turn a small amount, then look
-# again. Yaw must converge before contact because the first pass intentionally
-# does not rotate wrist/EEF poses to compensate a rotated box.
+# again. In the combined stage, yaw and x/y share one SE(2) command. Translation
+# is suppressed while yaw error is coarse so the base does not translate along a
+# stale direction while the robot frame is still rotating.
 MOBILE_BASE_ALIGN_DEFAULT = True
 MOBILE_BASE_TARGET_X_M = 0.45
 MOBILE_BASE_X_TOLERANCE_M = 0.01
@@ -141,6 +144,7 @@ MOBILE_BASE_YAW_TOTAL_TIMEOUT_SEC = 30.0
 MOBILE_BASE_YAW_MOVE_DURATION_SEC = 1.0
 MOBILE_BASE_YAW_VISION_FRAMES_NEEDED = 3
 MOBILE_BASE_YAW_VISION_TIMEOUT_SEC = 2.0
+MOBILE_BASE_COMBINED_COARSE_YAW_THRESHOLD_DEG = 8.0
 # Budget must cover the worst realistic initial error at 0.02 m/s plus a
 # vision recapture per step; 8 s only allowed ~8 cm of total travel.
 MOBILE_BASE_TOTAL_TIMEOUT_SEC = 30.0
@@ -423,6 +427,28 @@ def is_mobile_base_aligned(
     )
 
 
+def mobile_base_xy_residual_status(
+    center_base_m: Any,
+    *,
+    target_x_m: float = MOBILE_BASE_TARGET_X_M,
+    x_tolerance_m: float = MOBILE_BASE_X_TOLERANCE_M,
+    y_tolerance_m: float = MOBILE_BASE_Y_TOLERANCE_M,
+    max_residual_xy_m: float = MOBILE_BASE_MAX_RESIDUAL_XY_M,
+) -> dict[str, Any]:
+    """Return final xy residual status for the mobile-base contact gate."""
+    residual_xy = mobile_base_alignment_error_xy(center_base_m, target_x_m=target_x_m)
+    return {
+        "residual_xy_m": residual_xy,
+        "within_target_band": is_mobile_base_aligned(
+            center_base_m,
+            target_x_m=target_x_m,
+            x_tolerance_m=x_tolerance_m,
+            y_tolerance_m=y_tolerance_m,
+        ),
+        "within_safety_band": float(np.max(np.abs(residual_xy))) <= float(max_residual_xy_m) + 1e-9,
+    }
+
+
 def mobile_base_alignment_step_xy(
     center_base_m: Any,
     *,
@@ -606,6 +632,121 @@ def mobile_base_yaw_move_plan(
         abs(step_rad) / max(1e-6, float(max_angular_speed_radps)),
     )
     return step_rad / max(1e-6, duration), duration
+
+
+def is_mobile_base_se2_aligned(
+    measurement: dict[str, Any],
+    *,
+    target_x_m: float = MOBILE_BASE_TARGET_X_M,
+    x_tolerance_m: float = MOBILE_BASE_X_TOLERANCE_M,
+    y_tolerance_m: float = MOBILE_BASE_Y_TOLERANCE_M,
+    yaw_tolerance_deg: float = MOBILE_BASE_YAW_TOLERANCE_DEG,
+) -> bool:
+    """Return True when both box center and long-axis yaw are in the target band."""
+    return is_mobile_base_aligned(
+        measurement["center_base_m"],
+        target_x_m=target_x_m,
+        x_tolerance_m=x_tolerance_m,
+        y_tolerance_m=y_tolerance_m,
+    ) and is_mobile_base_yaw_aligned(
+        measurement,
+        tolerance_deg=yaw_tolerance_deg,
+    )
+
+
+def mobile_base_combined_move_plan(
+    step_xy_m: Any,
+    step_yaw_deg: float,
+    *,
+    xy_base_duration_sec: float = MOBILE_BASE_MOVE_DURATION_SEC,
+    yaw_base_duration_sec: float = MOBILE_BASE_YAW_MOVE_DURATION_SEC,
+    max_speed_mps: float = MOBILE_BASE_MAX_SPEED_MPS,
+    max_angular_speed_radps: float = MOBILE_BASE_YAW_MAX_SPEED_RADPS,
+) -> tuple[np.ndarray, float, float]:
+    """Return a bounded SE(2) velocity and duration for one combined step."""
+    step_xy = np.asarray(step_xy_m, dtype=np.float64)
+    step_yaw_rad = float(np.deg2rad(float(step_yaw_deg)))
+    xy_duration = float(np.linalg.norm(step_xy)) / max(1e-6, float(max_speed_mps))
+    yaw_duration = abs(step_yaw_rad) / max(1e-6, float(max_angular_speed_radps))
+    duration = max(
+        float(xy_base_duration_sec),
+        float(yaw_base_duration_sec),
+        xy_duration,
+        yaw_duration,
+    )
+    duration = max(1e-6, duration)
+    return step_xy / duration, step_yaw_rad / duration, duration
+
+
+def mobile_base_combined_alignment_plan(
+    measurement: dict[str, Any],
+    *,
+    target_x_m: float = MOBILE_BASE_TARGET_X_M,
+    x_tolerance_m: float = MOBILE_BASE_X_TOLERANCE_M,
+    y_tolerance_m: float = MOBILE_BASE_Y_TOLERANCE_M,
+    yaw_tolerance_deg: float = MOBILE_BASE_YAW_TOLERANCE_DEG,
+    max_step_m: float = MOBILE_BASE_MAX_STEP_M,
+    max_step_deg: float = MOBILE_BASE_YAW_MAX_STEP_DEG,
+    max_speed_mps: float = MOBILE_BASE_MAX_SPEED_MPS,
+    max_angular_speed_radps: float = MOBILE_BASE_YAW_MAX_SPEED_RADPS,
+    xy_move_duration_sec: float = MOBILE_BASE_MOVE_DURATION_SEC,
+    yaw_move_duration_sec: float = MOBILE_BASE_YAW_MOVE_DURATION_SEC,
+    coarse_yaw_threshold_deg: float = MOBILE_BASE_COMBINED_COARSE_YAW_THRESHOLD_DEG,
+) -> dict[str, Any] | None:
+    """Plan one conservative combined yaw/x/y correction from a fresh measurement.
+
+    If yaw is still coarse, x/y translation is suppressed. This keeps the stage
+    combined while avoiding sideways drift from translating in a base frame that
+    is about to rotate significantly.
+    """
+    yaw_error = mobile_base_yaw_alignment_error_deg(measurement)
+    if yaw_error is None:
+        return None
+
+    center_base = np.asarray(measurement["center_base_m"], dtype=np.float64)
+    error_xy = mobile_base_alignment_error_xy(center_base, target_x_m=target_x_m)
+    step_xy = mobile_base_alignment_step_xy(
+        center_base,
+        target_x_m=target_x_m,
+        x_tolerance_m=x_tolerance_m,
+        y_tolerance_m=y_tolerance_m,
+        max_step_m=max_step_m,
+    )
+    translation_enabled = abs(float(yaw_error)) <= float(coarse_yaw_threshold_deg) + 1e-9
+    if not translation_enabled:
+        step_xy = np.zeros(2, dtype=np.float64)
+
+    step_yaw_deg = mobile_base_yaw_alignment_step_deg(
+        yaw_error,
+        tolerance_deg=yaw_tolerance_deg,
+        max_step_deg=max_step_deg,
+    )
+    velocity_xy, angular_velocity, duration = mobile_base_combined_move_plan(
+        step_xy,
+        step_yaw_deg,
+        xy_base_duration_sec=xy_move_duration_sec,
+        yaw_base_duration_sec=yaw_move_duration_sec,
+        max_speed_mps=max_speed_mps,
+        max_angular_speed_radps=max_angular_speed_radps,
+    )
+    return {
+        "center_base_m": center_base,
+        "error_xy_m": error_xy,
+        "yaw_error_deg": float(yaw_error),
+        "translation_enabled": bool(translation_enabled),
+        "step_xy_m": step_xy,
+        "step_yaw_deg": float(step_yaw_deg),
+        "velocity_xy_mps": velocity_xy,
+        "angular_velocity_radps": float(angular_velocity),
+        "duration_sec": float(duration),
+        "aligned": is_mobile_base_se2_aligned(
+            measurement,
+            target_x_m=target_x_m,
+            x_tolerance_m=x_tolerance_m,
+            y_tolerance_m=y_tolerance_m,
+            yaw_tolerance_deg=yaw_tolerance_deg,
+        ),
+    }
 
 
 class UserAbortRequested(Exception):
@@ -1039,7 +1180,7 @@ class ContinuousLiveBoxView:
             fps=CAMERA_FPS,
             view_rotation=view_rotation,
         )
-        self.window_name = "picking_box_4 mobile align vision (q/ESC abort)"
+        self.window_name = "picking_box_5 mobile align vision (q/ESC abort)"
         self._closed = False
 
     def close(self) -> None:
@@ -2058,6 +2199,190 @@ def run_mobile_base_alignment(
             live_view.close()
 
 
+def run_mobile_base_combined_alignment(
+    robot: Any,
+    dyn_model: Any,
+    dyn_state: Any,
+    view_rotation: str,
+    measurement: dict[str, Any],
+    *,
+    visualize: bool,
+    target_x_m: float,
+    x_tolerance_m: float,
+    y_tolerance_m: float,
+    yaw_tolerance_deg: float,
+    coarse_yaw_threshold_deg: float,
+    max_speed_mps: float,
+    max_angular_speed_radps: float,
+    max_step_m: float,
+    max_step_deg: float,
+    max_iterations: int,
+    total_timeout_sec: float,
+    xy_move_duration_sec: float,
+    yaw_move_duration_sec: float,
+    vision_frames_needed: int,
+    vision_timeout_sec: float,
+    max_center_spread_m: float,
+    stage: str = "3-4/7 mobile_base_se2_align",
+) -> dict[str, Any] | None:
+    """Closed-loop mobile-base yaw/x/y alignment using one SE(2) stage."""
+    deadline = time.monotonic() + float(total_timeout_sec)
+    latest = measurement
+    live_view: ContinuousLiveBoxView | None = ContinuousLiveBoxView(view_rotation) if visualize else None
+
+    try:
+        for iteration in range(1, int(max_iterations) + 1):
+            plan = mobile_base_combined_alignment_plan(
+                latest,
+                target_x_m=target_x_m,
+                x_tolerance_m=x_tolerance_m,
+                y_tolerance_m=y_tolerance_m,
+                yaw_tolerance_deg=yaw_tolerance_deg,
+                max_step_m=max_step_m,
+                max_step_deg=max_step_deg,
+                max_speed_mps=max_speed_mps,
+                max_angular_speed_radps=max_angular_speed_radps,
+                xy_move_duration_sec=xy_move_duration_sec,
+                yaw_move_duration_sec=yaw_move_duration_sec,
+                coarse_yaw_threshold_deg=coarse_yaw_threshold_deg,
+            )
+            if plan is None:
+                print_stage(stage, "FAILED: no usable long-axis yaw in latest vision measurement")
+                return None
+
+            error_xy = np.asarray(plan["error_xy_m"], dtype=np.float64)
+            yaw_error = float(plan["yaw_error_deg"])
+            center_base = np.asarray(plan["center_base_m"], dtype=np.float64)
+            if bool(plan["aligned"]):
+                print_stage(
+                    stage,
+                    f"aligned at iter={iteration - 1}; "
+                    f"x={center_base[0]:+.3f}m y={center_base[1]:+.3f}m "
+                    f"error=[{error_xy[0]:+.3f}, {error_xy[1]:+.3f}]m "
+                    f"yaw_error={yaw_error:+.2f}deg",
+                )
+                return latest
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                print_stage(stage, "timeout; returning latest vision measurement for residual gate")
+                return latest
+
+            velocity_xy = np.asarray(plan["velocity_xy_mps"], dtype=np.float64)
+            angular_velocity = float(plan["angular_velocity_radps"])
+            if float(np.linalg.norm(velocity_xy)) <= 1e-6 and abs(angular_velocity) <= 1e-6:
+                print_stage(stage, "zero correction; returning latest vision measurement")
+                return latest
+
+            move_time = min(float(plan["duration_sec"]), max(0.1, remaining))
+            translation_text = "enabled" if bool(plan["translation_enabled"]) else "suppressed"
+            status_lines = [
+                (
+                    f"se2 iter {iteration}/{int(max_iterations)} "
+                    f"target x={target_x_m * 100:+.1f}cm y=+0.0cm yaw=base y",
+                    (255, 255, 255),
+                ),
+                (
+                    f"error x={error_xy[0] * 100:+.1f}cm y={error_xy[1] * 100:+.1f}cm "
+                    f"yaw={yaw_error:+.1f}deg; xy {translation_text}",
+                    (0, 220, 255),
+                ),
+            ]
+            step_xy = np.asarray(plan["step_xy_m"], dtype=np.float64)
+            print_stage(
+                stage,
+                f"iter={iteration}/{int(max_iterations)} "
+                f"center=[{center_base[0]:+.3f}, {center_base[1]:+.3f}]m "
+                f"error_xy=[{error_xy[0]:+.3f}, {error_xy[1]:+.3f}]m "
+                f"yaw_error={yaw_error:+.2f}deg "
+                f"xy={translation_text} "
+                f"step_xy=[{step_xy[0]:+.3f}, {step_xy[1]:+.3f}]m "
+                f"step_yaw={float(plan['step_yaw_deg']):+.2f}deg "
+                f"vel=[{velocity_xy[0]:+.3f}, {velocity_xy[1]:+.3f}]m/s "
+                f"omega={angular_velocity:+.3f}rad/s duration={move_time:.2f}s",
+            )
+            ok, move_status = stream_mobile_base_velocity_stage(
+                robot,
+                velocity_xy,
+                angular_velocity_radps=angular_velocity,
+                duration_sec=move_time,
+                stage=stage,
+                live_view=live_view,
+                dyn_model=dyn_model,
+                dyn_state=dyn_state,
+                view_rotation=view_rotation,
+                status_lines=status_lines,
+            )
+            if not ok:
+                if move_status == "visual_abort":
+                    raise UserAbortRequested("combined mobile alignment aborted from the live view")
+                print_stage(stage, f"SE(2) command not ok ({move_status}); re-measuring before deciding")
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                print_stage(stage, "timeout after SE(2) move; recapture required")
+                return None
+            measure_timeout = min(float(vision_timeout_sec), max(0.1, remaining))
+            if live_view is not None:
+                refreshed = live_view.collect_measurement(
+                    robot,
+                    dyn_model,
+                    dyn_state,
+                    view_rotation,
+                    frames_needed=vision_frames_needed,
+                    timeout_sec=measure_timeout,
+                    max_center_spread_m=max_center_spread_m,
+                    stage=stage,
+                    status_lines=status_lines,
+                )
+            else:
+                refreshed = capture_live_box_measurement(
+                    robot,
+                    dyn_model,
+                    dyn_state,
+                    view_rotation,
+                    frames_needed=vision_frames_needed,
+                    timeout_sec=measure_timeout,
+                    max_center_spread_m=max_center_spread_m,
+                    visualize=False,
+                    hold_after_capture=False,
+                )
+            if refreshed is None:
+                print_stage(stage, "post-SE(2) vision failed; recapture required")
+                return None
+            latest = refreshed
+
+        plan = mobile_base_combined_alignment_plan(
+            latest,
+            target_x_m=target_x_m,
+            x_tolerance_m=x_tolerance_m,
+            y_tolerance_m=y_tolerance_m,
+            yaw_tolerance_deg=yaw_tolerance_deg,
+            max_step_m=max_step_m,
+            max_step_deg=max_step_deg,
+            max_speed_mps=max_speed_mps,
+            max_angular_speed_radps=max_angular_speed_radps,
+            xy_move_duration_sec=xy_move_duration_sec,
+            yaw_move_duration_sec=yaw_move_duration_sec,
+            coarse_yaw_threshold_deg=coarse_yaw_threshold_deg,
+        )
+        if plan is None:
+            print_stage(stage, "max iterations reached with no usable yaw")
+        else:
+            center_base = np.asarray(plan["center_base_m"], dtype=np.float64)
+            error_xy = np.asarray(plan["error_xy_m"], dtype=np.float64)
+            print_stage(
+                stage,
+                f"max iterations reached; x={center_base[0]:+.3f}m y={center_base[1]:+.3f}m "
+                f"error=[{error_xy[0]:+.3f}, {error_xy[1]:+.3f}]m "
+                f"yaw_error={float(plan['yaw_error_deg']):+.2f}deg",
+            )
+        return latest
+    finally:
+        if live_view is not None:
+            live_view.close()
+
+
 def offset_translation(T: Any, dy: float = 0.0, dz: float = 0.0) -> np.ndarray:
     """Return a copy of T translated in the reference frame's y/z axes."""
     T_offset = np.asarray(T, dtype=np.float64).copy()
@@ -2315,6 +2640,7 @@ def main(
     mobile_base_yaw_move_duration_sec: float,
     mobile_base_yaw_vision_frames_needed: int,
     mobile_base_yaw_vision_timeout_sec: float,
+    mobile_base_combined_coarse_yaw_threshold_deg: float,
     mobile_base_align: bool,
     mobile_base_target_x_m: float,
     mobile_base_x_tolerance_m: float,
@@ -2425,6 +2751,104 @@ def main(
                 f"| center spread={measurement['center_spread_m'] * 1000.0:.1f} mm "
                 f"| modes={sorted(set(measurement['modes']))}",
             )
+            if mobile_base_yaw_align and mobile_base_align and str(model).lower() == "m":
+                print_stage(
+                    "3-4/7 mobile_base_se2_align",
+                    "closed-loop combined target "
+                    f"x={mobile_base_target_x_m:.3f}m±{mobile_base_x_tolerance_m:.3f}m, "
+                    f"y=0.000m±{mobile_base_y_tolerance_m:.3f}m, "
+                    f"yaw≤{mobile_base_yaw_tolerance_deg:.1f}deg "
+                    f"(xy suppressed while |yaw|>{mobile_base_combined_coarse_yaw_threshold_deg:.1f}deg)",
+                )
+                combined_measurement = run_mobile_base_combined_alignment(
+                    robot,
+                    dyn_model,
+                    dyn_state,
+                    view_rotation,
+                    measurement,
+                    visualize=visualize,
+                    target_x_m=mobile_base_target_x_m,
+                    x_tolerance_m=mobile_base_x_tolerance_m,
+                    y_tolerance_m=mobile_base_y_tolerance_m,
+                    yaw_tolerance_deg=mobile_base_yaw_tolerance_deg,
+                    coarse_yaw_threshold_deg=mobile_base_combined_coarse_yaw_threshold_deg,
+                    max_speed_mps=mobile_base_max_speed_mps,
+                    max_angular_speed_radps=mobile_base_yaw_max_speed_radps,
+                    max_step_m=mobile_base_max_step_m,
+                    max_step_deg=mobile_base_yaw_max_step_deg,
+                    max_iterations=max(mobile_base_max_iterations, mobile_base_yaw_max_iterations),
+                    total_timeout_sec=max(mobile_base_total_timeout_sec, mobile_base_yaw_total_timeout_sec),
+                    xy_move_duration_sec=mobile_base_move_duration_sec,
+                    yaw_move_duration_sec=mobile_base_yaw_move_duration_sec,
+                    vision_frames_needed=max(mobile_base_vision_frames_needed, mobile_base_yaw_vision_frames_needed),
+                    vision_timeout_sec=max(mobile_base_vision_timeout_sec, mobile_base_yaw_vision_timeout_sec),
+                    max_center_spread_m=live_center_spread_m,
+                )
+                if combined_measurement is None:
+                    print_stage(
+                        "3-4/7 mobile_base_se2_align",
+                        "alignment recapture failed; trying one normal live_vision recovery",
+                    )
+                    combined_measurement = capture_live_box_measurement(
+                        robot,
+                        dyn_model,
+                        dyn_state,
+                        view_rotation,
+                        frames_needed=live_vision_frames_needed,
+                        timeout_sec=live_vision_timeout_sec,
+                        max_center_spread_m=live_center_spread_m,
+                        visualize=visualize,
+                        hold_after_capture=False,
+                    )
+                if combined_measurement is None:
+                    print_stage(
+                        "3-4/7 mobile_base_se2_align",
+                        "FAILED: no fresh vision after base motion; aborting before contact",
+                    )
+                    return done
+                residual_yaw = mobile_base_yaw_alignment_error_deg(combined_measurement)
+                if residual_yaw is None:
+                    print_stage(
+                        "3-4/7 mobile_base_se2_align",
+                        "FAILED: no usable long-axis yaw after alignment; aborting before contact",
+                    )
+                    return done
+                if abs(float(residual_yaw)) > float(mobile_base_yaw_tolerance_deg):
+                    print_stage(
+                        "3-4/7 mobile_base_se2_align",
+                        "FAILED: residual yaw error "
+                        f"{residual_yaw:+.2f}deg exceeds {mobile_base_yaw_tolerance_deg:.1f}deg; "
+                        "aborting before contact",
+                    )
+                    return done
+                xy_status = mobile_base_xy_residual_status(
+                    combined_measurement["center_base_m"],
+                    target_x_m=mobile_base_target_x_m,
+                    x_tolerance_m=mobile_base_x_tolerance_m,
+                    y_tolerance_m=mobile_base_y_tolerance_m,
+                )
+                residual_xy = np.asarray(xy_status["residual_xy_m"], dtype=np.float64)
+                if not bool(xy_status["within_target_band"]):
+                    if bool(xy_status["within_safety_band"]):
+                        reason = (
+                            f"outside target band x±{mobile_base_x_tolerance_m * 100:.1f}cm "
+                            f"y±{mobile_base_y_tolerance_m * 100:.1f}cm"
+                        )
+                    else:
+                        reason = (
+                            f"exceeds safety band {MOBILE_BASE_MAX_RESIDUAL_XY_M * 100:.0f}cm; "
+                            "re-approach with the mobile base"
+                        )
+                    print_stage(
+                        "3-4/7 mobile_base_se2_align",
+                        "FAILED: residual error "
+                        f"x={residual_xy[0] * 100:+.1f}cm y={residual_xy[1] * 100:+.1f}cm "
+                        f"{reason}; aborting before contact",
+                    )
+                    return done
+                measurement = combined_measurement
+                mobile_base_yaw_align = False
+                mobile_base_align = False
             if mobile_base_yaw_align and str(model).lower() == "m":
                 print_stage(
                     "3/7 mobile_base_yaw_align",
@@ -2533,16 +2957,29 @@ def main(
                 # Contact gate: the arms only move if alignment actually ended
                 # near the target. A large residual (timeout / max iterations)
                 # would reproduce the far-reach IK failure this script avoids.
-                residual_xy = mobile_base_alignment_error_xy(
-                    measurement["center_base_m"], target_x_m=mobile_base_target_x_m
+                xy_status = mobile_base_xy_residual_status(
+                    measurement["center_base_m"],
+                    target_x_m=mobile_base_target_x_m,
+                    x_tolerance_m=mobile_base_x_tolerance_m,
+                    y_tolerance_m=mobile_base_y_tolerance_m,
                 )
-                if float(np.max(np.abs(residual_xy))) > MOBILE_BASE_MAX_RESIDUAL_XY_M:
+                residual_xy = np.asarray(xy_status["residual_xy_m"], dtype=np.float64)
+                if not bool(xy_status["within_target_band"]):
+                    if bool(xy_status["within_safety_band"]):
+                        reason = (
+                            f"outside target band x±{mobile_base_x_tolerance_m * 100:.1f}cm "
+                            f"y±{mobile_base_y_tolerance_m * 100:.1f}cm"
+                        )
+                    else:
+                        reason = (
+                            f"exceeds safety band {MOBILE_BASE_MAX_RESIDUAL_XY_M * 100:.0f}cm; "
+                            "re-approach with the mobile base"
+                        )
                     print_stage(
                         "4/7 mobile_base_xy_align",
                         "FAILED: residual error "
-                        f"x={residual_xy[0] * 100:+.1f}cm y={residual_xy[1] * 100:+.1f}cm exceeds "
-                        f"{MOBILE_BASE_MAX_RESIDUAL_XY_M * 100:.0f}cm band; aborting before contact "
-                        "(re-approach with the mobile base)",
+                        f"x={residual_xy[0] * 100:+.1f}cm y={residual_xy[1] * 100:+.1f}cm "
+                        f"{reason}; aborting before contact",
                     )
                     return done
             elif mobile_base_align:
@@ -2706,7 +3143,7 @@ def main(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="vision-adjusted picking_box_3 with M mobile-base alignment")
+    parser = argparse.ArgumentParser(description="vision-adjusted picking_box_5 with combined M SE(2) alignment")
     parser.add_argument("--address", type=str, required=True, help="Robot address")
     parser.add_argument("--model", type=str, default="m", help="Robot Model Name")
     parser.add_argument("--power", type=str, default=".*", help="Power device name regex")
@@ -2826,7 +3263,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "Enable M mobile-base theta alignment so box long axis is parallel to base y. "
-            "This is the default for picking_box_4."
+            "In picking_box_5 this is combined with x/y alignment when both are enabled."
         ),
     )
     parser.add_argument(
@@ -2882,6 +3319,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=MOBILE_BASE_YAW_VISION_TIMEOUT_SEC,
         help="Timeout for each post-yaw recapture.",
+    )
+    parser.add_argument(
+        "--mobile-base-combined-coarse-yaw-threshold-deg",
+        type=float,
+        default=MOBILE_BASE_COMBINED_COARSE_YAW_THRESHOLD_DEG,
+        help=(
+            "In picking_box_5 combined SE(2) alignment, suppress x/y translation "
+            "while absolute yaw error is larger than this threshold."
+        ),
     )
     parser.set_defaults(mobile_base_align=MOBILE_BASE_ALIGN_DEFAULT)
     parser.add_argument(
@@ -3034,6 +3480,11 @@ if __name__ == "__main__":
         raise SystemExit("--mobile-base-yaw-vision-frames must be positive")
     if args.mobile_base_yaw_vision_timeout_sec <= 0.0:
         raise SystemExit("--mobile-base-yaw-vision-timeout-sec must be positive")
+    if args.mobile_base_combined_coarse_yaw_threshold_deg <= args.mobile_base_yaw_tolerance_deg:
+        raise SystemExit(
+            "--mobile-base-combined-coarse-yaw-threshold-deg must be larger than "
+            "--mobile-base-yaw-tolerance-deg"
+        )
     if args.mobile_base_x_tolerance_m <= 0.0:
         raise SystemExit("--mobile-base-x-tolerance-m must be positive")
     if args.mobile_base_y_tolerance_m <= 0.0:
@@ -3088,6 +3539,9 @@ if __name__ == "__main__":
             mobile_base_yaw_move_duration_sec=float(args.mobile_base_yaw_move_duration_sec),
             mobile_base_yaw_vision_frames_needed=int(args.mobile_base_yaw_vision_frames),
             mobile_base_yaw_vision_timeout_sec=float(args.mobile_base_yaw_vision_timeout_sec),
+            mobile_base_combined_coarse_yaw_threshold_deg=float(
+                args.mobile_base_combined_coarse_yaw_threshold_deg
+            ),
             mobile_base_align=bool(args.mobile_base_align),
             mobile_base_target_x_m=float(args.mobile_base_target_x_m),
             mobile_base_x_tolerance_m=float(args.mobile_base_x_tolerance_m),
