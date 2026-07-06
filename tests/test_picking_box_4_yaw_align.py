@@ -265,6 +265,21 @@ class PickingBox4YawAlignTests(unittest.TestCase):
             self.assertFalse(pb4.verify_yaw_safe_before_contact(rotated, tolerance_deg=3.0))
             self.assertFalse(pb4.verify_yaw_safe_before_contact(missing, tolerance_deg=3.0))
 
+    def test_default_pre_contact_yaw_tolerance_is_four_degrees(self) -> None:
+        inside_default = {
+            "camera_to_base": np.eye(4, dtype=np.float64),
+            "long_axis_camera": axis_from_yaw_deg(93.5),
+        }
+        outside_default = {
+            "camera_to_base": np.eye(4, dtype=np.float64),
+            "long_axis_camera": axis_from_yaw_deg(94.5),
+        }
+
+        self.assertAlmostEqual(pb4.MOBILE_BASE_YAW_TOLERANCE_DEG, 4.0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(pb4.verify_yaw_safe_before_contact(inside_default))
+            self.assertFalse(pb4.verify_yaw_safe_before_contact(outside_default))
+
 
 if __name__ == "__main__":
     unittest.main()
