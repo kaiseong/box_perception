@@ -1,0 +1,237 @@
+from __future__ import annotations
+
+import contextlib
+import io
+import sys
+import types
+import unittest
+
+import numpy as np
+
+
+class _FinishCode:
+    Ok = "Ok"
+
+
+sys.modules.setdefault(
+    "rby1_sdk",
+    types.SimpleNamespace(
+        RobotCommandFeedback=types.SimpleNamespace(FinishCode=_FinishCode),
+    ),
+)
+
+import picking_box_3 as pb3
+from picking_box_3 import (
+    MOBILE_BASE_MAX_SPEED_MPS,
+    gripper_normalized_to_encoder_target,
+    is_mobile_base_aligned,
+    mobile_base_alignment_error_xy,
+    mobile_base_alignment_step_xy,
+    mobile_base_velocity_for_step_xy,
+)
+
+
+class PickingBox3MobileAlignTests(unittest.TestCase):
+    def test_gripper_stop_uses_bounded_join(self) -> None:
+        class FakeThread:
+            def __init__(self, alive: bool) -> None:
+                self.alive = alive
+                self.join_timeout = None
+
+            def join(self, timeout=None) -> None:
+                self.join_timeout = timeout
+
+            def is_alive(self) -> bool:
+                return self.alive
+
+        stopped_thread = FakeThread(alive=False)
+        gripper = object.__new__(pb3.MaxOpenGripper)
+        gripper._running = True
+        gripper._thread = stopped_thread
+        gripper.stop()
+
+        self.assertFalse(gripper._running)
+        self.assertEqual(stopped_thread.join_timeout, pb3.GRIPPER_STOP_JOIN_TIMEOUT_SEC)
+        self.assertIsNone(gripper._thread)
+
+        stuck_thread = FakeThread(alive=True)
+        gripper = object.__new__(pb3.MaxOpenGripper)
+        gripper._running = True
+        gripper._thread = stuck_thread
+        with contextlib.redirect_stdout(io.StringIO()):
+            gripper.stop()
+
+        self.assertFalse(gripper._running)
+        self.assertEqual(stuck_thread.join_timeout, pb3.GRIPPER_STOP_JOIN_TIMEOUT_SEC)
+        self.assertIs(gripper._thread, stuck_thread)
+
+    def test_visual_abort_cancels_mobile_command_without_timeout_reason(self) -> None:
+        class FakeCommand:
+            def __init__(self) -> None:
+                self.cancel_called = False
+
+            def wait_for(self, _timeout_ms: int) -> bool:
+                return False
+
+            def cancel(self) -> None:
+                self.cancel_called = True
+
+        class FakeRobot:
+            def __init__(self) -> None:
+                self.command = FakeCommand()
+                self.cancel_control_called = False
+
+            def send_command(self, _builder):
+                return self.command
+
+            def get_state(self):
+                return types.SimpleNamespace(position=np.zeros(1))
+
+            def cancel_control(self) -> None:
+                self.cancel_control_called = True
+
+        class AbortLiveView:
+            def process_next_frame(self, *, camera_to_base, status_lines=None):
+                return False, "unused", None, np.eye(4), True
+
+        original = pb3.compute_camera_to_base_for_view_rotation
+        pb3.compute_camera_to_base_for_view_rotation = lambda *args, **kwargs: np.eye(4)
+        robot = FakeRobot()
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output):
+                ok, status = pb3.send_mobile_stage_with_live_view(
+                    robot,
+                    object(),
+                    "stage",
+                    timeout_sec=1.0,
+                    live_view=AbortLiveView(),
+                    dyn_model=object(),
+                    dyn_state=object(),
+                    view_rotation="cw90",
+                )
+        finally:
+            pb3.compute_camera_to_base_for_view_rotation = original
+
+        self.assertFalse(ok)
+        self.assertEqual(status, "visual_abort")
+        self.assertTrue(robot.command.cancel_called)
+        self.assertTrue(robot.cancel_control_called)
+        text = output.getvalue()
+        self.assertIn("visualization abort requested; canceling command", text)
+        self.assertNotIn("TIMEOUT; canceling command", text)
+
+    def test_collect_measurement_visual_abort_raises_operator_abort(self) -> None:
+        class FakeRobot:
+            def get_state(self):
+                return types.SimpleNamespace(position=np.zeros(1))
+
+        class AbortLiveView(pb3.ContinuousLiveBoxView):
+            def __init__(self) -> None:
+                pass
+
+            def process_next_frame(self, *, camera_to_base, status_lines=None):
+                return False, "unused", None, np.eye(4), True
+
+        original = pb3.compute_camera_to_base_for_view_rotation
+        pb3.compute_camera_to_base_for_view_rotation = lambda *args, **kwargs: np.eye(4)
+        try:
+            with self.assertRaises(pb3.UserAbortRequested):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    AbortLiveView().collect_measurement(
+                        FakeRobot(),
+                        object(),
+                        object(),
+                        "cw90",
+                        frames_needed=1,
+                        timeout_sec=1.0,
+                        max_center_spread_m=0.01,
+                    )
+        finally:
+            pb3.compute_camera_to_base_for_view_rotation = original
+
+    def test_gripper_open_normalized_maps_to_homed_open_endpoint(self) -> None:
+        min_q = np.array([10.0, 20.0])
+        max_q = np.array([110.0, 220.0])
+
+        np.testing.assert_allclose(
+            gripper_normalized_to_encoder_target([1.0, 1.0], min_q, max_q),
+            min_q,
+        )
+        np.testing.assert_allclose(
+            gripper_normalized_to_encoder_target([1.0, 1.0], min_q, max_q, direction=True),
+            max_q,
+        )
+        np.testing.assert_allclose(
+            gripper_normalized_to_encoder_target([2.0, -1.0], min_q, max_q),
+            [10.0, 220.0],
+        )
+
+    def test_alignment_band_targets_45cm_x_and_zero_y(self) -> None:
+        self.assertTrue(is_mobile_base_aligned([0.45, 0.0, 0.0]))
+        self.assertTrue(is_mobile_base_aligned([0.44, -0.01, 0.0]))
+        self.assertTrue(is_mobile_base_aligned([0.46, 0.01, 0.0]))
+        self.assertFalse(is_mobile_base_aligned([0.461, 0.0, 0.0]))
+        self.assertFalse(is_mobile_base_aligned([0.45, 0.011, 0.0]))
+
+    def test_error_sign_matches_desired_base_motion_direction(self) -> None:
+        np.testing.assert_allclose(mobile_base_alignment_error_xy([0.50, 0.02, 0.0]), [0.05, 0.02])
+        np.testing.assert_allclose(mobile_base_alignment_error_xy([0.42, -0.03, 0.0]), [-0.03, -0.03])
+
+    def test_step_is_zero_inside_tolerance_and_clipped_by_norm(self) -> None:
+        np.testing.assert_allclose(mobile_base_alignment_step_xy([0.455, 0.005, 0.0]), [0.0, 0.0])
+
+        step = mobile_base_alignment_step_xy([0.51, 0.04, 0.0], max_step_m=0.03)
+        self.assertLessEqual(float(np.linalg.norm(step)), 0.0300001)
+        self.assertGreater(step[0], 0.0)
+        self.assertGreater(step[1], 0.0)
+
+        np.testing.assert_allclose(
+            mobile_base_alignment_step_xy([0.41, 0.0, 0.0], max_step_m=0.03),
+            [-0.03, 0.0],
+        )
+
+    def test_velocity_respects_duration_and_speed_limit(self) -> None:
+        self.assertEqual(MOBILE_BASE_MAX_SPEED_MPS, 0.02)
+        np.testing.assert_allclose(
+            mobile_base_velocity_for_step_xy([0.03, 0.0], duration_sec=1.0),
+            [0.02, 0.0],
+        )
+        np.testing.assert_allclose(
+            mobile_base_velocity_for_step_xy([0.03, 0.0], duration_sec=1.0, max_speed_mps=0.05),
+            [0.03, 0.0],
+        )
+
+        velocity = mobile_base_velocity_for_step_xy([0.10, 0.0], duration_sec=1.0, max_speed_mps=0.05)
+        np.testing.assert_allclose(velocity, [0.05, 0.0])
+
+    def test_move_plan_displacement_equals_step_under_speed_cap(self) -> None:
+        # A 3 cm step at the 0.02 m/s cap must extend the duration to 1.5 s
+        # instead of truncating the displacement to 2 cm.
+        velocity, duration = pb3.mobile_base_move_plan(
+            [0.03, 0.0], base_duration_sec=1.0, max_speed_mps=0.02
+        )
+        self.assertAlmostEqual(duration, 1.5)
+        np.testing.assert_allclose(velocity * duration, [0.03, 0.0])
+        self.assertLessEqual(float(np.linalg.norm(velocity)), 0.02 + 1e-9)
+
+        # Small steps keep the base duration.
+        velocity, duration = pb3.mobile_base_move_plan(
+            [0.01, 0.0], base_duration_sec=1.0, max_speed_mps=0.02
+        )
+        self.assertAlmostEqual(duration, 1.0)
+        np.testing.assert_allclose(velocity * duration, [0.01, 0.0])
+
+    def test_alignment_budget_covers_realistic_initial_error(self) -> None:
+        # 30 s at 0.02 m/s leaves room for ~20+ cm of travel plus vision time;
+        # the old 8 s budget only allowed ~8 cm and fell back to arm-only picks.
+        self.assertGreaterEqual(pb3.MOBILE_BASE_TOTAL_TIMEOUT_SEC, 30.0)
+        self.assertEqual(pb3.MOBILE_BASE_MAX_SPEED_MPS, 0.02)
+        self.assertLessEqual(pb3.MOBILE_BASE_MAX_RESIDUAL_XY_M, 0.05)
+
+    def test_user_abort_exception_exists_for_alignment(self) -> None:
+        self.assertTrue(issubclass(pb3.UserAbortRequested, Exception))
+
+
+if __name__ == "__main__":
+    unittest.main()
