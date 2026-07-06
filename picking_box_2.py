@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +78,15 @@ LIFT_HOLD_TIME = 100.0
 # CartesianCommandBuilder.add_target's last argument is a DIMENSIONLESS scaling
 # of the internal Cartesian acceleration limits (0.5 = half), NOT m/s^2.
 CARTESIAN_ACCELERATION_LIMIT_SCALING = 0.5
+
+# Command wait watchdog. Expected motion/hold time is stage-specific; these
+# values add slack around that expectation and prevent command.get() from
+# blocking forever when a target is unreachable.
+COMMAND_TIMEOUT_MARGIN_SEC = 5.0
+COMMAND_TIMEOUT_MIN_SEC = 8.0
+COMMAND_WAIT_POLL_SEC = 0.1
+COMMAND_WAIT_LOG_INTERVAL_SEC = 2.0
+COMMAND_CANCEL_GRACE_SEC = 2.0
 
 # ---- Vision extrinsic: shared single source of truth (camera_extrinsics.py) ----
 from camera_extrinsics import (
@@ -711,12 +721,78 @@ def print_stage(stage: str, message: str) -> None:
     print(f"[stage] {stage} | {message}", flush=True)
 
 
-def send_stage(robot: Any, builder: Any, stage: str) -> bool:
+def stage_timeout_sec(
+    *expected_durations_sec: float,
+    min_timeout_sec: float = COMMAND_TIMEOUT_MIN_SEC,
+    margin_sec: float = COMMAND_TIMEOUT_MARGIN_SEC,
+) -> float:
+    """Return watchdog timeout for a stage with known minimum/hold durations."""
+    expected = sum(max(0.0, float(value)) for value in expected_durations_sec)
+    return max(float(min_timeout_sec), expected + float(margin_sec))
+
+
+def wait_for_command_feedback(
+    command: Any,
+    stage: str,
+    *,
+    timeout_sec: float,
+    poll_sec: float = COMMAND_WAIT_POLL_SEC,
+    log_interval_sec: float = COMMAND_WAIT_LOG_INTERVAL_SEC,
+) -> Any | None:
+    """Poll an RBY1 command handler until feedback is ready or timeout expires."""
+    deadline = time.monotonic() + float(timeout_sec)
+    next_log = time.monotonic() + float(log_interval_sec)
+    while True:
+        now = time.monotonic()
+        remaining = deadline - now
+        if remaining <= 0.0:
+            return None
+
+        wait_ms = max(1, int(min(float(poll_sec), remaining) * 1000.0))
+        if command.wait_for(wait_ms):
+            return command.get()
+
+        now = time.monotonic()
+        if now >= next_log:
+            elapsed = max(0.0, float(timeout_sec) - max(0.0, deadline - now))
+            print_stage(stage, f"still waiting ({elapsed:.1f}/{float(timeout_sec):.1f}s)")
+            next_log = now + float(log_interval_sec)
+
+
+def cancel_timed_out_command(robot: Any, command: Any, stage: str) -> None:
+    """Best-effort cancellation after a stage watchdog timeout."""
+    print_stage(stage, "TIMEOUT; canceling command")
+    try:
+        command.cancel()
+        print_stage(stage, "command.cancel() requested")
+    except Exception as exc:  # pragma: no cover - SDK/hardware dependent
+        print_stage(stage, f"command.cancel() failed: {exc}")
+
+    try:
+        robot.cancel_control()
+        print_stage(stage, "robot.cancel_control() requested")
+    except Exception as exc:  # pragma: no cover - SDK/hardware dependent
+        print_stage(stage, f"robot.cancel_control() failed: {exc}")
+
+    try:
+        if command.wait_for(int(COMMAND_CANCEL_GRACE_SEC * 1000.0)):
+            feedback = command.get()
+            print_stage(stage, f"finish_code_after_cancel={feedback.finish_code}")
+        else:
+            print_stage(stage, "cancel feedback not received within grace window")
+    except Exception as exc:  # pragma: no cover - SDK/hardware dependent
+        print_stage(stage, f"failed while waiting for cancel feedback: {exc}")
+
+
+def send_stage(robot: Any, builder: Any, stage: str, *, timeout_sec: float) -> bool:
     """Send a command and leave a clear log while waiting for completion."""
     print_stage(stage, "sending command")
     command = robot.send_command(builder)
-    print_stage(stage, "waiting for finish_code")
-    feedback = command.get()
+    print_stage(stage, f"waiting for finish_code (timeout={float(timeout_sec):.1f}s)")
+    feedback = wait_for_command_feedback(command, stage, timeout_sec=float(timeout_sec))
+    if feedback is None:
+        cancel_timed_out_command(robot, command, stage)
+        return False
     print_stage(stage, f"finish_code={feedback.finish_code}")
     return feedback.finish_code == rby.RobotCommandFeedback.FinishCode.Ok
 
@@ -869,6 +945,8 @@ def main(
     continue_pick: bool,
     visualize: bool,
     visualize_only: bool,
+    command_timeout_margin_sec: float,
+    min_command_timeout_sec: float,
 ) -> bool:
     robot = rby.create_robot(address, model)
     robot.connect()
@@ -914,7 +992,16 @@ def main(
         for name, pose in JOINT_SEQUENCE:
             stage = f"1/5 {name}"
             print_stage(stage, "joint position move")
-            if not send_stage(robot, build_pose_command(pose, MINIMUM_TIME), stage):
+            if not send_stage(
+                robot,
+                build_pose_command(pose, MINIMUM_TIME),
+                stage,
+                timeout_sec=stage_timeout_sec(
+                    MINIMUM_TIME,
+                    min_timeout_sec=min_command_timeout_sec,
+                    margin_sec=command_timeout_margin_sec,
+                ),
+            ):
                 print_stage(stage, "FAILED; aborting")
                 return done
             print_stage(stage, "reached")
@@ -1007,7 +1094,17 @@ def main(
             midpoint_offset_xy_m=midpoint_offset_xy_m,
             drop_delta_axis_base_xy=drop_delta_axis_base_xy,
         )
-        if not send_stage(robot, command, "3/5 vision_pre_push"):
+        if not send_stage(
+            robot,
+            command,
+            "3/5 vision_pre_push",
+            timeout_sec=stage_timeout_sec(
+                approach_time,
+                hold_time,
+                min_timeout_sec=min_command_timeout_sec,
+                margin_sec=command_timeout_margin_sec,
+            ),
+        ):
             print_stage("3/5 vision_pre_push", "FAILED; aborting")
             return done
         print_stage("3/5 vision_pre_push", "reached")
@@ -1023,6 +1120,11 @@ def main(
             robot,
             build_impedance_push_command(dyn_model, dyn_state, q),
             "4/5 inward_push",
+            timeout_sec=stage_timeout_sec(
+                PUSH_HOLD_TIME,
+                min_timeout_sec=min_command_timeout_sec,
+                margin_sec=command_timeout_margin_sec,
+            ),
         ):
             print_stage("4/5 inward_push", "FAILED; aborting")
             return done
@@ -1030,7 +1132,17 @@ def main(
 
         print_stage("5/5 lift", "building target")
         q = robot.get_state().position
-        if not send_stage(robot, build_impedance_lift_command(dyn_model, dyn_state, q), "5/5 lift"):
+        if not send_stage(
+            robot,
+            build_impedance_lift_command(dyn_model, dyn_state, q),
+            "5/5 lift",
+            timeout_sec=stage_timeout_sec(
+                LIFT_MINIMUM_TIME,
+                LIFT_HOLD_TIME,
+                min_timeout_sec=min_command_timeout_sec,
+                margin_sec=command_timeout_margin_sec,
+            ),
+        ):
             print_stage("5/5 lift", "FAILED; aborting")
             return done
         print_stage("5/5 lift", "done")
@@ -1143,6 +1255,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Observation mode: stream the visualization at the current posture, send NO motion commands.",
     )
+    parser.add_argument(
+        "--command-timeout-margin-sec",
+        type=float,
+        default=COMMAND_TIMEOUT_MARGIN_SEC,
+        help=(
+            "Extra watchdog slack added to each command's expected motion/hold time. "
+            "A timed-out stage is canceled instead of blocking forever."
+        ),
+    )
+    parser.add_argument(
+        "--min-command-timeout-sec",
+        type=float,
+        default=COMMAND_TIMEOUT_MIN_SEC,
+        help="Minimum watchdog timeout for any robot command stage.",
+    )
     parser.set_defaults(continue_pick=True)
     parser.add_argument(
         "--continue-pick",
@@ -1177,6 +1304,10 @@ def combined_midpoint_offset_xy(args: argparse.Namespace) -> tuple[float, float]
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.command_timeout_margin_sec < 0.0:
+        raise SystemExit("--command-timeout-margin-sec must be non-negative")
+    if args.min_command_timeout_sec <= 0.0:
+        raise SystemExit("--min-command-timeout-sec must be positive")
     center_camera = resolve_box_center_camera(args)
     max_shift = None if args.allow_large_vision_shift else float(args.max_reference_xy_shift_m)
     midpoint_offset_xy = combined_midpoint_offset_xy(args)
@@ -1200,6 +1331,8 @@ if __name__ == "__main__":
             continue_pick=bool(args.continue_pick),
             visualize=bool(args.visualize or args.visualize_only),
             visualize_only=bool(args.visualize_only),
+            command_timeout_margin_sec=float(args.command_timeout_margin_sec),
+            min_command_timeout_sec=float(args.min_command_timeout_sec),
         )
         else 1
     )
