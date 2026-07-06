@@ -6,11 +6,10 @@ orientation, but shifts only x/y from the latest camera-estimated box center.
 
 Default sequence:
   1. ready                           (joint position control)
-  2. ready_to_picking                (joint pre-shape to avoid elbow-up IK)
-  3. live vision at pre-shape pose   (D405 + rim-plane estimator, usable center frames)
-  4. vision_pre_push                 (START_TO_PICKING z/rotation, vision x/y)
-  5. inward y-axis push              (Cartesian impedance control)
-  6. lift                            (dual-target Cartesian control)
+  2. live vision at ready pose       (D405 + rim-plane estimator, usable center frames)
+  3. vision_pre_push                 (START_TO_PICKING z/rotation, vision x/y)
+  4. inward y-axis push              (Cartesian impedance control)
+  5. lift                            (dual-target Cartesian control)
 
 Pass --pre-push-only to stop at the pose just before the inward y-axis push.
 
@@ -61,20 +60,20 @@ VISION_PRE_PUSH_HAND_Y_MARGIN_M = 0.05
 # x-direction torso-frame moves would have.
 IMPEDANCE_REFERENCE_LINK = "link_torso_5"
 # Actual inward travel from the widened vision pre-push pose.
-PUSH_DISTANCE = 0.12
+PUSH_DISTANCE = 0.10
 IMPEDANCE_TRANSLATION_WEIGHT = [500.0, 1000.0, 500.0]
 IMPEDANCE_ROTATION_WEIGHT = [50.0, 50.0, 50.0]
 PUSH_HOLD_TIME = 3.0
 
 # ---- Cartesian lift parameters ----
 IMPEDANCE_LIFT_REFERENCE_LINK = "base"
-LIFT_HEIGHT = 0.1
+LIFT_HEIGHT = 0.12
 LIFT_MINIMUM_TIME = 5.0
 LIFT_LINEAR_VELOCITY_LIMIT = 0.1
 LIFT_ANGULAR_VELOCITY_LIMIT = float(np.pi / 4)
 LIFT_LINEAR_ACCELERATION_LIMIT = 0.5   # m/s^2 (CartesianImpedance add_target)
 LIFT_ANGULAR_ACCELERATION_LIMIT = float(np.pi)  # rad/s^2
-LIFT_JOINT_STIFFNESS = [100.0] * 7
+LIFT_JOINT_STIFFNESS = [250.0] * 7
 LIFT_JOINT_DAMPING_RATIO = 1.0
 LIFT_JOINT_TORQUE_LIMIT = [50.0] * 7
 LIFT_HOLD_TIME = 100.0
@@ -225,13 +224,6 @@ READY = {
     "head": [0.000, 0.436],
 }
 
-READY_TO_PICKING = {
-    "torso": [0.000, 0.000, 0.000, 0.349, 0.000, 0.000],
-    "right_arm": [-0.111, -0.987, -0.205, -1.463, -2.454, 1.744, 0.30],
-    "left_arm": [-0.111, 0.987, 0.205, -1.463, 2.454, 1.744, -0.30],
-    "head": [0.000, 0.436],
-}
-
 START_TO_PICKING = {
     "torso": [0.000, 0.000, 0.000, 0.349, 0.000, 0.000],
     "right_arm": [-0.171, -0.841, -0.153, -1.511, -2.403, 1.743, 0.5],
@@ -239,12 +231,11 @@ START_TO_PICKING = {
     "head": [0.000, 0.436],
 }
 
-# Move near the grasping branch in joint space before the Cartesian
-# vision_pre_push target. This avoids the arm choosing an elbow-up/"hands up"
-# IK branch when commanded directly from READY.
+# Joint-space stages executed before live vision and Cartesian motion.
+# START_TO_PICKING is not executed here; it only supplies the reference hand
+# z/rotation for the later vision_pre_push target.
 JOINT_SEQUENCE = [
     ("ready", READY),
-    ("ready_to_picking", READY_TO_PICKING),
 ]
 
 
