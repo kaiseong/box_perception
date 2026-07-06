@@ -27,8 +27,9 @@ For the current side grasp, the box long axis must be parallel to base y
 (90/270 degrees in base xy, equivalently zero error modulo 180) before
 contact. This script uses the mobile base theta axis for that yaw alignment
 and does NOT rotate the wrists in the first pass. In picking_box_5, yaw and x/y
-are handled in one closed-loop stage: while yaw is still coarse, translation is
-suppressed; once yaw is close enough, x/y/theta are corrected together.
+are handled in one closed-loop stage. By default x/y/theta are corrected
+together even when yaw error is still large, so the base does not rotate in
+place into an off-center box.
 """
 
 from __future__ import annotations
@@ -124,31 +125,31 @@ GRIPPER_STOP_JOIN_TIMEOUT_SEC = 1.0
 # ---- Mobile base closed-loop alignment (picking_box_5) ----
 # M model supports SE(2) x/y/theta velocity commands. The control law is
 # deliberately conservative: use vision, move/turn a small amount, then look
-# again. In the combined stage, yaw and x/y share one SE(2) command. Translation
-# is suppressed while yaw error is coarse so the base does not translate along a
-# stale direction while the robot frame is still rotating.
+# again. In the combined stage, yaw and x/y share one SE(2) command. The default
+# threshold covers the full modulo-180 yaw-error range, so x/y remains enabled
+# during yaw alignment and avoids rotating in place into an off-center box.
 MOBILE_BASE_ALIGN_DEFAULT = True
 MOBILE_BASE_TARGET_X_M = 0.45
 MOBILE_BASE_X_TOLERANCE_M = 0.01
 MOBILE_BASE_Y_TOLERANCE_M = 0.01
 MOBILE_BASE_MAX_SPEED_MPS = 0.04
-MOBILE_BASE_MAX_STEP_M = 0.03
+MOBILE_BASE_MAX_STEP_M = 0.06
 MOBILE_BASE_MAX_ITERATIONS = 8
 MOBILE_BASE_YAW_ALIGN_DEFAULT = True
 MOBILE_BASE_YAW_TARGET_DEG = 90.0
 MOBILE_BASE_YAW_TOLERANCE_DEG = 4.0
 MOBILE_BASE_YAW_MAX_SPEED_RADPS = 0.10
-MOBILE_BASE_YAW_MAX_STEP_DEG = 10.0
+MOBILE_BASE_YAW_MAX_STEP_DEG = 20.0
 MOBILE_BASE_YAW_MAX_ITERATIONS = 8
 MOBILE_BASE_YAW_TOTAL_TIMEOUT_SEC = 30.0
-MOBILE_BASE_YAW_MOVE_DURATION_SEC = 1.0
+MOBILE_BASE_YAW_MOVE_DURATION_SEC = 2.0
 MOBILE_BASE_YAW_VISION_FRAMES_NEEDED = 3
 MOBILE_BASE_YAW_VISION_TIMEOUT_SEC = 2.0
-MOBILE_BASE_COMBINED_COARSE_YAW_THRESHOLD_DEG = 8.0
-# Budget must cover the worst realistic initial error at 0.02 m/s plus a
+MOBILE_BASE_COMBINED_COARSE_YAW_THRESHOLD_DEG = 90.0
+# Budget must cover the worst realistic initial error at the capped base speed plus a
 # vision recapture per step; 8 s only allowed ~8 cm of total travel.
 MOBILE_BASE_TOTAL_TIMEOUT_SEC = 30.0
-MOBILE_BASE_MOVE_DURATION_SEC = 1.0
+MOBILE_BASE_MOVE_DURATION_SEC = 2.0
 MOBILE_BASE_VISION_FRAMES_NEEDED = 3
 MOBILE_BASE_VISION_TIMEOUT_SEC = 2.0
 MOBILE_BASE_STREAM_PRIORITY = 1
@@ -695,9 +696,9 @@ def mobile_base_combined_alignment_plan(
 ) -> dict[str, Any] | None:
     """Plan one conservative combined yaw/x/y correction from a fresh measurement.
 
-    If yaw is still coarse, x/y translation is suppressed. This keeps the stage
-    combined while avoiding sideways drift from translating in a base frame that
-    is about to rotate significantly.
+    By default x/y remains enabled across the full modulo-180 yaw-error range.
+    Lower coarse_yaw_threshold_deg only when you deliberately want a yaw-first
+    debug mode.
     """
     yaw_error = mobile_base_yaw_alignment_error_deg(measurement)
     if yaw_error is None:
@@ -1211,6 +1212,32 @@ def live_result_to_measurement(
         "center_base_m": center_base,
         "drop_delta_axis_base_xy": drop_delta_axis_base_xy,
     }
+
+
+def live_estimate_to_measurement(
+    robot: Any,
+    dyn_model: Any,
+    dyn_state: Any,
+    view_rotation: str,
+    estimate: Any,
+    mode: str,
+) -> dict[str, Any]:
+    """Convert one usable live estimate into a base-frame measurement."""
+    axis = estimate.support.get("long_axis_camera")
+    axis_unconstrained = (
+        not estimate.confidence.ok
+        and "long_axis_center_underconstrained" in estimate.failure_reasons
+    )
+    live = {
+        "center_camera_m": estimate.center_top_camera_m,
+        "center_spread_m": 0.0,
+        "long_axis_camera": axis,
+        "long_axis_unconstrained": axis_unconstrained,
+        "frames_used": 1,
+        "candidate_frames": 1,
+        "modes": [mode],
+    }
+    return live_result_to_measurement(robot, dyn_model, dyn_state, view_rotation, live)
 
 
 class ContinuousLiveBoxView:
@@ -2255,6 +2282,204 @@ def run_mobile_base_alignment(
             live_view.close()
 
 
+def run_mobile_base_combined_servo_alignment(
+    robot: Any,
+    dyn_model: Any,
+    dyn_state: Any,
+    view_rotation: str,
+    measurement: dict[str, Any],
+    *,
+    target_x_m: float,
+    x_tolerance_m: float,
+    y_tolerance_m: float,
+    yaw_tolerance_deg: float,
+    coarse_yaw_threshold_deg: float,
+    max_speed_mps: float,
+    max_angular_speed_radps: float,
+    max_step_m: float,
+    max_step_deg: float,
+    total_timeout_sec: float,
+    xy_move_duration_sec: float,
+    yaw_move_duration_sec: float,
+    vision_frames_needed: int,
+    stage: str = "3-4/7 mobile_base_se2_align",
+) -> dict[str, Any] | None:
+    """Continuously update M-base SE(2) velocity from live vision frames."""
+    initial_plan = mobile_base_combined_alignment_plan(
+        measurement,
+        target_x_m=target_x_m,
+        x_tolerance_m=x_tolerance_m,
+        y_tolerance_m=y_tolerance_m,
+        yaw_tolerance_deg=yaw_tolerance_deg,
+        max_step_m=max_step_m,
+        max_step_deg=max_step_deg,
+        max_speed_mps=max_speed_mps,
+        max_angular_speed_radps=max_angular_speed_radps,
+        xy_move_duration_sec=xy_move_duration_sec,
+        yaw_move_duration_sec=yaw_move_duration_sec,
+        coarse_yaw_threshold_deg=coarse_yaw_threshold_deg,
+    )
+    if initial_plan is None:
+        print_stage(stage, "FAILED: no usable long-axis yaw in initial vision measurement")
+        return None
+    if bool(initial_plan["aligned"]):
+        center_base = np.asarray(initial_plan["center_base_m"], dtype=np.float64)
+        print_stage(
+            stage,
+            f"already aligned; x={center_base[0]:+.3f}m y={center_base[1]:+.3f}m "
+            f"yaw_error={float(initial_plan['yaw_error_deg']):+.2f}deg",
+        )
+        return measurement
+
+    live_view = ContinuousLiveBoxView(view_rotation)
+    latest = measurement
+    latest_plan = initial_plan
+    velocity_xy = np.zeros(2, dtype=np.float64)
+    angular_velocity = 0.0
+    aligned_frames = 0
+    required_aligned_frames = max(1, min(3, int(vision_frames_needed)))
+    period = max(0.01, float(MOBILE_BASE_STREAM_PERIOD_SEC))
+    minimum_time = period * 1.01
+    deadline = time.monotonic() + float(total_timeout_sec)
+    next_log = time.monotonic() + COMMAND_WAIT_LOG_INTERVAL_SEC
+    sends = 0
+    updates = 0
+
+    try:
+        stream = robot.create_command_stream(priority=MOBILE_BASE_STREAM_PRIORITY)
+    except Exception as exc:  # pragma: no cover - SDK/hardware dependent
+        print_stage(stage, f"failed to create mobile command stream: {exc}")
+        live_view.close()
+        return None
+
+    def send_velocity(v_xy: Any, omega: float) -> None:
+        stream.send_command(
+            build_mobile_base_velocity_command(
+                v_xy,
+                angular_velocity_radps=float(omega),
+                minimum_time=minimum_time,
+                control_hold_time=MOBILE_BASE_COMMAND_HOLD_TIME_SEC,
+            )
+        )
+
+    try:
+        print_stage(
+            stage,
+            "servo streaming live vision -> SE(2) velocity "
+            f"(timeout={float(total_timeout_sec):.1f}s, aligned_frames={required_aligned_frames})",
+        )
+        while time.monotonic() < deadline:
+            error_xy = np.asarray(latest_plan["error_xy_m"], dtype=np.float64)
+            yaw_error = float(latest_plan["yaw_error_deg"])
+            status_lines = [
+                (
+                    f"servo target x={target_x_m * 100:+.1f}cm y=+0.0cm yaw=base y",
+                    (255, 255, 255),
+                ),
+                (
+                    f"error x={error_xy[0] * 100:+.1f}cm y={error_xy[1] * 100:+.1f}cm "
+                    f"yaw={yaw_error:+.1f}deg aligned={aligned_frames}/{required_aligned_frames}",
+                    (0, 220, 255),
+                ),
+                (
+                    f"cmd vel=[{velocity_xy[0]:+.3f},{velocity_xy[1]:+.3f}]m/s "
+                    f"omega={angular_velocity:+.3f}rad/s",
+                    (0, 220, 255),
+                ),
+            ]
+            q = robot.get_state().position
+            camera_to_base = compute_camera_to_base_for_view_rotation(
+                view_rotation,
+                dyn_model,
+                dyn_state,
+                q,
+            )
+            try:
+                usable, mode, estimate, _, abort_requested = live_view.process_next_frame(
+                    camera_to_base=camera_to_base,
+                    status_lines=status_lines,
+                )
+            except StopIteration:
+                print_stage(stage, "live vision stream ended during servo alignment")
+                return latest
+            if abort_requested:
+                raise UserAbortRequested("combined mobile servo alignment aborted from the live view")
+
+            if usable:
+                updates += 1
+                latest = live_estimate_to_measurement(
+                    robot,
+                    dyn_model,
+                    dyn_state,
+                    view_rotation,
+                    estimate,
+                    mode,
+                )
+                plan = mobile_base_combined_alignment_plan(
+                    latest,
+                    target_x_m=target_x_m,
+                    x_tolerance_m=x_tolerance_m,
+                    y_tolerance_m=y_tolerance_m,
+                    yaw_tolerance_deg=yaw_tolerance_deg,
+                    max_step_m=max_step_m,
+                    max_step_deg=max_step_deg,
+                    max_speed_mps=max_speed_mps,
+                    max_angular_speed_radps=max_angular_speed_radps,
+                    xy_move_duration_sec=xy_move_duration_sec,
+                    yaw_move_duration_sec=yaw_move_duration_sec,
+                    coarse_yaw_threshold_deg=coarse_yaw_threshold_deg,
+                )
+                if plan is None:
+                    aligned_frames = 0
+                    velocity_xy = np.zeros(2, dtype=np.float64)
+                    angular_velocity = 0.0
+                else:
+                    latest_plan = plan
+                    if bool(plan["aligned"]):
+                        aligned_frames += 1
+                        velocity_xy = np.zeros(2, dtype=np.float64)
+                        angular_velocity = 0.0
+                        if aligned_frames >= required_aligned_frames:
+                            print_stage(
+                                stage,
+                                f"servo aligned after {updates} usable updates; "
+                                f"yaw_error={float(plan['yaw_error_deg']):+.2f}deg",
+                            )
+                            return latest
+                    else:
+                        aligned_frames = 0
+                        velocity_xy = np.asarray(plan["velocity_xy_mps"], dtype=np.float64)
+                        angular_velocity = float(plan["angular_velocity_radps"])
+            else:
+                aligned_frames = 0
+                velocity_xy = np.zeros(2, dtype=np.float64)
+                angular_velocity = 0.0
+                if updates == 0 or updates % 5 == 0:
+                    print_stage(stage, f"servo frame rejected: {mode}; sending zero velocity")
+
+            send_velocity(velocity_xy, angular_velocity)
+            sends += 1
+            now = time.monotonic()
+            if now >= next_log:
+                elapsed = float(total_timeout_sec) - max(0.0, deadline - now)
+                print_stage(
+                    stage,
+                    f"servo streaming ({elapsed:.1f}/{float(total_timeout_sec):.1f}s, "
+                    f"updates={updates}, sends={sends})",
+                )
+                next_log = now + COMMAND_WAIT_LOG_INTERVAL_SEC
+
+        print_stage(stage, "servo timeout; returning latest vision measurement for residual gate")
+        return latest
+    finally:
+        zero = np.zeros(2, dtype=np.float64)
+        for _ in range(max(1, int(MOBILE_BASE_STOP_REPEATS))):
+            send_velocity(zero, 0.0)
+            time.sleep(period)
+        print_stage(stage, f"servo stop sent; motion sends={sends}, usable updates={updates}")
+        live_view.close()
+
+
 def run_mobile_base_combined_alignment(
     robot: Any,
     dyn_model: Any,
@@ -2282,9 +2507,32 @@ def run_mobile_base_combined_alignment(
     stage: str = "3-4/7 mobile_base_se2_align",
 ) -> dict[str, Any] | None:
     """Closed-loop mobile-base yaw/x/y alignment using one SE(2) stage."""
+    if visualize:
+        return run_mobile_base_combined_servo_alignment(
+            robot,
+            dyn_model,
+            dyn_state,
+            view_rotation,
+            measurement,
+            target_x_m=target_x_m,
+            x_tolerance_m=x_tolerance_m,
+            y_tolerance_m=y_tolerance_m,
+            yaw_tolerance_deg=yaw_tolerance_deg,
+            coarse_yaw_threshold_deg=coarse_yaw_threshold_deg,
+            max_speed_mps=max_speed_mps,
+            max_angular_speed_radps=max_angular_speed_radps,
+            max_step_m=max_step_m,
+            max_step_deg=max_step_deg,
+            total_timeout_sec=total_timeout_sec,
+            xy_move_duration_sec=xy_move_duration_sec,
+            yaw_move_duration_sec=yaw_move_duration_sec,
+            vision_frames_needed=vision_frames_needed,
+            stage=stage,
+        )
+
     deadline = time.monotonic() + float(total_timeout_sec)
     latest = measurement
-    live_view: ContinuousLiveBoxView | None = ContinuousLiveBoxView(view_rotation) if visualize else None
+    live_view: ContinuousLiveBoxView | None = None
 
     try:
         for iteration in range(1, int(max_iterations) + 1):
@@ -2808,13 +3056,18 @@ def main(
                 f"| modes={sorted(set(measurement['modes']))}",
             )
             if mobile_base_yaw_align and mobile_base_align and str(model).lower() == "m":
+                if mobile_base_combined_coarse_yaw_threshold_deg >= 90.0:
+                    xy_policy = "xy enabled during yaw alignment"
+                else:
+                    xy_policy = (
+                        f"xy suppressed while |yaw|>{mobile_base_combined_coarse_yaw_threshold_deg:.1f}deg"
+                    )
                 print_stage(
                     "3-4/7 mobile_base_se2_align",
                     "closed-loop combined target "
                     f"x={mobile_base_target_x_m:.3f}m±{mobile_base_x_tolerance_m:.3f}m, "
                     f"y=0.000m±{mobile_base_y_tolerance_m:.3f}m, "
-                    f"yaw≤{mobile_base_yaw_tolerance_deg:.1f}deg "
-                    f"(xy suppressed while |yaw|>{mobile_base_combined_coarse_yaw_threshold_deg:.1f}deg)",
+                    f"yaw≤{mobile_base_yaw_tolerance_deg:.1f}deg ({xy_policy})",
                 )
                 combined_measurement = run_mobile_base_combined_alignment(
                     robot,

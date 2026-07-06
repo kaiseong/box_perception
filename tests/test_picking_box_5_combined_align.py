@@ -37,7 +37,26 @@ def measurement(*, center: tuple[float, float, float], yaw_deg: float) -> dict:
 
 
 class PickingBox5CombinedAlignTests(unittest.TestCase):
-    def test_combined_plan_suppresses_translation_when_yaw_is_coarse(self) -> None:
+    def test_combined_plan_moves_xy_even_when_yaw_is_coarse_by_default(self) -> None:
+        plan = pb5.mobile_base_combined_alignment_plan(
+            measurement(center=(0.52, 0.03, 0.0), yaw_deg=105.0),
+            target_x_m=0.45,
+            x_tolerance_m=0.01,
+            y_tolerance_m=0.01,
+            yaw_tolerance_deg=4.0,
+            max_step_m=0.03,
+            max_step_deg=10.0,
+        )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertTrue(plan["translation_enabled"])
+        self.assertGreater(float(np.linalg.norm(plan["step_xy_m"])), 0.0)
+        self.assertAlmostEqual(plan["step_yaw_deg"], 10.0)
+        self.assertGreater(float(np.linalg.norm(plan["velocity_xy_mps"])), 0.0)
+        self.assertGreater(plan["angular_velocity_radps"], 0.0)
+
+    def test_combined_plan_can_suppress_translation_when_threshold_is_lowered(self) -> None:
         plan = pb5.mobile_base_combined_alignment_plan(
             measurement(center=(0.52, 0.03, 0.0), yaw_deg=105.0),
             target_x_m=0.45,
