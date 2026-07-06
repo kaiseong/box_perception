@@ -74,7 +74,7 @@ IMPEDANCE_ROTATION_WEIGHT = [50.0, 50.0, 50.0]
 # ImpedanceControlCommandBuilder has no trajectory minimum_time in the SDK
 # examples. Ramp the target itself over this duration to avoid a spring target
 # jump that slams into the box.
-PUSH_RAMP_TIME = 1.0
+PUSH_RAMP_TIME = 0.5
 PUSH_STREAM_PERIOD_SEC = 1.0 / 30.0
 PUSH_STREAM_COMMAND_HOLD_TIME = 1.0
 PUSH_STREAM_PRIORITY = 1
@@ -83,10 +83,10 @@ PUSH_HOLD_TIME = 0.5
 # ---- Cartesian lift parameters ----
 IMPEDANCE_LIFT_REFERENCE_LINK = "base"
 LIFT_HEIGHT = 0.12
-LIFT_MINIMUM_TIME = 1.0
-LIFT_LINEAR_VELOCITY_LIMIT = 0.1
+LIFT_MINIMUM_TIME = 0.5
+LIFT_LINEAR_VELOCITY_LIMIT = 0.4
 LIFT_ANGULAR_VELOCITY_LIMIT = float(np.pi / 4)
-LIFT_LINEAR_ACCELERATION_LIMIT = 0.5   # m/s^2 (CartesianImpedance add_target)
+LIFT_LINEAR_ACCELERATION_LIMIT = 0.8   # m/s^2 (CartesianImpedance add_target)
 LIFT_ANGULAR_ACCELERATION_LIMIT = float(np.pi)  # rad/s^2
 LIFT_JOINT_STIFFNESS = [300.0] * 7
 LIFT_JOINT_DAMPING_RATIO = 1.0
@@ -132,13 +132,13 @@ MOBILE_BASE_ALIGN_DEFAULT = True
 MOBILE_BASE_TARGET_X_M = 0.45
 MOBILE_BASE_X_TOLERANCE_M = 0.01
 MOBILE_BASE_Y_TOLERANCE_M = 0.01
-MOBILE_BASE_MAX_SPEED_MPS = 0.04
+MOBILE_BASE_MAX_SPEED_MPS = 0.06
 MOBILE_BASE_MAX_STEP_M = 0.06
 MOBILE_BASE_MAX_ITERATIONS = 8
 MOBILE_BASE_YAW_ALIGN_DEFAULT = True
 MOBILE_BASE_YAW_TARGET_DEG = 90.0
 MOBILE_BASE_YAW_TOLERANCE_DEG = 4.0
-MOBILE_BASE_YAW_MAX_SPEED_RADPS = 0.10
+MOBILE_BASE_YAW_MAX_SPEED_RADPS = 0.15
 MOBILE_BASE_YAW_MAX_STEP_DEG = 20.0
 MOBILE_BASE_YAW_MAX_ITERATIONS = 8
 MOBILE_BASE_YAW_TOTAL_TIMEOUT_SEC = 30.0
@@ -155,8 +155,8 @@ MOBILE_BASE_COMBINED_COARSE_YAW_THRESHOLD_DEG = 90.0
 # MOBILE_BASE_YAW_MAX_SPEED_RADPS; when a cap binds, v and omega are scaled
 # by the SAME factor so the orbit geometry is preserved.
 SERVO_ALIGN_DEFAULT = True
-SERVO_KP_XY = 0.6               # 1/s: proportional gain, tapers speed near target
-SERVO_KP_YAW = 0.8              # 1/s
+SERVO_KP_XY = 0.8               # 1/s: proportional gain, tapers speed near target
+SERVO_KP_YAW = 1.0              # 1/s
 SERVO_SETTLED_FRAMES = 5        # consecutive in-tolerance frames to finish
 SERVO_TOTAL_TIMEOUT_SEC = 40.0
 SERVO_UNUSABLE_DECAY = 0.5      # velocity decay per unusable frame
@@ -1092,8 +1092,8 @@ def build_mobile_base_velocity_command(
     )
 
 
-VISION_APPROACH_MINIMUM_TIME = 1.0
-VISION_APPROACH_HOLD_TIME = 1.0
+VISION_APPROACH_MINIMUM_TIME = 0.6
+VISION_APPROACH_HOLD_TIME = 0.4
 VISION_APPROACH_MAX_REFERENCE_XY_SHIFT_M = 0.25
 
 # ---- Live vision (default input source) ----
