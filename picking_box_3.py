@@ -128,8 +128,11 @@ MOBILE_BASE_MOVE_DURATION_SEC = 1.0
 MOBILE_BASE_VISION_FRAMES_NEEDED = 3
 MOBILE_BASE_VISION_TIMEOUT_SEC = 2.0
 MOBILE_BASE_STREAM_PRIORITY = 1
-MOBILE_BASE_STREAM_PERIOD_SEC = 1.0 / 15.0
-MOBILE_BASE_COMMAND_HOLD_TIME_SEC = 0.25
+MOBILE_BASE_STREAM_PERIOD_SEC = 1.0 / 30.0
+# Match rby1-lerobot's command type (priority stream + SE2 velocity command), not
+# its exact loop rate. Keep a bounded hold time so brief Python/D405 stalls do
+# not expire the stream, while a process crash cannot keep the base moving long.
+MOBILE_BASE_COMMAND_HOLD_TIME_SEC = 2.0
 MOBILE_BASE_STOP_REPEATS = 3
 # The arms only get to move if alignment ended near the target; a residual
 # error beyond this band reproduces the far-reach IK failure this script

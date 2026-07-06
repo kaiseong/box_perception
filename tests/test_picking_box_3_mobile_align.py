@@ -154,6 +154,10 @@ class PickingBox3MobileAlignTests(unittest.TestCase):
             np.testing.assert_allclose(command.velocity, [0.0, 0.0])
             self.assertEqual(command.angular, 0.0)
 
+    def test_mobile_base_stream_defaults_allow_d405_processing_slack(self) -> None:
+        self.assertLessEqual(pb3.MOBILE_BASE_STREAM_PERIOD_SEC, 1.0 / 30.0 + 1e-9)
+        self.assertGreaterEqual(pb3.MOBILE_BASE_COMMAND_HOLD_TIME_SEC, 2.0)
+
     def test_gripper_stop_uses_bounded_join(self) -> None:
         class FakeThread:
             def __init__(self, alive: bool) -> None:
