@@ -3,7 +3,7 @@
 
 This script is for visual motion checks in the RBY1 simulator. It does not run
 vision or FT monitoring. Default mode runs:
-ready -> vision_pre_push_demo -> inward Cartesian push -> lift.
+ready -> vision_pre_push_demo -> inward impedance push -> lift.
 """
 
 from __future__ import annotations
@@ -18,10 +18,15 @@ import rby1_sdk as rby
 
 from picking_box_2 import (
     DYN_LINK_NAMES,
+    COMMAND_TIMEOUT_MARGIN_SEC,
+    COMMAND_TIMEOUT_MIN_SEC,
     IMPEDANCE_LIFT_REFERENCE_LINK,
     IMPEDANCE_REFERENCE_LINK,
     JOINT_SEQUENCE,
+    LIFT_HOLD_TIME,
+    LIFT_MINIMUM_TIME,
     MINIMUM_TIME,
+    PUSH_HOLD_TIME,
     READY,
     START_TO_PICKING,
     VISION_APPROACH_HOLD_TIME,
@@ -31,7 +36,10 @@ from picking_box_2 import (
     build_impedance_push_command,
     build_pose_command,
     build_vision_pre_push_command,
+    cancel_timed_out_command,
     start_to_picking_reference_targets,
+    stage_timeout_sec,
+    wait_for_command_feedback,
 )
 
 
@@ -121,23 +129,55 @@ def connect_and_enable_robot(
     return robot
 
 
-def send_pose(robot: object, named_pose: NamedPose, minimum_time: float, priority: int) -> None:
+def send_builder_stage(
+    robot: object,
+    builder: object,
+    name: str,
+    priority: int,
+    *,
+    timeout_sec: float,
+) -> None:
+    print(f"[stage] {name} | sending command")
+    command = robot.send_command(builder, priority)
+    print(f"[stage] {name} | waiting for finish_code (timeout={timeout_sec:.1f}s)")
+    feedback = wait_for_command_feedback(command, name, timeout_sec=timeout_sec)
+    if feedback is None:
+        cancel_timed_out_command(robot, command, name)
+        raise RuntimeError(f"command timed out: {name}")
+    print(f"[stage] {name} | finish_code={feedback.finish_code}")
+    if feedback.finish_code != rby.RobotCommandFeedback.FinishCode.Ok:
+        raise RuntimeError(f"command failed: {name}")
+
+
+def send_pose(
+    robot: object,
+    named_pose: NamedPose,
+    minimum_time: float,
+    priority: int,
+    *,
+    timeout_sec: float,
+) -> None:
     print(f"[pose] moving to {named_pose.name} over {minimum_time:.2f}s")
-    feedback = robot.send_command(
+    send_builder_stage(
+        robot,
         build_pose_command(named_pose.pose, minimum_time),
+        f"pose:{named_pose.name}",
         priority,
-    ).get()
-    print(f"[pose] {named_pose.name} finish_code={feedback.finish_code}")
-    if feedback.finish_code != rby.RobotCommandFeedback.FinishCode.Ok:
-        raise RuntimeError(f"pose command failed: {named_pose.name}")
+        timeout_sec=timeout_sec,
+    )
+    print(f"[pose] {named_pose.name} reached")
 
 
-def send_cartesian_stage(robot: object, builder: object, name: str, priority: int) -> None:
+def send_cartesian_stage(
+    robot: object,
+    builder: object,
+    name: str,
+    priority: int,
+    *,
+    timeout_sec: float,
+) -> None:
     print(f"[cartesian] running {name}")
-    feedback = robot.send_command(builder, priority).get()
-    print(f"[cartesian] {name} finish_code={feedback.finish_code}")
-    if feedback.finish_code != rby.RobotCommandFeedback.FinishCode.Ok:
-        raise RuntimeError(f"cartesian command failed: {name}")
+    send_builder_stage(robot, builder, name, priority, timeout_sec=timeout_sec)
 
 
 def build_demo_vision_pre_push_command(
@@ -208,6 +248,18 @@ def main() -> int:
     parser.add_argument("--hold-sec", type=float, default=DEFAULT_HOLD_SEC)
     parser.add_argument("--priority", type=int, default=DEFAULT_PRIORITY)
     parser.add_argument(
+        "--command-timeout-margin-sec",
+        type=float,
+        default=COMMAND_TIMEOUT_MARGIN_SEC,
+        help="Extra watchdog slack added to each demo command's expected motion/hold time.",
+    )
+    parser.add_argument(
+        "--min-command-timeout-sec",
+        type=float,
+        default=COMMAND_TIMEOUT_MIN_SEC,
+        help="Minimum watchdog timeout for any demo command stage.",
+    )
+    parser.add_argument(
         "--box-x-offset",
         "--box-center-offset-x-m",
         dest="box_x_offset",
@@ -234,13 +286,19 @@ def main() -> int:
         help="Allow non-localhost addresses. Use only when intentionally moving hardware.",
     )
     args = parser.parse_args()
+    if args.command_timeout_margin_sec < 0.0:
+        raise SystemExit("--command-timeout-margin-sec must be non-negative")
+    if args.min_command_timeout_sec <= 0.0:
+        raise SystemExit("--min-command-timeout-sec must be positive")
 
     sequence = pose_sequence(args.mode)
     print(
         "[defaults] "
         f"address={args.address} model={args.model} mode={args.mode} "
         f"minimum_time={args.minimum_time} hold_sec={args.hold_sec} "
-        f"box_x_offset={args.box_x_offset:+.3f}"
+        f"box_x_offset={args.box_x_offset:+.3f} "
+        f"timeout_min={args.min_command_timeout_sec:.1f}s "
+        f"timeout_margin={args.command_timeout_margin_sec:.1f}s"
     )
     print("[sequence]", " -> ".join(item.name for item in sequence))
     if mode_runs_push_lift(args.mode):
@@ -268,7 +326,17 @@ def main() -> int:
         skip_enable=args.skip_enable,
     )
     for item in sequence:
-        send_pose(robot, item, float(args.minimum_time), int(args.priority))
+        send_pose(
+            robot,
+            item,
+            float(args.minimum_time),
+            int(args.priority),
+            timeout_sec=stage_timeout_sec(
+                float(args.minimum_time),
+                min_timeout_sec=float(args.min_command_timeout_sec),
+                margin_sec=float(args.command_timeout_margin_sec),
+            ),
+        )
         if args.hold_sec > 0:
             time.sleep(float(args.hold_sec))
     if mode_runs_push_lift(args.mode):
@@ -288,6 +356,12 @@ def main() -> int:
             ),
             "vision_pre_push_demo",
             int(args.priority),
+            timeout_sec=stage_timeout_sec(
+                VISION_APPROACH_MINIMUM_TIME,
+                VISION_APPROACH_HOLD_TIME,
+                min_timeout_sec=float(args.min_command_timeout_sec),
+                margin_sec=float(args.command_timeout_margin_sec),
+            ),
         )
         if args.hold_sec > 0:
             time.sleep(float(args.hold_sec))
@@ -298,6 +372,11 @@ def main() -> int:
             build_impedance_push_command(dyn_model, dyn_state, q),
             "inward_push",
             int(args.priority),
+            timeout_sec=stage_timeout_sec(
+                PUSH_HOLD_TIME,
+                min_timeout_sec=float(args.min_command_timeout_sec),
+                margin_sec=float(args.command_timeout_margin_sec),
+            ),
         )
         if args.hold_sec > 0:
             time.sleep(float(args.hold_sec))
@@ -308,6 +387,12 @@ def main() -> int:
             build_impedance_lift_command(dyn_model, dyn_state, q),
             "lift",
             int(args.priority),
+            timeout_sec=stage_timeout_sec(
+                LIFT_MINIMUM_TIME,
+                LIFT_HOLD_TIME,
+                min_timeout_sec=float(args.min_command_timeout_sec),
+                margin_sec=float(args.command_timeout_margin_sec),
+            ),
         )
     print("[done] pose demo complete")
     return 0
