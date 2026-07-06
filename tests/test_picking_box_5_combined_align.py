@@ -106,6 +106,45 @@ class PickingBox5CombinedAlignTests(unittest.TestCase):
         self.assertTrue(status["within_safety_band"])
         self.assertFalse(status["within_target_band"])
 
+    def test_live_center_cluster_ignores_single_outlier_candidate(self) -> None:
+        centers = [
+            [0.400, 0.000, 0.100],
+            [0.404, 0.001, 0.101],
+            [0.399, -0.001, 0.099],
+            [0.520, 0.090, 0.100],
+        ]
+        axes = [axis_from_yaw_deg(91.0), axis_from_yaw_deg(92.0), None, axis_from_yaw_deg(20.0)]
+        result, best_spread = pb5.select_stable_live_center_result(
+            centers,
+            axes,
+            ["a", "b", "c", "outlier"],
+            [False, False, True, False],
+            frames_needed=3,
+            max_center_spread_m=0.01,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertLessEqual(float(best_spread), 0.01)
+        self.assertEqual(result["candidate_frames"], 4)
+        self.assertEqual(result["frames_used"], 3)
+        self.assertNotIn("outlier", result["modes"])
+        np.testing.assert_allclose(result["center_camera_m"], [0.400, 0.000, 0.100], atol=0.002)
+        self.assertTrue(result["long_axis_unconstrained"])
+
+    def test_live_center_cluster_reports_unstable_candidates(self) -> None:
+        result, best_spread = pb5.select_stable_live_center_result(
+            [[0.0, 0.0, 0.0], [0.04, 0.0, 0.0], [0.08, 0.0, 0.0]],
+            [None, None, None],
+            ["a", "b", "c"],
+            [False, False, False],
+            frames_needed=3,
+            max_center_spread_m=0.01,
+        )
+
+        self.assertIsNone(result)
+        self.assertGreater(float(best_spread), 0.01)
+
     def test_combined_alignment_streams_xy_and_yaw_in_one_command_then_recaptures(self) -> None:
         initial = measurement(center=(0.48, 0.02, 0.0), yaw_deg=96.0)
         refreshed = measurement(center=(0.451, 0.002, 0.0), yaw_deg=91.0)

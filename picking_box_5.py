@@ -938,6 +938,61 @@ def live_estimate_center_mode(estimate: Any) -> tuple[bool, str]:
     return False, ",".join(estimate.failure_reasons[:2]) or "low_confidence"
 
 
+def select_stable_live_center_result(
+    centers: list[Any],
+    long_axes: list[Any | None],
+    modes: list[str],
+    long_axis_unconstrained_flags: list[bool],
+    *,
+    frames_needed: int,
+    max_center_spread_m: float,
+) -> tuple[dict[str, Any] | None, float | None]:
+    """Return the tightest stable center cluster from live candidates.
+
+    D405 depth and partial-crop fits occasionally produce isolated center
+    outliers. Contact planning should reject genuinely unstable vision, but it
+    should not fail just because one candidate jumped while enough nearby
+    candidates exist in the same timeout window.
+    """
+    needed = int(frames_needed)
+    if len(centers) < needed:
+        return None, None
+
+    center_array = np.asarray(centers, dtype=np.float64)
+    best_indices: np.ndarray | None = None
+    best_spread = float("inf")
+    for anchor in center_array:
+        distances = np.linalg.norm(center_array - anchor, axis=1)
+        indices = np.argsort(distances)[:needed]
+        cluster = center_array[indices]
+        cluster_median = np.median(cluster, axis=0)
+        spread = float(np.max(np.linalg.norm(cluster - cluster_median, axis=1)))
+        if spread < best_spread:
+            best_spread = spread
+            best_indices = indices
+
+    if best_indices is None:
+        return None, None
+    if best_spread > float(max_center_spread_m):
+        return None, best_spread
+
+    selected_centers = center_array[best_indices]
+    selected_axes = [
+        np.asarray(long_axes[int(i)], dtype=np.float64)
+        for i in best_indices
+        if long_axes[int(i)] is not None
+    ]
+    return {
+        "center_camera_m": np.median(selected_centers, axis=0),
+        "center_spread_m": best_spread,
+        "long_axis_camera": None if not selected_axes else np.median(np.asarray(selected_axes), axis=0),
+        "long_axis_unconstrained": any(long_axis_unconstrained_flags[int(i)] for i in best_indices),
+        "frames_used": needed,
+        "candidate_frames": len(centers),
+        "modes": [modes[int(i)] for i in best_indices],
+    }, best_spread
+
+
 def capture_box_live(
     view_rotation: str,
     *,
@@ -985,18 +1040,20 @@ def capture_box_live(
     T_base = None if camera_to_base is None else np.asarray(camera_to_base, dtype=np.float64)
     window_name = "picking_box_3 vision (q/ESC to close)"
     centers: list[Any] = []
-    long_axes: list[Any] = []
+    long_axes: list[Any | None] = []
     modes: list[str] = []
+    long_axis_unconstrained_flags: list[bool] = []
     quit_requested = False
     continue_requested = False
-    long_axis_unconstrained = False
+    stable_result: dict[str, Any] | None = None
+    best_unstable_spread_m: float | None = None
     deadline = time.monotonic() + (float("inf") if run_forever else float(timeout_sec))
     frames = iter_live_frames(
         width=CAMERA_WIDTH, height=CAMERA_HEIGHT, fps=CAMERA_FPS, view_rotation=view_rotation
     )
     try:
         for _, image, depth_m, intrinsics in frames:
-            captured_enough = not run_forever and len(centers) >= int(frames_needed)
+            captured_enough = stable_result is not None
             if captured_enough and not (visualize and hold_after_capture):
                 break
             if time.monotonic() >= deadline and not (captured_enough and visualize and hold_after_capture):
@@ -1004,22 +1061,31 @@ def capture_box_live(
             mask, _ = segment_yellow_box(image, keep_largest_component=False)
             estimate = estimate_plane_box(mask, depth_m, intrinsics, rim_plane=rim_plane)
             usable, mode = live_estimate_center_mode(estimate)
-            collecting = not run_forever and len(centers) < int(frames_needed)
+            collecting = not run_forever and stable_result is None
             if collecting:
                 if usable:
                     centers.append(estimate.center_top_camera_m)
                     modes.append(mode)
                     axis = estimate.support.get("long_axis_camera")
-                    if axis is not None:
-                        long_axes.append(axis)
+                    long_axes.append(axis)
+                    axis_unconstrained = False
                     if not estimate.confidence.ok:
                         # The long-axis center of this frame is a visible-span
                         # midpoint, not a measurement; remember to drop that
                         # axis from the commanded correction.
                         if "long_axis_center_underconstrained" in estimate.failure_reasons:
-                            long_axis_unconstrained = True
+                            axis_unconstrained = True
                         if len(centers) == 1 or len(centers) % 3 == 0:
                             print(f"[vision] accepted center-only frame: {mode}")
+                    long_axis_unconstrained_flags.append(axis_unconstrained)
+                    stable_result, best_unstable_spread_m = select_stable_live_center_result(
+                        centers,
+                        long_axes,
+                        modes,
+                        long_axis_unconstrained_flags,
+                        frames_needed=frames_needed,
+                        max_center_spread_m=max_center_spread_m,
+                    )
                 else:
                     print(f"[vision] frame rejected: {mode}")
 
@@ -1027,7 +1093,7 @@ def capture_box_live(
                 vis = draw_known_size_estimate(image.copy(), estimate)
                 status_color = (30, 160, 30) if usable else (40, 40, 220)
                 lines = [(f"{'USABLE' if usable else 'REJECTED'}: {mode}", status_color)]
-                if not run_forever and len(centers) >= int(frames_needed):
+                if not run_forever and stable_result is not None:
                     lines.append((
                         "CAPTURED: press c/space/enter to continue, q/ESC to abort",
                         (0, 220, 255),
@@ -1050,9 +1116,11 @@ def capture_box_live(
                 if key in (27, ord("q")):
                     quit_requested = True
                     break
-                if len(centers) >= int(frames_needed) and key in (ord("c"), ord(" "), 10, 13):
+                if stable_result is not None and key in (ord("c"), ord(" "), 10, 13):
                     continue_requested = True
                     break
+            elif stable_result is not None:
+                break
     finally:
         frames.close()  # stops the RealSense pipeline (generator finally)
         if visualize:
@@ -1060,29 +1128,19 @@ def capture_box_live(
 
     if run_forever or quit_requested:
         return None
-    if visualize and hold_after_capture and not continue_requested and len(centers) >= int(frames_needed):
+    if visualize and hold_after_capture and not continue_requested and stable_result is not None:
         return None
 
-    if len(centers) < int(frames_needed):
-        return None
-    center_array = np.asarray(centers, dtype=np.float64)
-    center_median = np.median(center_array, axis=0)
-    center_spread_m = float(np.max(np.linalg.norm(center_array - center_median, axis=1)))
-    if center_spread_m > float(max_center_spread_m):
-        print(
-            "[vision] FAILED: live center spread too large "
-            f"({center_spread_m:.3f} m > {max_center_spread_m:.3f} m)."
-        )
+    if stable_result is None:
+        if len(centers) >= int(frames_needed) and best_unstable_spread_m is not None:
+            print(
+                "[vision] FAILED: live center spread too large "
+                f"({best_unstable_spread_m:.3f} m > {max_center_spread_m:.3f} m) "
+                f"after {len(centers)} usable candidates."
+            )
         return None
 
-    return {
-        "center_camera_m": center_median,
-        "center_spread_m": center_spread_m,
-        "long_axis_camera": None if not long_axes else np.median(np.asarray(long_axes, dtype=np.float64), axis=0),
-        "long_axis_unconstrained": long_axis_unconstrained,
-        "frames_used": len(centers),
-        "modes": modes,
-    }
+    return stable_result
 
 
 def capture_live_box_measurement(
@@ -1267,14 +1325,15 @@ class ContinuousLiveBoxView:
         status_lines: list[tuple[str, tuple[int, int, int]]] | None = None,
     ) -> dict[str, Any] | None:
         centers: list[Any] = []
-        long_axes: list[Any] = []
+        long_axes: list[Any | None] = []
         modes: list[str] = []
-        long_axis_unconstrained = False
+        long_axis_unconstrained_flags: list[bool] = []
         deadline = time.monotonic() + float(timeout_sec)
+        best_unstable_spread_m: float | None = None
 
-        while len(centers) < int(frames_needed):
+        while time.monotonic() < deadline:
             if time.monotonic() >= deadline:
-                return None
+                break
             q = robot.get_state().position
             camera_to_base = compute_camera_to_base_for_view_rotation(
                 view_rotation,
@@ -1302,34 +1361,31 @@ class ContinuousLiveBoxView:
                 centers.append(estimate.center_top_camera_m)
                 modes.append(mode)
                 axis = estimate.support.get("long_axis_camera")
-                if axis is not None:
-                    long_axes.append(axis)
+                long_axes.append(axis)
+                axis_unconstrained = False
                 if not estimate.confidence.ok and "long_axis_center_underconstrained" in estimate.failure_reasons:
-                    long_axis_unconstrained = True
+                    axis_unconstrained = True
+                long_axis_unconstrained_flags.append(axis_unconstrained)
+                live, best_unstable_spread_m = select_stable_live_center_result(
+                    centers,
+                    long_axes,
+                    modes,
+                    long_axis_unconstrained_flags,
+                    frames_needed=frames_needed,
+                    max_center_spread_m=max_center_spread_m,
+                )
+                if live is not None:
+                    return live_result_to_measurement(robot, dyn_model, dyn_state, view_rotation, live)
             else:
                 print(f"[vision] frame rejected: {mode}")
 
-        center_array = np.asarray(centers, dtype=np.float64)
-        center_median = np.median(center_array, axis=0)
-        center_spread_m = float(np.max(np.linalg.norm(center_array - center_median, axis=1)))
-        if center_spread_m > float(max_center_spread_m):
+        if len(centers) >= int(frames_needed) and best_unstable_spread_m is not None:
             print(
                 "[vision] FAILED: live center spread too large "
-                f"({center_spread_m:.3f} m > {max_center_spread_m:.3f} m)."
+                f"({best_unstable_spread_m:.3f} m > {max_center_spread_m:.3f} m) "
+                f"after {len(centers)} usable candidates."
             )
-            return None
-
-        live = {
-            "center_camera_m": center_median,
-            "center_spread_m": center_spread_m,
-            "long_axis_camera": None
-            if not long_axes
-            else np.median(np.asarray(long_axes, dtype=np.float64), axis=0),
-            "long_axis_unconstrained": long_axis_unconstrained,
-            "frames_used": len(centers),
-            "modes": modes,
-        }
-        return live_result_to_measurement(robot, dyn_model, dyn_state, view_rotation, live)
+        return None
 
 
 def wait_for_mobile_command_with_live_view(
