@@ -1,33 +1,29 @@
 #!/usr/bin/env python3
-"""Pick, externally transfer, place, regrasp, and lift the pallet box.
+"""Place a held pallet box, regrasp it, and lift it again.
 
-The initial pick path intentionally mirrors picking_box_5.py, but this file is
-standalone: it does not import picking_box_5.py. After the first lift, another
-system/person can move the robot to the opposite table. This script then places
+This script is standalone: it does not import picking_box_5.py. The default
+entry point assumes another process has already picked the box and moved the
+robot to the opposite table. It starts from the current held-box posture, places
 the box by reversing lift and inward push, waits briefly, regrips, and lifts
-again.
+again. The original vision-based initial pick path is retained only as an
+explicit --initial-pick option.
 
 Default sequence:
   0. gripper_home_open               (Dynamixel homing + continuous max-open hold)
-  1. ready                           (joint position control)
-  2. live vision at ready pose       (D405 + rim-plane estimator, usable center frames)
-  3-4. mobile_base_se2_align         (M-model SE(2), closed loop, yaw + x/y)
-  5. vision_pre_push                 (START_TO_PICKING z/rotation, vision x/y)
-  6. inward y-axis push for pick      (Cartesian impedance control)
-  7. lift picked box                 (Cartesian impedance control)
-  8. external transfer handoff        (operator confirmation or timed wait)
-  9. lower at destination             (reverse lift)
- 10. release push reverse             (exact reverse to inward zero)
- 11. release wait                     (default 1.0 s)
- 12. inward y-axis push for regrasp   (same push distance/ramp)
- 13. lift regrasped box              (same lift height/impedance)
+  1. lower at destination             (reverse lift from current posture)
+  2. release push reverse             (exact reverse to inward zero)
+  3. release wait                     (default 1.0 s)
+  4. inward y-axis push for regrasp   (same push distance/ramp)
+  5. lift regrasped box               (same lift height/impedance)
 
-Pass --pre-push-only to stop at the pose just before the inward y-axis push.
-Pass --pick-only to stop after the first lift.
+Pass --initial-pick to prepend the old picking_box_5-like vision pick path:
+ready -> live vision -> mobile-base align -> vision_pre_push -> inward push ->
+lift -> external transfer -> destination place/regrasp.
 
-Vision input, one of:
-  - default: LIVE capture from the D405 at the pre-push pose (median over
-    LIVE_VISION_FRAMES_NEEDED usable center frames; aborts if not enough).
+When --initial-pick is enabled, vision input is one of:
+  - default with --initial-pick: LIVE capture from the D405 at the pre-push pose
+    (median over LIVE_VISION_FRAMES_NEEDED usable center frames; aborts if not
+    enough).
   - --vision-json <path>: latest record of inference.py --print-json output.
   - --box-center-camera X Y Z: manual center_top_camera_m.
 All are in the cw90 analysis camera frame (see --view-rotation). They are
@@ -1486,6 +1482,52 @@ def capture_live_box_measurement(
         return None
 
     return live_result_to_measurement(robot, dyn_model, dyn_state, view_rotation, live)
+
+
+def requires_live_vision(
+    *,
+    initial_pick: bool,
+    visualize_only: bool,
+    box_center_camera_m: np.ndarray | None,
+) -> bool:
+    """Return whether this run will open the live D405 pipeline."""
+    if visualize_only:
+        return True
+    return bool(initial_pick and box_center_camera_m is None)
+
+
+def preflight_live_vision_dependencies() -> bool:
+    """Fail before robot/gripper setup when the selected mode needs D405 live vision."""
+    if not RIM_PLANE_CONFIG.exists():
+        print(f"Live vision calibration is missing: {RIM_PLANE_CONFIG}")
+        return False
+
+    if str(BOX_PERCEPTION_ROOT) not in sys.path:
+        sys.path.insert(0, str(BOX_PERCEPTION_ROOT))
+
+    try:
+        import cv2 as _cv2  # noqa: F401
+        import pyrealsense2 as _rs  # noqa: F401
+        from box_pose import estimate_plane_box as _estimate_plane_box  # noqa: F401
+        from box_pose import segment_yellow_box as _segment_yellow_box  # noqa: F401
+        from box_pose.visualization import draw_known_size_estimate as _draw_known_size_estimate  # noqa: F401
+        from inference_2 import iter_live_frames as _iter_live_frames  # noqa: F401
+    except ModuleNotFoundError as exc:
+        missing = exc.name or str(exc)
+        if missing == "pyrealsense2":
+            print(
+                "pyrealsense2 is required only for --initial-pick live vision or --visualize-only. "
+                "Default place/regrasp mode does not need vision. Install pyrealsense2 in this "
+                "Python environment, or run without --initial-pick/--visualize-only. For a "
+                "non-live initial pick, provide --vision-json or --box-center-camera."
+            )
+        else:
+            print(f"Live vision dependency is missing: {missing}")
+        return False
+    except ImportError as exc:
+        print(f"Failed to import live vision dependencies: {exc}")
+        return False
+    return True
 
 
 def live_result_to_measurement(
@@ -3667,6 +3709,7 @@ def main(
     address: str,
     model: str,
     power: str,
+    initial_pick: bool,
     box_center_camera_m: np.ndarray | None,
     view_rotation: str,
     approach_time: float,
@@ -3720,6 +3763,12 @@ def main(
     if rby is None:
         print("Failed to import rby1_sdk. Run this script in the RBY1 SDK environment.")
         return False
+    if requires_live_vision(
+        initial_pick=initial_pick,
+        visualize_only=visualize_only,
+        box_center_camera_m=box_center_camera_m,
+    ) and not preflight_live_vision_dependencies():
+        return False
 
     robot = rby.create_robot(address, model)
     robot.connect()
@@ -3770,6 +3819,34 @@ def main(
                 run_forever=True,
             )
             return True
+
+        if not initial_pick:
+            print_stage(
+                "1/5 place_regrasp_only",
+                "skipping initial pick, live vision, and mobile-base alignment; "
+                "starting from the current held-box posture",
+            )
+            if not place_regrasp:
+                print_stage(
+                    "1/5 place_regrasp_only",
+                    "FAILED: --pick-only/--pre-push-only require --initial-pick",
+                )
+                return done
+            if not perform_place_regrasp_sequence(
+                robot,
+                dyn_model,
+                dyn_state,
+                push_ramp_time_sec=push_ramp_time_sec,
+                place_wait_sec=place_wait_sec,
+                command_timeout_margin_sec=command_timeout_margin_sec,
+                min_command_timeout_sec=min_command_timeout_sec,
+            ):
+                return done
+            done = True
+            print("=" * 60)
+            print(f"[picking_and_place] place/regrasp COMPLETED. done = {done}")
+            print("=" * 60)
+            return done
 
         for name, pose in JOINT_SEQUENCE:
             stage = f"1/13 {name}"
@@ -4272,10 +4349,26 @@ def main(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="pick, external-transfer place, regrasp, and lift")
+    parser = argparse.ArgumentParser(description="place a held box, regrasp it, and lift it")
     parser.add_argument("--address", type=str, required=True, help="Robot address")
     parser.add_argument("--model", type=str, default="m", help="Robot Model Name")
     parser.add_argument("--power", type=str, default=".*", help="Power device name regex")
+    parser.set_defaults(initial_pick=False)
+    parser.add_argument(
+        "--initial-pick",
+        dest="initial_pick",
+        action="store_true",
+        help=(
+            "Prepend the vision-based initial pick path before destination place/regrasp. "
+            "Default is place/regrasp-only from the current held-box posture."
+        ),
+    )
+    parser.add_argument(
+        "--place-regrasp-only",
+        dest="initial_pick",
+        action="store_false",
+        help="Skip live vision and initial pick; run only lower, release, wait, regrasp, and lift. This is the default.",
+    )
     parser.add_argument(
         "--box-center-camera",
         type=float,
@@ -4601,26 +4694,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--continue-pick",
         dest="continue_pick",
         action="store_true",
-        help="After reaching pre-push, continue with inward y push and lift. This is now the default.",
+        help="With --initial-pick, continue from pre-push to inward y push and lift. This is the default.",
     )
     parser.add_argument(
         "--pre-push-only",
         dest="continue_pick",
         action="store_false",
-        help="Stop after the vision-adjusted pre-push pose, before y-axis inward push.",
+        help="With --initial-pick, stop after the vision-adjusted pre-push pose, before y-axis inward push.",
     )
     parser.set_defaults(place_regrasp=True)
     parser.add_argument(
         "--full-cycle",
         dest="place_regrasp",
         action="store_true",
-        help="After the first lift, wait for transfer, place, regrasp, and lift again. This is the default.",
+        help="With --initial-pick, after first lift wait for transfer, then place/regrasp/lift. This is the default.",
     )
     parser.add_argument(
         "--pick-only",
         dest="place_regrasp",
         action="store_false",
-        help="Stop after the first inward push and lift; do not run destination place/regrasp.",
+        help="With --initial-pick, stop after first inward push and lift; do not run destination place/regrasp.",
     )
     parser.set_defaults(transfer_confirm=True)
     parser.add_argument(
@@ -4751,6 +4844,7 @@ if __name__ == "__main__":
             address=args.address,
             model=args.model,
             power=args.power,
+            initial_pick=bool(args.initial_pick),
             box_center_camera_m=center_camera,
             view_rotation=args.view_rotation,
             approach_time=float(args.approach_time),
