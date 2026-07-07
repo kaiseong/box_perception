@@ -103,7 +103,9 @@ LIFT_JOINT_STIFFNESS = [300.0] * 7
 LIFT_JOINT_DAMPING_RATIO = 1.0
 # RBY1 M arm effort limits from rby1-sdk/models/rby1m/urdf/model.urdf.
 LIFT_JOINT_TORQUE_LIMIT = [70.0, 70.0, 70.0, 40.0, 10.0, 10.0, 8.0]
-LIFT_HOLD_TIME = 100.0
+# Destination place/regrasp should not wait at a vertical target for the old
+# long "carry" hold. The user-facing wait after release is PLACE_WAIT_AFTER_RELEASE_SEC.
+VERTICAL_MOVE_HOLD_TIME = 0.2
 # CartesianCommandBuilder.add_target's last argument is a DIMENSIONLESS scaling
 # of the internal Cartesian acceleration limits (0.5 = half), NOT m/s^2.
 CARTESIAN_ACCELERATION_LIMIT_SCALING = 0.5
@@ -3523,6 +3525,7 @@ def build_impedance_vertical_command(
     *,
     vertical_delta_m: float,
     label: str,
+    hold_time: float = VERTICAL_MOVE_HOLD_TIME,
 ) -> Any:
     """Move both hands along base z with the same Cartesian impedance style.
 
@@ -3550,7 +3553,7 @@ def build_impedance_vertical_command(
         return (
             rby.CartesianImpedanceControlCommandBuilder()
             .set_command_header(
-                rby.CommandHeaderBuilder().set_control_hold_time(LIFT_HOLD_TIME)
+                rby.CommandHeaderBuilder().set_control_hold_time(float(hold_time))
             )
             .add_target(
                 IMPEDANCE_LIFT_REFERENCE_LINK, link_name, T_target,
@@ -3641,7 +3644,7 @@ def perform_place_regrasp_sequence(
         "9/13 place_lower",
         timeout_sec=stage_timeout_sec(
             LIFT_MINIMUM_TIME,
-            LIFT_HOLD_TIME,
+            VERTICAL_MOVE_HOLD_TIME,
             min_timeout_sec=min_command_timeout_sec,
             margin_sec=command_timeout_margin_sec,
         ),
@@ -3692,7 +3695,7 @@ def perform_place_regrasp_sequence(
         "13/13 regrasp_lift",
         timeout_sec=stage_timeout_sec(
             LIFT_MINIMUM_TIME,
-            LIFT_HOLD_TIME,
+            VERTICAL_MOVE_HOLD_TIME,
             min_timeout_sec=min_command_timeout_sec,
             margin_sec=command_timeout_margin_sec,
         ),
@@ -4298,7 +4301,7 @@ def main(
             "7/13 lift_pick",
             timeout_sec=stage_timeout_sec(
                 LIFT_MINIMUM_TIME,
-                LIFT_HOLD_TIME,
+                VERTICAL_MOVE_HOLD_TIME,
                 min_timeout_sec=min_command_timeout_sec,
                 margin_sec=command_timeout_margin_sec,
             ),

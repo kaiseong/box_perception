@@ -52,6 +52,9 @@ class PickingAndPlaceTests(unittest.TestCase):
 
         self.assertTrue(args.initial_pick)
 
+    def test_vertical_place_hold_does_not_hide_the_one_second_release_wait(self) -> None:
+        self.assertLess(pap.VERTICAL_MOVE_HOLD_TIME, pap.PLACE_WAIT_AFTER_RELEASE_SEC)
+
     def test_push_stream_can_reverse_exact_push_distance(self) -> None:
         inward_targets: list[float] = []
 
@@ -155,11 +158,11 @@ class PickingAndPlaceTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("send", "9/13 place_lower", "lower", 105.5),
+                ("send", "9/13 place_lower", "lower", 8.0),
                 ("stream", "10/13 release_push_reverse", -pap.PUSH_DISTANCE),
                 ("sleep", 1.0),
                 ("stream", "12/13 regrasp_push", pap.PUSH_DISTANCE),
-                ("send", "13/13 regrasp_lift", "lift", 105.5),
+                ("send", "13/13 regrasp_lift", "lift", 8.0),
             ],
         )
 
