@@ -66,6 +66,36 @@ class PickingBox5DebugTests(unittest.TestCase):
         self.assertIn("skipping stationary confirm", servo_source)
         self.assertNotIn("time.sleep(0.3)", servo_source)
 
+    def test_mobile_servo_handoff_keeps_stream_for_pre_push(self) -> None:
+        source = Path(debug.__file__).read_text()
+        servo_start = source.index("def run_mobile_base_visual_servo_alignment(")
+        servo_end = source.index("def run_mobile_base_combined_alignment(", servo_start)
+        servo_source = source[servo_start:servo_end]
+
+        self.assertIn("def stop_thread", source)
+        self.assertIn('"_handoff_stream"', servo_source)
+        self.assertIn('"_handoff_live_view"', servo_source)
+        self.assertIn("commander.stop_thread()", servo_source)
+
+    def test_streamed_pre_push_uses_stream_and_live_vision_gate(self) -> None:
+        source = Path(debug.__file__).read_text()
+        builder_start = source.index("def build_streamed_vision_pre_push_command(")
+        builder_end = source.index("def build_pose_command(", builder_start)
+        builder_source = source[builder_start:builder_end]
+        self.assertIn(".set_body_command(body)", builder_source)
+        self.assertIn(".set_mobility_command(mobility)", builder_source)
+
+        stage_start = source.index('print_stage("5/7 vision_pre_push", "building target")')
+        stage_end = source.index("if not continue_pick:", stage_start)
+        stage_source = source[stage_start:stage_end]
+        handoff_start = stage_source.index("if handoff_stream is not None:")
+        handoff_end = stage_source.index("else:", handoff_start)
+        handoff_source = stage_source[handoff_start:handoff_end]
+
+        self.assertIn("handoff_stream.send_command(command)", handoff_source)
+        self.assertIn("wait_streamed_pre_push_live_vision", handoff_source)
+        self.assertNotIn("send_stage", handoff_source)
+
 
 if __name__ == "__main__":
     unittest.main()
