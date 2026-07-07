@@ -1112,8 +1112,8 @@ def build_mobile_base_velocity_command(
     )
 
 
-VISION_APPROACH_MINIMUM_TIME = 0.4
-VISION_APPROACH_HOLD_TIME = 0.2
+VISION_APPROACH_MINIMUM_TIME = 0.25
+VISION_APPROACH_HOLD_TIME = 0.1
 VISION_APPROACH_MAX_REFERENCE_XY_SHIFT_M = 0.25
 
 # ---- Live vision (default input source) ----
