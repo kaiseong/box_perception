@@ -125,6 +125,34 @@ class PickingBox5CombinedAlignTests(unittest.TestCase):
         self.assertTrue(status["within_safety_band"])
         self.assertFalse(status["within_target_band"])
 
+    def test_se2_residual_status_reports_xy_fallback_need_when_yaw_is_ok(self) -> None:
+        status = pb5.mobile_base_se2_residual_status(
+            measurement(center=(0.475, 0.0, 0.0), yaw_deg=92.0),
+            target_x_m=0.45,
+            x_tolerance_m=0.01,
+            y_tolerance_m=0.01,
+            yaw_tolerance_deg=4.0,
+        )
+
+        self.assertTrue(status["yaw_within_target_band"])
+        self.assertFalse(status["xy_status"]["within_target_band"])
+        self.assertFalse(status["within_target_band"])
+        np.testing.assert_allclose(status["xy_status"]["residual_xy_m"], [0.025, 0.0])
+
+    def test_se2_residual_status_reports_yaw_fallback_need_when_xy_is_ok(self) -> None:
+        status = pb5.mobile_base_se2_residual_status(
+            measurement(center=(0.455, 0.0, 0.0), yaw_deg=99.0),
+            target_x_m=0.45,
+            x_tolerance_m=0.01,
+            y_tolerance_m=0.01,
+            yaw_tolerance_deg=4.0,
+        )
+
+        self.assertFalse(status["yaw_within_target_band"])
+        self.assertTrue(status["xy_status"]["within_target_band"])
+        self.assertFalse(status["within_target_band"])
+        self.assertAlmostEqual(status["residual_yaw_deg"], 9.0)
+
     def test_live_center_cluster_ignores_single_outlier_candidate(self) -> None:
         centers = [
             [0.400, 0.000, 0.100],

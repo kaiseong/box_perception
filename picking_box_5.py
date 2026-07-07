@@ -685,6 +685,36 @@ def is_mobile_base_se2_aligned(
     )
 
 
+def mobile_base_se2_residual_status(
+    measurement: dict[str, Any],
+    *,
+    target_x_m: float = MOBILE_BASE_TARGET_X_M,
+    x_tolerance_m: float = MOBILE_BASE_X_TOLERANCE_M,
+    y_tolerance_m: float = MOBILE_BASE_Y_TOLERANCE_M,
+    yaw_tolerance_deg: float = MOBILE_BASE_YAW_TOLERANCE_DEG,
+    max_residual_xy_m: float = MOBILE_BASE_MAX_RESIDUAL_XY_M,
+) -> dict[str, Any]:
+    """Return yaw and x/y residuals after a combined SE(2) align attempt."""
+    residual_yaw = mobile_base_yaw_alignment_error_deg(measurement)
+    xy_status = mobile_base_xy_residual_status(
+        measurement["center_base_m"],
+        target_x_m=target_x_m,
+        x_tolerance_m=x_tolerance_m,
+        y_tolerance_m=y_tolerance_m,
+        max_residual_xy_m=max_residual_xy_m,
+    )
+    yaw_within_target = (
+        residual_yaw is not None
+        and abs(float(residual_yaw)) <= float(yaw_tolerance_deg) + 1e-9
+    )
+    return {
+        "residual_yaw_deg": residual_yaw,
+        "yaw_within_target_band": bool(yaw_within_target),
+        "xy_status": xy_status,
+        "within_target_band": bool(yaw_within_target and xy_status["within_target_band"]),
+    }
+
+
 def mobile_base_combined_move_plan(
     step_xy_m: Any,
     step_yaw_deg: float,
@@ -3747,49 +3777,65 @@ def main(
                         "FAILED: no fresh vision after base motion; aborting before contact",
                     )
                     return done
-                residual_yaw = mobile_base_yaw_alignment_error_deg(combined_measurement)
+                measurement = combined_measurement
+                residual_status = mobile_base_se2_residual_status(
+                    measurement,
+                    target_x_m=mobile_base_target_x_m,
+                    x_tolerance_m=mobile_base_x_tolerance_m,
+                    y_tolerance_m=mobile_base_y_tolerance_m,
+                    yaw_tolerance_deg=mobile_base_yaw_tolerance_deg,
+                )
+                residual_yaw = residual_status["residual_yaw_deg"]
                 if residual_yaw is None:
                     print_stage(
                         "3-4/7 mobile_base_se2_align",
                         "FAILED: no usable long-axis yaw after alignment; aborting before contact",
                     )
                     return done
-                if abs(float(residual_yaw)) > float(mobile_base_yaw_tolerance_deg):
-                    print_stage(
-                        "3-4/7 mobile_base_se2_align",
-                        "FAILED: residual yaw error "
-                        f"{residual_yaw:+.2f}deg exceeds {mobile_base_yaw_tolerance_deg:.1f}deg; "
-                        "aborting before contact",
-                    )
-                    return done
-                xy_status = mobile_base_xy_residual_status(
-                    combined_measurement["center_base_m"],
-                    target_x_m=mobile_base_target_x_m,
-                    x_tolerance_m=mobile_base_x_tolerance_m,
-                    y_tolerance_m=mobile_base_y_tolerance_m,
-                )
+                yaw_ok = bool(residual_status["yaw_within_target_band"])
+                xy_status = residual_status["xy_status"]
+                xy_ok = bool(xy_status["within_target_band"])
                 residual_xy = np.asarray(xy_status["residual_xy_m"], dtype=np.float64)
-                if not bool(xy_status["within_target_band"]):
-                    if bool(xy_status["within_safety_band"]):
-                        reason = (
-                            f"outside target band x±{mobile_base_x_tolerance_m * 100:.1f}cm "
-                            f"y±{mobile_base_y_tolerance_m * 100:.1f}cm"
+                if yaw_ok and xy_ok:
+                    print_stage(
+                        "3-4/7 mobile_base_se2_align",
+                        "combined residuals accepted: "
+                        f"x={residual_xy[0] * 100:+.1f}cm y={residual_xy[1] * 100:+.1f}cm "
+                        f"yaw={float(residual_yaw):+.2f}deg",
+                    )
+                    mobile_base_yaw_align = False
+                    mobile_base_align = False
+                else:
+                    retry_reasons = []
+                    if not yaw_ok:
+                        retry_reasons.append(
+                            f"yaw={float(residual_yaw):+.2f}deg "
+                            f"> {mobile_base_yaw_tolerance_deg:.1f}deg"
                         )
-                    else:
-                        reason = (
-                            f"exceeds safety band {MOBILE_BASE_MAX_RESIDUAL_XY_M * 100:.0f}cm; "
-                            "re-approach with the mobile base"
+                    if not xy_ok:
+                        if bool(xy_status["within_safety_band"]):
+                            xy_reason = (
+                                f"outside target x±{mobile_base_x_tolerance_m * 100:.1f}cm "
+                                f"y±{mobile_base_y_tolerance_m * 100:.1f}cm"
+                            )
+                        else:
+                            xy_reason = (
+                                f"outside safety {MOBILE_BASE_MAX_RESIDUAL_XY_M * 100:.0f}cm"
+                            )
+                        retry_reasons.append(
+                            f"x={residual_xy[0] * 100:+.1f}cm "
+                            f"y={residual_xy[1] * 100:+.1f}cm ({xy_reason})"
                         )
                     print_stage(
                         "3-4/7 mobile_base_se2_align",
-                        "FAILED: residual error "
-                        f"x={residual_xy[0] * 100:+.1f}cm y={residual_xy[1] * 100:+.1f}cm "
-                        f"{reason}; aborting before contact",
+                        "combined residual not accepted; trying separate align before contact: "
+                        + "; ".join(retry_reasons),
                     )
-                    return done
-                measurement = combined_measurement
-                mobile_base_yaw_align = False
-                mobile_base_align = False
+                    # If yaw was off, yaw motion can disturb x/y, so run x/y
+                    # after yaw as a final contact gate even when x/y was
+                    # already inside the target band at this checkpoint.
+                    mobile_base_yaw_align = not yaw_ok
+                    mobile_base_align = (not xy_ok) or (not yaw_ok)
             if mobile_base_yaw_align and str(model).lower() == "m":
                 print_stage(
                     "3/7 mobile_base_yaw_align",
