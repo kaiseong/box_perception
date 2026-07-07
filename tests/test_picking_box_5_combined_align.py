@@ -37,6 +37,37 @@ def measurement(*, center: tuple[float, float, float], yaw_deg: float) -> dict:
 
 
 class PickingBox5CombinedAlignTests(unittest.TestCase):
+    def test_fast_default_timing_parameters_are_exposed_by_cli(self) -> None:
+        args = pb5.parse_args(["--address", "localhost:50051"])
+
+        self.assertEqual(args.live_vision_frames, 3)
+        self.assertEqual(args.servo_settled_frames, 3)
+        self.assertAlmostEqual(args.servo_kp_xy, 1.1)
+        self.assertAlmostEqual(args.servo_kp_yaw, 1.3)
+        self.assertAlmostEqual(args.mobile_base_max_speed_mps, 0.10)
+        self.assertAlmostEqual(args.mobile_base_yaw_max_speed_radps, 0.4)
+        self.assertAlmostEqual(args.vision_pre_push_linear_velocity_limit, 0.60)
+        self.assertAlmostEqual(args.vision_pre_push_angular_velocity_limit, np.pi / 2)
+        self.assertAlmostEqual(args.vision_pre_push_acceleration_limit_scaling, 0.80)
+
+    def test_vision_pre_push_speed_limits_can_be_overridden(self) -> None:
+        args = pb5.parse_args(
+            [
+                "--address",
+                "localhost:50051",
+                "--vision-pre-push-linear-velocity-limit",
+                "0.45",
+                "--vision-pre-push-angular-velocity-limit",
+                "1.2",
+                "--vision-pre-push-acceleration-limit-scaling",
+                "0.6",
+            ]
+        )
+
+        self.assertAlmostEqual(args.vision_pre_push_linear_velocity_limit, 0.45)
+        self.assertAlmostEqual(args.vision_pre_push_angular_velocity_limit, 1.2)
+        self.assertAlmostEqual(args.vision_pre_push_acceleration_limit_scaling, 0.6)
+
     def test_combined_plan_moves_xy_even_when_yaw_is_coarse_by_default(self) -> None:
         plan = pb5.mobile_base_combined_alignment_plan(
             measurement(center=(0.52, 0.03, 0.0), yaw_deg=105.0),

@@ -60,6 +60,9 @@ BASE_INDEX, TORSO_INDEX, EE_RIGHT_INDEX, EE_LEFT_INDEX, HEAD2_INDEX = 0, 1, 2, 3
 VISION_PRE_PUSH_REFERENCE_LINK = "base"
 VISION_PRE_PUSH_REFERENCE_INDEX = BASE_INDEX
 VISION_PRE_PUSH_HAND_Y_MARGIN_M = 0.05
+VISION_PRE_PUSH_LINEAR_VELOCITY_LIMIT = 0.60
+VISION_PRE_PUSH_ANGULAR_VELOCITY_LIMIT = float(np.pi / 2)
+VISION_PRE_PUSH_ACCELERATION_LIMIT_SCALING = 0.80
 
 # ---- Cartesian impedance "push inward" parameters ----
 # Use the same torso-tip reference as the baseline picking_box.py push. The
@@ -132,13 +135,13 @@ MOBILE_BASE_ALIGN_DEFAULT = True
 MOBILE_BASE_TARGET_X_M = 0.45
 MOBILE_BASE_X_TOLERANCE_M = 0.01
 MOBILE_BASE_Y_TOLERANCE_M = 0.01
-MOBILE_BASE_MAX_SPEED_MPS = 0.08
+MOBILE_BASE_MAX_SPEED_MPS = 0.10
 MOBILE_BASE_MAX_STEP_M = 0.06
 MOBILE_BASE_MAX_ITERATIONS = 8
 MOBILE_BASE_YAW_ALIGN_DEFAULT = True
 MOBILE_BASE_YAW_TARGET_DEG = 90.0
 MOBILE_BASE_YAW_TOLERANCE_DEG = 4.0
-MOBILE_BASE_YAW_MAX_SPEED_RADPS = 0.3
+MOBILE_BASE_YAW_MAX_SPEED_RADPS = 0.4
 MOBILE_BASE_YAW_MAX_STEP_DEG = 20.0
 MOBILE_BASE_YAW_MAX_ITERATIONS = 8
 MOBILE_BASE_YAW_TOTAL_TIMEOUT_SEC = 30.0
@@ -155,9 +158,9 @@ MOBILE_BASE_COMBINED_COARSE_YAW_THRESHOLD_DEG = 90.0
 # MOBILE_BASE_YAW_MAX_SPEED_RADPS; when a cap binds, v and omega are scaled
 # by the SAME factor so the orbit geometry is preserved.
 SERVO_ALIGN_DEFAULT = True
-SERVO_KP_XY = 0.8               # 1/s: proportional gain, tapers speed near target
-SERVO_KP_YAW = 1.0              # 1/s
-SERVO_SETTLED_FRAMES = 5        # consecutive in-tolerance frames to finish
+SERVO_KP_XY = 1.1               # 1/s: proportional gain, tapers speed near target
+SERVO_KP_YAW = 1.3              # 1/s
+SERVO_SETTLED_FRAMES = 3        # consecutive in-tolerance frames to finish
 SERVO_TOTAL_TIMEOUT_SEC = 40.0
 SERVO_UNUSABLE_DECAY = 0.5      # velocity decay per unusable frame
 SERVO_NO_MEASUREMENT_STOP_SEC = 1.0
@@ -1085,6 +1088,9 @@ def build_dual_target_cartesian_command(
     left_target: np.ndarray,
     minimum_time: float,
     hold_time: float,
+    linear_velocity_limit: float = LIFT_LINEAR_VELOCITY_LIMIT,
+    angular_velocity_limit: float = LIFT_ANGULAR_VELOCITY_LIMIT,
+    acceleration_limit_scaling: float = CARTESIAN_ACCELERATION_LIMIT_SCALING,
 ) -> Any:
     """Build one synchronized arm-only command with independent EEF targets.
 
@@ -1100,9 +1106,9 @@ def build_dual_target_cartesian_command(
                 reference_link,
                 link_name,
                 target,
-                LIFT_LINEAR_VELOCITY_LIMIT,
-                LIFT_ANGULAR_VELOCITY_LIMIT,
-                CARTESIAN_ACCELERATION_LIMIT_SCALING,
+                float(linear_velocity_limit),
+                float(angular_velocity_limit),
+                float(acceleration_limit_scaling),
             )
             .set_minimum_time(minimum_time)
         )
@@ -1153,7 +1159,7 @@ BOX_PERCEPTION_ROOT = Path(__file__).resolve().parent
 RIM_PLANE_CONFIG = BOX_PERCEPTION_ROOT / "config_2" / "rim_plane.json"
 CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS = 1280, 720, 30
 # The box is static, so a few confident frames (median) reject one-off noise.
-LIVE_VISION_FRAMES_NEEDED = 5
+LIVE_VISION_FRAMES_NEEDED = 3
 LIVE_VISION_TIMEOUT_SEC = 10.0
 LIVE_VISION_MAX_CENTER_SPREAD_M = 0.025
 LIVE_VISION_CENTER_ONLY_ALLOWED_REASONS = {
@@ -2184,6 +2190,9 @@ def build_vision_pre_push_command(
     max_reference_xy_shift_m: float | None,
     midpoint_offset_xy_m: tuple[float, float],
     drop_delta_axis_base_xy: np.ndarray | None = None,
+    linear_velocity_limit: float = VISION_PRE_PUSH_LINEAR_VELOCITY_LIMIT,
+    angular_velocity_limit: float = VISION_PRE_PUSH_ANGULAR_VELOCITY_LIMIT,
+    acceleration_limit_scaling: float = VISION_PRE_PUSH_ACCELERATION_LIMIT_SCALING,
 ) -> Any:
     targets = vision_pre_push_targets(
         dyn_model,
@@ -2248,6 +2257,9 @@ def build_vision_pre_push_command(
         left_target=targets["left_target"],
         minimum_time=approach_time,
         hold_time=hold_time,
+        linear_velocity_limit=linear_velocity_limit,
+        angular_velocity_limit=angular_velocity_limit,
+        acceleration_limit_scaling=acceleration_limit_scaling,
     )
 
 
@@ -3545,6 +3557,9 @@ def main(
     view_rotation: str,
     approach_time: float,
     hold_time: float,
+    vision_pre_push_linear_velocity_limit: float,
+    vision_pre_push_angular_velocity_limit: float,
+    vision_pre_push_acceleration_limit_scaling: float,
     max_reference_xy_shift_m: float | None,
     midpoint_offset_xy_m: tuple[float, float],
     live_vision_frames_needed: int,
@@ -4057,6 +4072,9 @@ def main(
             box_center_base_m,
             approach_time=approach_time,
             hold_time=hold_time,
+            linear_velocity_limit=vision_pre_push_linear_velocity_limit,
+            angular_velocity_limit=vision_pre_push_angular_velocity_limit,
+            acceleration_limit_scaling=vision_pre_push_acceleration_limit_scaling,
             max_reference_xy_shift_m=max_reference_xy_shift_m,
             midpoint_offset_xy_m=midpoint_offset_xy_m,
             drop_delta_axis_base_xy=drop_delta_axis_base_xy,
@@ -4168,6 +4186,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=VISION_APPROACH_HOLD_TIME,
         help="Control hold time for the vision-adjusted pre-push command.",
+    )
+    parser.add_argument(
+        "--vision-pre-push-linear-velocity-limit",
+        type=float,
+        default=VISION_PRE_PUSH_LINEAR_VELOCITY_LIMIT,
+        help="Cartesian linear velocity limit for the vision_pre_push arm motion.",
+    )
+    parser.add_argument(
+        "--vision-pre-push-angular-velocity-limit",
+        type=float,
+        default=VISION_PRE_PUSH_ANGULAR_VELOCITY_LIMIT,
+        help="Cartesian angular velocity limit in rad/s for the vision_pre_push arm motion.",
+    )
+    parser.add_argument(
+        "--vision-pre-push-acceleration-limit-scaling",
+        type=float,
+        default=VISION_PRE_PUSH_ACCELERATION_LIMIT_SCALING,
+        help="Dimensionless Cartesian acceleration scaling for the vision_pre_push arm motion.",
     )
     parser.add_argument(
         "--max-reference-xy-shift-m",
@@ -4502,6 +4538,12 @@ def run_cli(argv: list[str] | None = None) -> int:
         raise SystemExit("--command-timeout-margin-sec must be non-negative")
     if args.min_command_timeout_sec <= 0.0:
         raise SystemExit("--min-command-timeout-sec must be positive")
+    if args.vision_pre_push_linear_velocity_limit <= 0.0:
+        raise SystemExit("--vision-pre-push-linear-velocity-limit must be positive")
+    if args.vision_pre_push_angular_velocity_limit <= 0.0:
+        raise SystemExit("--vision-pre-push-angular-velocity-limit must be positive")
+    if args.vision_pre_push_acceleration_limit_scaling <= 0.0:
+        raise SystemExit("--vision-pre-push-acceleration-limit-scaling must be positive")
     if args.mobile_base_yaw_tolerance_deg <= 0.0:
         raise SystemExit("--mobile-base-yaw-tolerance-deg must be positive")
     if args.mobile_base_yaw_max_speed_radps <= 0.0:
@@ -4570,6 +4612,11 @@ def run_cli(argv: list[str] | None = None) -> int:
         view_rotation=args.view_rotation,
         approach_time=float(args.approach_time),
         hold_time=float(args.hold_time),
+        vision_pre_push_linear_velocity_limit=float(args.vision_pre_push_linear_velocity_limit),
+        vision_pre_push_angular_velocity_limit=float(args.vision_pre_push_angular_velocity_limit),
+        vision_pre_push_acceleration_limit_scaling=float(
+            args.vision_pre_push_acceleration_limit_scaling
+        ),
         max_reference_xy_shift_m=max_shift,
         midpoint_offset_xy_m=midpoint_offset_xy,
         live_vision_frames_needed=int(args.live_vision_frames),
