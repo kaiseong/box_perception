@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import io
+import ast
+from pathlib import Path
+import sys
+from types import SimpleNamespace
 import unittest
 
-from picking_box_5_debug import StageDurationPrinter
+sys.modules.setdefault("rby1_sdk", SimpleNamespace())
+
+import picking_box_5_debug as debug
 
 
 class FakeClock:
@@ -21,7 +27,7 @@ class PickingBox5DebugTests(unittest.TestCase):
     def test_stage_duration_printer_outputs_only_stage_seconds(self) -> None:
         output = io.StringIO()
         clock = FakeClock()
-        timer = StageDurationPrinter(output=output, clock=clock)
+        timer = debug.StageDurationPrinter(output=output, clock=clock)
 
         timer.mark("2/7 live_vision", "capturing")
         clock.advance(0.25)
@@ -38,6 +44,27 @@ class PickingBox5DebugTests(unittest.TestCase):
                 "[timing] 3-4/7 mobile_base_se2_align: 1.500s",
             ],
         )
+
+    def test_debug_script_is_standalone(self) -> None:
+        source = Path(debug.__file__).read_text()
+        tree = ast.parse(source)
+        imports = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imports.append(node.module)
+
+        self.assertNotIn("picking_box_5", imports)
+
+    def test_mobile_servo_skips_stationary_confirm(self) -> None:
+        source = Path(debug.__file__).read_text()
+        servo_start = source.index("def run_mobile_base_visual_servo_alignment(")
+        servo_end = source.index("def run_mobile_base_combined_alignment(", servo_start)
+        servo_source = source[servo_start:servo_end]
+
+        self.assertIn("skipping stationary confirm", servo_source)
+        self.assertNotIn("time.sleep(0.3)", servo_source)
 
 
 if __name__ == "__main__":
