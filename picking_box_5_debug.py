@@ -82,6 +82,15 @@ class StageDurationPrinter:
 
 _STAGE_DURATION_PRINTER = StageDurationPrinter()
 
+# Substrings that mark a stage message as a failure that must stay visible even
+# in timing-only mode. Silent failures made the robot "not move with no logs".
+STAGE_FAILURE_KEYWORDS = ("fail", "abort", "cancel")
+
+
+def stage_message_is_failure(message: str) -> bool:
+    lowered = message.lower()
+    return any(keyword in lowered for keyword in STAGE_FAILURE_KEYWORDS)
+
 
 def _debug_silent_print(*_args: Any, **_kwargs: Any) -> None:
     """Suppress normal picking_box_5 logs in this timing-only debug script."""
@@ -1070,19 +1079,15 @@ class MobileBaseServoCommandStreamer:
             self._omega = float(omega)
             self._last_update = time.monotonic()
 
-    def stop_thread(self) -> None:
-        """Stop only the fixed-rate sender thread while keeping the stream usable."""
+    def stop(self, *, zero_repeats: int = MOBILE_BASE_STOP_REPEATS) -> None:
         with self._lock:
             self._velocity_xy = np.zeros(2, dtype=np.float64)
             self._omega = 0.0
             self._running = False
         if self._thread is not None:
-            self._thread.join(timeout=max(0.2, self.period_sec * 5.0))
+            self._thread.join(timeout=max(1.0, self.period_sec * 5.0))
             if self._thread.is_alive():
                 raise TimeoutError("mobile-base servo stream thread did not stop before timeout")
-
-    def stop(self, *, zero_repeats: int = MOBILE_BASE_STOP_REPEATS) -> None:
-        self.stop_thread()
         for _ in range(max(1, int(zero_repeats))):
             self._send_once(np.zeros(2, dtype=np.float64), 0.0)
             time.sleep(self.period_sec)
@@ -1127,7 +1132,7 @@ class UserAbortRequested(Exception):
     """Operator requested abort from the live vision window."""
 
 
-def build_dual_target_cartesian_body_command(
+def build_dual_target_cartesian_command(
     *,
     reference_link: str,
     right_target: np.ndarray,
@@ -1138,12 +1143,12 @@ def build_dual_target_cartesian_body_command(
     angular_velocity_limit: float = LIFT_ANGULAR_VELOCITY_LIMIT,
     acceleration_limit_scaling: float = CARTESIAN_ACCELERATION_LIMIT_SCALING,
 ) -> Any:
-    """Build one synchronized right/left arm body command with independent EEF targets.
+    """Build one synchronized arm-only command with independent EEF targets.
 
     Rotation, crop offset, or asymmetric hand placement should be handled by
     computing different `right_target` / `left_target` transforms. They are sent
-    together as right/left arm-component commands so torso and head are not
-    used to satisfy the Cartesian targets.
+    together in one RobotCommand, but as right/left arm-component commands so
+    torso and head are not used to satisfy the Cartesian targets.
     """
     def arm_cartesian_command(link_name: str, target: np.ndarray) -> Any:
         command = (
@@ -1164,54 +1169,12 @@ def build_dual_target_cartesian_body_command(
             )
         return command
 
-    return (
-        rby.BodyComponentBasedCommandBuilder()
-        .set_right_arm_command(arm_cartesian_command("ee_right", right_target))
-        .set_left_arm_command(arm_cartesian_command("ee_left", left_target))
-    )
-
-
-def build_dual_target_cartesian_command(
-    *,
-    reference_link: str,
-    right_target: np.ndarray,
-    left_target: np.ndarray,
-    minimum_time: float,
-    hold_time: float,
-    linear_velocity_limit: float = LIFT_LINEAR_VELOCITY_LIMIT,
-    angular_velocity_limit: float = LIFT_ANGULAR_VELOCITY_LIMIT,
-    acceleration_limit_scaling: float = CARTESIAN_ACCELERATION_LIMIT_SCALING,
-) -> Any:
-    """Build one synchronized arm-only RobotCommand."""
     return rby.RobotCommandBuilder().set_command(
         rby.ComponentBasedCommandBuilder().set_body_command(
-            build_dual_target_cartesian_body_command(
-                reference_link=reference_link,
-                right_target=right_target,
-                left_target=left_target,
-                minimum_time=minimum_time,
-                hold_time=hold_time,
-                linear_velocity_limit=linear_velocity_limit,
-                angular_velocity_limit=angular_velocity_limit,
-                acceleration_limit_scaling=acceleration_limit_scaling,
-            )
+            rby.BodyComponentBasedCommandBuilder()
+            .set_right_arm_command(arm_cartesian_command("ee_right", right_target))
+            .set_left_arm_command(arm_cartesian_command("ee_left", left_target))
         )
-    )
-
-
-def build_zero_mobile_base_velocity_command(
-    *,
-    minimum_time: float,
-    control_hold_time: float,
-) -> Any:
-    """Build the mobility component that keeps the M base stopped on a shared stream."""
-    return (
-        rby.SE2VelocityCommandBuilder()
-        .set_command_header(
-            rby.CommandHeaderBuilder().set_control_hold_time(float(control_hold_time))
-        )
-        .set_minimum_time(float(minimum_time))
-        .set_velocity(np.zeros(2, dtype=np.float64), 0.0)
     )
 
 
@@ -1236,37 +1199,9 @@ def build_mobile_base_velocity_command(
     )
 
 
-def close_streamed_mobile_handoff(measurement: dict[str, Any], *, stage: str) -> None:
-    """Release a debug-only mobile stream/live-view handoff that will not be used."""
-    stream = measurement.pop("_handoff_stream", None)
-    live_view = measurement.pop("_handoff_live_view", None)
-    if stream is not None:
-        try:
-            stream.send_command(
-                build_mobile_base_velocity_command(
-                    np.zeros(2, dtype=np.float64),
-                    angular_velocity_radps=0.0,
-                    minimum_time=MOBILE_BASE_STREAM_PERIOD_SEC,
-                    control_hold_time=SERVO_COMMAND_HOLD_TIME_SEC,
-                )
-            )
-        except Exception as exc:  # pragma: no cover - SDK/hardware dependent
-            print_stage(stage, f"mobile handoff zero send failed during cleanup: {exc}")
-    if live_view is not None:
-        try:
-            live_view.close()
-        except Exception as exc:  # pragma: no cover - GUI/camera dependent
-            print_stage(stage, f"mobile handoff live-view close failed during cleanup: {exc}")
-
-
 VISION_APPROACH_MINIMUM_TIME = 0.25
 VISION_APPROACH_HOLD_TIME = 0.1
 VISION_APPROACH_MAX_REFERENCE_XY_SHIFT_M = 0.25
-STREAMED_PRE_PUSH_EXTRA_WAIT_SEC = 0.15
-STREAMED_PRE_PUSH_VISION_TIMEOUT_SEC = 0.35
-STREAMED_PRE_PUSH_EEF_TIMEOUT_SEC = 2.0
-STREAMED_PRE_PUSH_EEF_POSITION_TOLERANCE_M = 0.02
-STREAMED_PRE_PUSH_EEF_ROTATION_TOLERANCE_DEG = 8.0
 
 # ---- Live vision (default input source) ----
 # Rim-plane estimator stack (box_pose/, replay_recording.py) and the stored
@@ -1686,65 +1621,6 @@ def live_estimate_to_measurement(
     return live_result_to_measurement(robot, dyn_model, dyn_state, view_rotation, live)
 
 
-def synced_servo_sample_to_measurement(
-    sample: dict[str, Any],
-    *,
-    center_base_m: Any | None = None,
-    frames_used: int = 1,
-) -> dict[str, Any] | None:
-    """Convert one synced servo sample into the normal measurement schema.
-
-    This debug script intentionally skips the production stationary recapture
-    after mobile-base servoing. The sample already contains the camera->base
-    transform captured before the estimator ran, so it is the lowest-latency
-    measurement available at the mobile-to-approach transition.
-    """
-    estimate = sample.get("estimate")
-    camera_to_base = sample.get("camera_to_base")
-    q = sample.get("q")
-    if estimate is None or camera_to_base is None or q is None:
-        return None
-    if estimate.center_top_camera_m is None:
-        return None
-
-    T_base = np.asarray(camera_to_base, dtype=np.float64)
-    if center_base_m is None:
-        if sample.get("center_base_m") is None:
-            return None
-        center_base = np.asarray(sample["center_base_m"], dtype=np.float64)
-    else:
-        center_base = np.asarray(center_base_m, dtype=np.float64)
-    if center_base.shape[0] < 3 or not np.all(np.isfinite(center_base[:3])):
-        return None
-    center_base = center_base[:3].astype(np.float64, copy=True)
-
-    center_camera = (np.linalg.inv(T_base) @ np.append(center_base, 1.0))[:3]
-    support = estimate.support if estimate.support else {}
-    long_axis_camera = support.get("long_axis_camera")
-    axis_unconstrained = (
-        not estimate.confidence.ok
-        and "long_axis_center_underconstrained" in estimate.failure_reasons
-    )
-    drop_delta_axis_base_xy = None
-    if axis_unconstrained and long_axis_camera is not None:
-        axis_base = T_base[:3, :3] @ np.asarray(long_axis_camera, dtype=np.float64)
-        drop_delta_axis_base_xy = axis_base[:2]
-
-    return {
-        "q": q,
-        "camera_to_base": T_base,
-        "center_camera_m": center_camera,
-        "center_base_m": center_base,
-        "center_spread_m": 0.0,
-        "long_axis_camera": long_axis_camera,
-        "long_axis_unconstrained": axis_unconstrained,
-        "drop_delta_axis_base_xy": drop_delta_axis_base_xy,
-        "frames_used": max(1, int(frames_used)),
-        "candidate_frames": max(1, int(frames_used)),
-        "modes": [sample.get("mode", "servo_synced")],
-    }
-
-
 class ContinuousLiveBoxView:
     """Keep the D405 vision window alive during closed-loop base alignment."""
 
@@ -1899,7 +1775,6 @@ class ContinuousLiveBoxView:
             "usable": usable,
             "mode": mode,
             "estimate": estimate,
-            "q": q,
             "camera_to_base": T_base,
             "center_base_m": center_base,
             "long_axis_base": axis_base,
@@ -2439,68 +2314,6 @@ def build_vision_pre_push_command(
     )
 
 
-def build_streamed_vision_pre_push_command(
-    dyn_model: Any,
-    dyn_state: Any,
-    robot_model: Any,
-    q_template: np.ndarray,
-    box_center_base_m: np.ndarray,
-    *,
-    approach_time: float,
-    hold_time: float,
-    max_reference_xy_shift_m: float | None,
-    midpoint_offset_xy_m: tuple[float, float],
-    drop_delta_axis_base_xy: np.ndarray | None = None,
-    linear_velocity_limit: float = VISION_PRE_PUSH_LINEAR_VELOCITY_LIMIT,
-    angular_velocity_limit: float = VISION_PRE_PUSH_ANGULAR_VELOCITY_LIMIT,
-    acceleration_limit_scaling: float = VISION_PRE_PUSH_ACCELERATION_LIMIT_SCALING,
-) -> tuple[Any, dict[str, Any]]:
-    """Build vision_pre_push as a shared-stream body + zero-mobility command."""
-    targets = vision_pre_push_targets(
-        dyn_model,
-        dyn_state,
-        robot_model,
-        q_template,
-        box_center_base_m,
-        midpoint_offset_xy_m=midpoint_offset_xy_m,
-        drop_delta_axis_base_xy=drop_delta_axis_base_xy,
-    )
-
-    xy_delta = targets["xy_delta"]
-    xy_shift = float(np.linalg.norm(xy_delta))
-    if max_reference_xy_shift_m is not None and xy_shift > max_reference_xy_shift_m:
-        raise ValueError(
-            "vision x/y shift is too large: "
-            f"{xy_shift:.3f} m > {max_reference_xy_shift_m:.3f} m. "
-            "Re-run with --allow-large-vision-shift or a larger --max-reference-xy-shift-m "
-            "only after checking the vision estimate."
-        )
-
-    body = build_dual_target_cartesian_body_command(
-        reference_link=VISION_PRE_PUSH_REFERENCE_LINK,
-        right_target=targets["right_target"],
-        left_target=targets["left_target"],
-        minimum_time=approach_time,
-        hold_time=hold_time,
-        linear_velocity_limit=linear_velocity_limit,
-        angular_velocity_limit=angular_velocity_limit,
-        acceleration_limit_scaling=acceleration_limit_scaling,
-    )
-    mobility = build_zero_mobile_base_velocity_command(
-        minimum_time=max(float(approach_time), MOBILE_BASE_STREAM_PERIOD_SEC),
-        control_hold_time=max(
-            float(hold_time) + STREAMED_PRE_PUSH_EXTRA_WAIT_SEC,
-            SERVO_COMMAND_HOLD_TIME_SEC,
-        ),
-    )
-    command = rby.RobotCommandBuilder().set_command(
-        rby.ComponentBasedCommandBuilder()
-        .set_body_command(body)
-        .set_mobility_command(mobility)
-    )
-    return command, targets
-
-
 def build_pose_command(pose: dict[str, list[float]], minimum_time: float) -> Any:
     """Build a one-shot joint position command for torso, both arms, and head."""
     return rby.RobotCommandBuilder().set_command(
@@ -2534,8 +2347,11 @@ def build_pose_command(pose: dict[str, list[float]], minimum_time: float) -> Any
 
 
 def print_stage(stage: str, message: str) -> None:
-    """Mark a stage boundary; timing debug output prints elapsed seconds only."""
+    """Mark a stage boundary for timing; failures always stay visible on stderr."""
     _STAGE_DURATION_PRINTER.mark(stage, message)
+    if stage_message_is_failure(message):
+        sys.stderr.write(f"[stage] {stage} | {message}\n")
+        sys.stderr.flush()
 
 
 def finish_stage_timing() -> None:
@@ -3153,14 +2969,13 @@ def run_mobile_base_visual_servo_alignment(
     a P-control velocity with the omega x r orbit feedforward. A separate
     fixed-rate command sender streams the latest command with a short hold time
     so D405 processing stalls do not leave a stale nonzero command active.
-    Debug difference from picking_box_5.py: after servo stop this returns the
-    last settled synced sample instead of sleeping and recapturing stationary
-    frames, so the mobile-to-approach handoff latency is visible. `measurement`
-    seeds nothing but logging; the loop trusts only its own fresh frames.
+    Ends with a STATIONARY confirm measurement (median + spread
+    gate) that the caller's residual gates consume, so contact decisions never
+    rest on an in-motion sample. `measurement` seeds nothing but logging; the
+    loop trusts only its own fresh frames.
     """
     del measurement  # servoing must not act on a pre-motion sample
     live_view = ContinuousLiveBoxView(view_rotation, show=visualize)
-    close_live_view_on_exit = True
     guard = ServoDivergenceGuard()
     try:
         try:
@@ -3188,9 +3003,6 @@ def run_mobile_base_visual_servo_alignment(
         next_log = start + COMMAND_WAIT_LOG_INTERVAL_SEC
         error_xy = np.array([float("nan"), float("nan")])
         yaw_error: float | None = None
-        latest_synced_measurement: dict[str, Any] | None = None
-        settled_synced_measurement: dict[str, Any] | None = None
-        stream_handoff_ready = False
 
         try:
             while True:
@@ -3199,7 +3011,7 @@ def run_mobile_base_visual_servo_alignment(
                     return None
                 now = time.monotonic()
                 if now >= deadline:
-                    print_stage(stage, "servo timeout; stopping for synced-frame handoff")
+                    print_stage(stage, "servo timeout; stopping for stationary confirm")
                     outcome = "timeout"
                     break
 
@@ -3253,11 +3065,6 @@ def run_mobile_base_visual_servo_alignment(
                             center_base = np.asarray(filtered["center_base_m"], dtype=np.float64)
                             error_xy = np.asarray(filtered["error_xy_m"], dtype=np.float64)
                             yaw_error = float(filtered["yaw_error_deg"])
-                            latest_synced_measurement = synced_servo_sample_to_measurement(
-                                sample,
-                                center_base_m=center_base,
-                                frames_used=filter_window_frames,
-                            )
                 if usable:
                     aligned = (
                         abs(float(error_xy[0])) <= float(x_tolerance_m) + 1e-9
@@ -3276,7 +3083,6 @@ def run_mobile_base_visual_servo_alignment(
                                 f"({settled} consecutive frames)",
                             )
                             outcome = "settled"
-                            settled_synced_measurement = latest_synced_measurement
                             commander.update(np.zeros(2, dtype=np.float64), 0.0)
                             break
                     else:
@@ -3335,39 +3141,22 @@ def run_mobile_base_visual_servo_alignment(
                     )
                     next_log = now + COMMAND_WAIT_LOG_INTERVAL_SEC
         finally:
-            # Settled debug handoff keeps the SDK stream and live view alive so
-            # vision_pre_push can run on the same stream without a FinishCode wait.
-            # All other exits use the full stop path.
+            # Guaranteed stop, even on exceptions/aborts; cancel_control is the
+            # backstop when the stream itself is broken.
             try:
-                if settled_synced_measurement is not None:
-                    commander.stop_thread()
-                    stream_handoff_ready = True
-                    print_stage(stage, f"servo sender paused for stream handoff; sends={commander.send_count}")
-                else:
-                    commander.stop()
-                    print_stage(stage, f"servo stream stop sent; sends={commander.send_count}")
+                commander.stop()
+                print_stage(stage, f"servo stream stop sent; sends={commander.send_count}")
             except Exception as exc:  # pragma: no cover - SDK/hardware dependent
-                settled_synced_measurement = None
                 print_stage(stage, f"stop send failed ({exc}); calling robot.cancel_control()")
                 try:
                     robot.cancel_control()
                 except Exception as cancel_exc:
                     print_stage(stage, f"robot.cancel_control() failed: {cancel_exc}")
 
-        # Debug-only fast handoff: skip the production stationary recapture so
-        # this script measures the controller-transition gap directly.
-        if settled_synced_measurement is not None:
-            print_stage(stage, "using last settled synced frame; skipping stationary confirm")
-            if stream_handoff_ready:
-                settled_synced_measurement["_handoff_stream"] = stream
-                settled_synced_measurement["_handoff_live_view"] = live_view
-                close_live_view_on_exit = False
-            return settled_synced_measurement
-        if latest_synced_measurement is not None:
-            print_stage(stage, f"{outcome}; using latest synced frame; skipping stationary confirm")
-            return latest_synced_measurement
-
-        print_stage(stage, f"{outcome}; no synced frame available; fallback recapture")
+        # Stationary confirm: contact decisions use a settled median with the
+        # spread gate, never an in-motion sample.
+        time.sleep(0.3)
+        print_stage(stage, f"stationary confirm after servo ({outcome})")
         return live_view.collect_measurement(
             robot,
             dyn_model,
@@ -3379,151 +3168,7 @@ def run_mobile_base_visual_servo_alignment(
             stage=stage,
         )
     finally:
-        if close_live_view_on_exit:
-            live_view.close()
-
-
-def wait_streamed_pre_push_live_vision(
-    robot: Any,
-    dyn_model: Any,
-    dyn_state: Any,
-    view_rotation: str,
-    *,
-    live_view: Any | None,
-    visualize: bool,
-    minimum_wait_sec: float,
-    right_target: np.ndarray,
-    left_target: np.ndarray,
-    target_x_m: float,
-    x_tolerance_m: float,
-    y_tolerance_m: float,
-    yaw_tolerance_deg: float,
-    eef_position_tolerance_m: float = STREAMED_PRE_PUSH_EEF_POSITION_TOLERANCE_M,
-    eef_rotation_tolerance_deg: float = STREAMED_PRE_PUSH_EEF_ROTATION_TOLERANCE_DEG,
-    stage: str = "5/7 vision_pre_push",
-) -> dict[str, Any] | None:
-    """Wait for streamed pre-push without FinishCode, using live vision plus FK as the gate."""
-    view = live_view if live_view is not None else ContinuousLiveBoxView(view_rotation, show=visualize)
-    min_wait = max(0.0, float(minimum_wait_sec))
-    deadline = time.monotonic() + max(
-        min_wait + max(0.0, STREAMED_PRE_PUSH_VISION_TIMEOUT_SEC),
-        STREAMED_PRE_PUSH_EEF_TIMEOUT_SEC,
-    )
-    start = time.monotonic()
-    latest_measurement: dict[str, Any] | None = None
-    latest_status: dict[str, Any] | None = None
-    latest_eef_errors: dict[str, float] | None = None
-    ok_frames = 0
-
-    def eef_errors(q: Any) -> dict[str, float]:
-        dyn_state.set_q(q)
-        dyn_model.compute_forward_kinematics(dyn_state)
-        current_right = np.asarray(
-            dyn_model.compute_transformation(dyn_state, VISION_PRE_PUSH_REFERENCE_INDEX, EE_RIGHT_INDEX),
-            dtype=np.float64,
-        )
-        current_left = np.asarray(
-            dyn_model.compute_transformation(dyn_state, VISION_PRE_PUSH_REFERENCE_INDEX, EE_LEFT_INDEX),
-            dtype=np.float64,
-        )
-        right_pos = float(np.linalg.norm(current_right[:3, 3] - np.asarray(right_target)[:3, 3]))
-        left_pos = float(np.linalg.norm(current_left[:3, 3] - np.asarray(left_target)[:3, 3]))
-        right_rot = rotation_error_deg(current_right, right_target)
-        left_rot = rotation_error_deg(current_left, left_target)
-        return {
-            "right_pos_m": right_pos,
-            "left_pos_m": left_pos,
-            "max_pos_m": max(right_pos, left_pos),
-            "right_rot_deg": right_rot,
-            "left_rot_deg": left_rot,
-            "max_rot_deg": max(right_rot, left_rot),
-        }
-
-    try:
-        while time.monotonic() < deadline:
-            elapsed = time.monotonic() - start
-            status_lines = [
-                (
-                    f"streamed pre-push live gate {elapsed:.2f}/{min_wait:.2f}s",
-                    (255, 255, 255),
-                ),
-                (
-                    "waiting for box alignment + EEF pre-push pose; no FinishCode wait",
-                    (0, 220, 255),
-                ),
-            ]
-            try:
-                sample = view.grab_synced_estimate(
-                    robot,
-                    dyn_model,
-                    dyn_state,
-                    view_rotation,
-                    status_lines=status_lines,
-                )
-            except StopIteration:
-                print_stage(stage, "FAILED: live vision stream ended during streamed pre-push")
-                return None
-            if sample["abort"]:
-                raise UserAbortRequested("streamed pre-push aborted from the live view")
-
-            latest_eef_errors = eef_errors(sample["q"])
-            eef_ok = (
-                latest_eef_errors["max_pos_m"] <= float(eef_position_tolerance_m) + 1e-9
-                and latest_eef_errors["max_rot_deg"] <= float(eef_rotation_tolerance_deg) + 1e-9
-            )
-            usable = (
-                sample["usable"]
-                and sample["center_base_m"] is not None
-                and sample["long_axis_base"] is not None
-            )
-            vision_ok = False
-            if usable:
-                measurement = synced_servo_sample_to_measurement(sample)
-                if measurement is not None:
-                    latest_measurement = measurement
-                    latest_status = mobile_base_se2_residual_status(
-                        measurement,
-                        target_x_m=target_x_m,
-                        x_tolerance_m=x_tolerance_m,
-                        y_tolerance_m=y_tolerance_m,
-                        yaw_tolerance_deg=yaw_tolerance_deg,
-                    )
-                    vision_ok = bool(latest_status["within_target_band"])
-            if vision_ok and eef_ok:
-                ok_frames += 1
-            else:
-                ok_frames = 0
-
-            if time.monotonic() - start >= min_wait and ok_frames >= 1:
-                print_stage(
-                    stage,
-                    "live vision + EEF FK gate accepted streamed pre-push "
-                    f"(max_eef_pos={latest_eef_errors['max_pos_m'] * 100:.1f}cm "
-                    f"max_eef_rot={latest_eef_errors['max_rot_deg']:.1f}deg)",
-                )
-                return latest_measurement
-
-        if latest_status is None:
-            print_stage(stage, "FAILED: no usable live vision frame during streamed pre-push")
-            return None
-        xy_status = latest_status["xy_status"]
-        residual_xy = np.asarray(xy_status["residual_xy_m"], dtype=np.float64)
-        residual_yaw = latest_status["residual_yaw_deg"]
-        yaw_text = "n/a" if residual_yaw is None else f"{float(residual_yaw):+.2f}deg"
-        eef_pos_text = "n/a"
-        eef_rot_text = "n/a"
-        if latest_eef_errors is not None:
-            eef_pos_text = f"{latest_eef_errors['max_pos_m'] * 100:.1f}cm"
-            eef_rot_text = f"{latest_eef_errors['max_rot_deg']:.1f}deg"
-        print_stage(
-            stage,
-            "FAILED: live vision gate never reached target band after streamed pre-push "
-            f"(x={residual_xy[0] * 100:+.1f}cm y={residual_xy[1] * 100:+.1f}cm yaw={yaw_text}; "
-            f"max_eef_pos={eef_pos_text} max_eef_rot={eef_rot_text})",
-        )
-        return None
-    finally:
-        view.close()
+        live_view.close()
 
 
 def run_mobile_base_combined_alignment(
@@ -4216,7 +3861,6 @@ def main(
                 )
                 residual_yaw = residual_status["residual_yaw_deg"]
                 if residual_yaw is None:
-                    close_streamed_mobile_handoff(measurement, stage="3-4/7 mobile_base_se2_align")
                     print_stage(
                         "3-4/7 mobile_base_se2_align",
                         "FAILED: no usable long-axis yaw after alignment; aborting before contact",
@@ -4261,7 +3905,6 @@ def main(
                         "combined residual not accepted; trying separate align before contact: "
                         + "; ".join(retry_reasons),
                     )
-                    close_streamed_mobile_handoff(measurement, stage="3-4/7 mobile_base_se2_align")
                     # If yaw was off, yaw motion can disturb x/y, so run x/y
                     # after yaw as a final contact gate even when x/y was
                     # already inside the target band at this checkpoint.
@@ -4480,82 +4123,34 @@ def main(
 
         print_stage("5/7 vision_pre_push", "building target")
         q = robot.get_state().position
-        handoff_stream = measurement.pop("_handoff_stream", None)
-        handoff_live_view = measurement.pop("_handoff_live_view", None)
-        try:
-            if handoff_stream is not None:
-                command, streamed_pre_push_targets = build_streamed_vision_pre_push_command(
-                    dyn_model,
-                    dyn_state,
-                    robot_model,
-                    q,
-                    box_center_base_m,
-                    approach_time=approach_time,
-                    hold_time=hold_time,
-                    linear_velocity_limit=vision_pre_push_linear_velocity_limit,
-                    angular_velocity_limit=vision_pre_push_angular_velocity_limit,
-                    acceleration_limit_scaling=vision_pre_push_acceleration_limit_scaling,
-                    max_reference_xy_shift_m=max_reference_xy_shift_m,
-                    midpoint_offset_xy_m=midpoint_offset_xy_m,
-                    drop_delta_axis_base_xy=drop_delta_axis_base_xy,
-                )
-                print_stage("5/7 vision_pre_push", "streaming on existing mobile command stream")
-                handoff_stream.send_command(command)
-                post_pre_push_measurement = wait_streamed_pre_push_live_vision(
-                    robot,
-                    dyn_model,
-                    dyn_state,
-                    view_rotation,
-                    live_view=handoff_live_view,
-                    visualize=visualize,
-                    minimum_wait_sec=approach_time + hold_time + STREAMED_PRE_PUSH_EXTRA_WAIT_SEC,
-                    right_target=streamed_pre_push_targets["right_target"],
-                    left_target=streamed_pre_push_targets["left_target"],
-                    target_x_m=mobile_base_target_x_m,
-                    x_tolerance_m=mobile_base_x_tolerance_m,
-                    y_tolerance_m=mobile_base_y_tolerance_m,
-                    yaw_tolerance_deg=mobile_base_yaw_tolerance_deg,
-                )
-                handoff_live_view = None
-                if post_pre_push_measurement is None:
-                    print_stage("5/7 vision_pre_push", "FAILED; aborting")
-                    return done
-                measurement = post_pre_push_measurement
-            else:
-                command = build_vision_pre_push_command(
-                    dyn_model,
-                    dyn_state,
-                    robot_model,
-                    q,
-                    box_center_base_m,
-                    approach_time=approach_time,
-                    hold_time=hold_time,
-                    linear_velocity_limit=vision_pre_push_linear_velocity_limit,
-                    angular_velocity_limit=vision_pre_push_angular_velocity_limit,
-                    acceleration_limit_scaling=vision_pre_push_acceleration_limit_scaling,
-                    max_reference_xy_shift_m=max_reference_xy_shift_m,
-                    midpoint_offset_xy_m=midpoint_offset_xy_m,
-                    drop_delta_axis_base_xy=drop_delta_axis_base_xy,
-                )
-                if not send_stage(
-                    robot,
-                    command,
-                    "5/7 vision_pre_push",
-                    timeout_sec=stage_timeout_sec(
-                        approach_time,
-                        hold_time,
-                        min_timeout_sec=min_command_timeout_sec,
-                        margin_sec=command_timeout_margin_sec,
-                    ),
-                ):
-                    print_stage("5/7 vision_pre_push", "FAILED; aborting")
-                    return done
-        finally:
-            if handoff_live_view is not None:
-                try:
-                    handoff_live_view.close()
-                except Exception as exc:  # pragma: no cover - GUI/camera dependent
-                    print_stage("5/7 vision_pre_push", f"handoff live-view close failed: {exc}")
+        command = build_vision_pre_push_command(
+            dyn_model,
+            dyn_state,
+            robot_model,
+            q,
+            box_center_base_m,
+            approach_time=approach_time,
+            hold_time=hold_time,
+            linear_velocity_limit=vision_pre_push_linear_velocity_limit,
+            angular_velocity_limit=vision_pre_push_angular_velocity_limit,
+            acceleration_limit_scaling=vision_pre_push_acceleration_limit_scaling,
+            max_reference_xy_shift_m=max_reference_xy_shift_m,
+            midpoint_offset_xy_m=midpoint_offset_xy_m,
+            drop_delta_axis_base_xy=drop_delta_axis_base_xy,
+        )
+        if not send_stage(
+            robot,
+            command,
+            "5/7 vision_pre_push",
+            timeout_sec=stage_timeout_sec(
+                approach_time,
+                hold_time,
+                min_timeout_sec=min_command_timeout_sec,
+                margin_sec=command_timeout_margin_sec,
+            ),
+        ):
+            print_stage("5/7 vision_pre_push", "FAILED; aborting")
+            return done
         print_stage("5/7 vision_pre_push", "reached")
 
         if not continue_pick:
@@ -4606,9 +4201,6 @@ def main(
         print_stage("interrupted", "KeyboardInterrupt while waiting in the last printed stage")
         raise
     finally:
-        pending_measurement = locals().get("measurement")
-        if isinstance(pending_measurement, dict):
-            close_streamed_mobile_handoff(pending_measurement, stage="cleanup")
         if gripper_device is not None:
             print_stage("0/7 gripper_home_open", "stopping max-open background loop")
             gripper_device.stop()

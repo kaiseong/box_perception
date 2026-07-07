@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 sys.modules.setdefault("rby1_sdk", SimpleNamespace())
 
@@ -57,56 +58,32 @@ class PickingBox5DebugTests(unittest.TestCase):
 
         self.assertNotIn("picking_box_5", imports)
 
-    def test_mobile_servo_skips_stationary_confirm(self) -> None:
-        source = Path(debug.__file__).read_text()
-        servo_start = source.index("def run_mobile_base_visual_servo_alignment(")
-        servo_end = source.index("def run_mobile_base_combined_alignment(", servo_start)
-        servo_source = source[servo_start:servo_end]
+    def test_print_stage_keeps_failures_visible_on_stderr(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "stderr", stderr):
+            debug.print_stage("5/7 vision_pre_push", "FAILED; aborting")
+        self.assertIn("[stage] 5/7 vision_pre_push | FAILED; aborting", stderr.getvalue())
 
-        self.assertIn("skipping stationary confirm", servo_source)
-        self.assertNotIn("time.sleep(0.3)", servo_source)
+    def test_print_stage_silences_normal_progress_messages(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "stderr", stderr):
+            debug.print_stage("3-4/7 mobile_base_se2_align", "servoing error x=+1.0cm settled=0")
+        self.assertEqual(stderr.getvalue(), "")
 
-    def test_mobile_servo_handoff_keeps_stream_for_pre_push(self) -> None:
-        source = Path(debug.__file__).read_text()
-        servo_start = source.index("def run_mobile_base_visual_servo_alignment(")
-        servo_end = source.index("def run_mobile_base_combined_alignment(", servo_start)
-        servo_source = source[servo_start:servo_end]
-
-        self.assertIn("def stop_thread", source)
-        self.assertIn('"_handoff_stream"', servo_source)
-        self.assertIn('"_handoff_live_view"', servo_source)
-        self.assertIn("commander.stop_thread()", servo_source)
-
-    def test_streamed_pre_push_uses_stream_and_live_vision_gate(self) -> None:
-        source = Path(debug.__file__).read_text()
-        builder_start = source.index("def build_streamed_vision_pre_push_command(")
-        builder_end = source.index("def build_pose_command(", builder_start)
-        builder_source = source[builder_start:builder_end]
-        self.assertIn(".set_body_command(body)", builder_source)
-        self.assertIn(".set_mobility_command(mobility)", builder_source)
-
-        stage_start = source.index('print_stage("5/7 vision_pre_push", "building target")')
-        stage_end = source.index("if not continue_pick:", stage_start)
-        stage_source = source[stage_start:stage_end]
-        handoff_start = stage_source.index("if handoff_stream is not None:")
-        handoff_end = stage_source.index("else:", handoff_start)
-        handoff_source = stage_source[handoff_start:handoff_end]
-
-        self.assertIn("handoff_stream.send_command(command)", handoff_source)
-        self.assertIn("wait_streamed_pre_push_live_vision", handoff_source)
-        self.assertNotIn("send_stage", handoff_source)
-
-    def test_streamed_pre_push_wait_requires_eef_fk_gate(self) -> None:
-        source = Path(debug.__file__).read_text()
-        wait_start = source.index("def wait_streamed_pre_push_live_vision(")
-        wait_end = source.index("def run_mobile_base_combined_alignment(", wait_start)
-        wait_source = source[wait_start:wait_end]
-
-        self.assertIn("right_target", wait_source)
-        self.assertIn("left_target", wait_source)
-        self.assertIn("compute_transformation", wait_source)
-        self.assertIn("eef_ok", wait_source)
-        self.assertIn("vision_ok and eef_ok", wait_source)
+    def test_failure_keywords_cover_known_failure_messages(self) -> None:
+        for message in (
+            "FAILED: residual error exceeds safety band",
+            "stop send failed (boom); calling robot.cancel_control()",
+            "servo alignment aborted from the live view",
+            "robot.cancel_control() requested",
+        ):
+            self.assertTrue(debug.stage_message_is_failure(message), message)
+        for message in (
+            "building target",
+            "servo settled: error x=+0.3cm y=-0.2cm yaw=+0.5deg",
+            "reached",
+        ):
+            self.assertFalse(debug.stage_message_is_failure(message), message)
 
 
 if __name__ == "__main__":
