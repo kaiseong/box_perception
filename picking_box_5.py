@@ -2288,6 +2288,15 @@ def print_stage(stage: str, message: str) -> None:
     print(f"[stage] {stage} | {message}", flush=True)
 
 
+def print_timing(enabled: bool, label: str, start_sec: float, *, detail: str = "") -> None:
+    """Print elapsed wall-clock time for operator-facing timing checks."""
+    if not enabled:
+        return
+    elapsed = time.monotonic() - float(start_sec)
+    suffix = f" | {detail}" if detail else ""
+    print_stage("timing", f"{label}: {elapsed:.3f}s{suffix}")
+
+
 def stage_timeout_sec(
     *expected_durations_sec: float,
     min_timeout_sec: float = COMMAND_TIMEOUT_MIN_SEC,
@@ -3586,6 +3595,7 @@ def main(
     mobile_base_vision_timeout_sec: float,
     command_timeout_margin_sec: float,
     min_command_timeout_sec: float,
+    timing: bool = False,
 ) -> bool:
     robot = rby.create_robot(address, model)
     robot.connect()
@@ -3655,9 +3665,12 @@ def main(
             print_stage(stage, "reached")
 
         using_live_vision = box_center_camera_m is None
+        vision_to_pre_push_start_sec: float | None = None
         if box_center_camera_m is None:
             # Live capture AT this pose, so the FK-based camera->base above and
             # the measurement share the exact same posture.
+            vision_to_pre_push_start_sec = time.monotonic()
+            live_capture_start_sec = time.monotonic()
             print_stage("2/7 live_vision", "capturing D405 frames")
             measurement = capture_live_box_measurement(
                 robot,
@@ -3671,12 +3684,24 @@ def main(
                 hold_after_capture=visualize,
             )
             if measurement is None:
+                print_timing(
+                    timing,
+                    "live_vision_capture",
+                    live_capture_start_sec,
+                    detail="failed",
+                )
                 print_stage(
                     "2/7 live_vision",
                     "FAILED: not enough usable center frames within "
                     f"{live_vision_timeout_sec:.0f}s; aborting before contact",
                 )
                 return done
+            print_timing(
+                timing,
+                "live_vision_capture",
+                live_capture_start_sec,
+                detail=f"usable_frames={measurement['frames_used']}",
+            )
             print_stage(
                 "2/7 live_vision",
                 f"done; usable frames={measurement['frames_used']} "
@@ -3697,6 +3722,7 @@ def main(
                     f"y=0.000m±{mobile_base_y_tolerance_m:.3f}m, "
                     f"yaw≤{mobile_base_yaw_tolerance_deg:.1f}deg ({xy_policy})",
                 )
+                combined_align_start_sec = time.monotonic()
                 if discrete_align:
                     combined_measurement = run_mobile_base_combined_alignment(
                         robot,
@@ -3755,6 +3781,12 @@ def main(
                         ),
                         max_center_spread_m=live_center_spread_m,
                     )
+                print_timing(
+                    timing,
+                    "mobile_base_se2_align",
+                    combined_align_start_sec,
+                    detail="combined stage returned",
+                )
                 if combined_measurement is None:
                     print_stage(
                         "3-4/7 mobile_base_se2_align",
@@ -3842,6 +3874,7 @@ def main(
                     "closed-loop target box long-axis -> base y "
                     f"(tolerance={mobile_base_yaw_tolerance_deg:.1f}deg)",
                 )
+                yaw_align_start_sec = time.monotonic()
                 yaw_measurement = run_mobile_base_yaw_alignment(
                     robot,
                     dyn_model,
@@ -3858,6 +3891,12 @@ def main(
                     vision_frames_needed=mobile_base_yaw_vision_frames_needed,
                     vision_timeout_sec=mobile_base_yaw_vision_timeout_sec,
                     max_center_spread_m=live_center_spread_m,
+                )
+                print_timing(
+                    timing,
+                    "mobile_base_yaw_align",
+                    yaw_align_start_sec,
+                    detail="separate yaw stage returned",
                 )
                 if yaw_measurement is None:
                     print_stage(
@@ -3895,6 +3934,7 @@ def main(
                     f"x={mobile_base_target_x_m:.3f}m±{mobile_base_x_tolerance_m:.3f}m, "
                     f"y=0.000m±{mobile_base_y_tolerance_m:.3f}m",
                 )
+                xy_align_start_sec = time.monotonic()
                 aligned_measurement = run_mobile_base_alignment(
                     robot,
                     dyn_model,
@@ -3916,6 +3956,12 @@ def main(
                     min_command_timeout_sec=min_command_timeout_sec,
                     command_timeout_margin_sec=command_timeout_margin_sec,
                     stage="4/7 mobile_base_xy_align",
+                )
+                print_timing(
+                    timing,
+                    "mobile_base_xy_align",
+                    xy_align_start_sec,
+                    detail="separate xy stage returned",
                 )
                 if aligned_measurement is None:
                     print_stage(
@@ -4046,6 +4092,13 @@ def main(
             stage="pre_contact_yaw_gate",
         ):
             return done
+        if vision_to_pre_push_start_sec is not None:
+            print_timing(
+                timing,
+                "vision_to_pre_push_ready",
+                vision_to_pre_push_start_sec,
+                detail="pre-contact gates passed; building arm target next",
+            )
 
         print_stage("5/7 vision_pre_push", "building target")
         q = robot.get_state().position
@@ -4229,6 +4282,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--visualize-only",
         action="store_true",
         help="Observation mode: stream the visualization at the current posture, send NO motion commands.",
+    )
+    parser.add_argument(
+        "--timing",
+        action="store_true",
+        help=(
+            "Print wall-clock timings for live vision capture, mobile-base alignment, "
+            "and the vision-to-pre-push transition."
+        ),
     )
     parser.set_defaults(gripper_open=GRIPPER_OPEN_DEFAULT)
     parser.add_argument(
@@ -4614,6 +4675,7 @@ if __name__ == "__main__":
             mobile_base_vision_timeout_sec=float(args.mobile_base_vision_timeout_sec),
             command_timeout_margin_sec=float(args.command_timeout_margin_sec),
             min_command_timeout_sec=float(args.min_command_timeout_sec),
+            timing=bool(args.timing),
         )
         else 1
     )
