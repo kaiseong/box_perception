@@ -1264,6 +1264,9 @@ VISION_APPROACH_HOLD_TIME = 0.1
 VISION_APPROACH_MAX_REFERENCE_XY_SHIFT_M = 0.25
 STREAMED_PRE_PUSH_EXTRA_WAIT_SEC = 0.15
 STREAMED_PRE_PUSH_VISION_TIMEOUT_SEC = 0.35
+STREAMED_PRE_PUSH_EEF_TIMEOUT_SEC = 2.0
+STREAMED_PRE_PUSH_EEF_POSITION_TOLERANCE_M = 0.02
+STREAMED_PRE_PUSH_EEF_ROTATION_TOLERANCE_DEG = 8.0
 
 # ---- Live vision (default input source) ----
 # Rim-plane estimator stack (box_pose/, replay_recording.py) and the stored
@@ -2451,7 +2454,7 @@ def build_streamed_vision_pre_push_command(
     linear_velocity_limit: float = VISION_PRE_PUSH_LINEAR_VELOCITY_LIMIT,
     angular_velocity_limit: float = VISION_PRE_PUSH_ANGULAR_VELOCITY_LIMIT,
     acceleration_limit_scaling: float = VISION_PRE_PUSH_ACCELERATION_LIMIT_SCALING,
-) -> Any:
+) -> tuple[Any, dict[str, Any]]:
     """Build vision_pre_push as a shared-stream body + zero-mobility command."""
     targets = vision_pre_push_targets(
         dyn_model,
@@ -2490,11 +2493,12 @@ def build_streamed_vision_pre_push_command(
             SERVO_COMMAND_HOLD_TIME_SEC,
         ),
     )
-    return rby.RobotCommandBuilder().set_command(
+    command = rby.RobotCommandBuilder().set_command(
         rby.ComponentBasedCommandBuilder()
         .set_body_command(body)
         .set_mobility_command(mobility)
     )
+    return command, targets
 
 
 def build_pose_command(pose: dict[str, list[float]], minimum_time: float) -> Any:
@@ -3388,20 +3392,53 @@ def wait_streamed_pre_push_live_vision(
     live_view: Any | None,
     visualize: bool,
     minimum_wait_sec: float,
+    right_target: np.ndarray,
+    left_target: np.ndarray,
     target_x_m: float,
     x_tolerance_m: float,
     y_tolerance_m: float,
     yaw_tolerance_deg: float,
+    eef_position_tolerance_m: float = STREAMED_PRE_PUSH_EEF_POSITION_TOLERANCE_M,
+    eef_rotation_tolerance_deg: float = STREAMED_PRE_PUSH_EEF_ROTATION_TOLERANCE_DEG,
     stage: str = "5/7 vision_pre_push",
 ) -> dict[str, Any] | None:
-    """Wait for streamed pre-push without FinishCode, using live vision as the gate."""
+    """Wait for streamed pre-push without FinishCode, using live vision plus FK as the gate."""
     view = live_view if live_view is not None else ContinuousLiveBoxView(view_rotation, show=visualize)
     min_wait = max(0.0, float(minimum_wait_sec))
-    deadline = time.monotonic() + min_wait + max(0.0, STREAMED_PRE_PUSH_VISION_TIMEOUT_SEC)
+    deadline = time.monotonic() + max(
+        min_wait + max(0.0, STREAMED_PRE_PUSH_VISION_TIMEOUT_SEC),
+        STREAMED_PRE_PUSH_EEF_TIMEOUT_SEC,
+    )
     start = time.monotonic()
     latest_measurement: dict[str, Any] | None = None
     latest_status: dict[str, Any] | None = None
+    latest_eef_errors: dict[str, float] | None = None
     ok_frames = 0
+
+    def eef_errors(q: Any) -> dict[str, float]:
+        dyn_state.set_q(q)
+        dyn_model.compute_forward_kinematics(dyn_state)
+        current_right = np.asarray(
+            dyn_model.compute_transformation(dyn_state, VISION_PRE_PUSH_REFERENCE_INDEX, EE_RIGHT_INDEX),
+            dtype=np.float64,
+        )
+        current_left = np.asarray(
+            dyn_model.compute_transformation(dyn_state, VISION_PRE_PUSH_REFERENCE_INDEX, EE_LEFT_INDEX),
+            dtype=np.float64,
+        )
+        right_pos = float(np.linalg.norm(current_right[:3, 3] - np.asarray(right_target)[:3, 3]))
+        left_pos = float(np.linalg.norm(current_left[:3, 3] - np.asarray(left_target)[:3, 3]))
+        right_rot = rotation_error_deg(current_right, right_target)
+        left_rot = rotation_error_deg(current_left, left_target)
+        return {
+            "right_pos_m": right_pos,
+            "left_pos_m": left_pos,
+            "max_pos_m": max(right_pos, left_pos),
+            "right_rot_deg": right_rot,
+            "left_rot_deg": left_rot,
+            "max_rot_deg": max(right_rot, left_rot),
+        }
+
     try:
         while time.monotonic() < deadline:
             elapsed = time.monotonic() - start
@@ -3411,7 +3448,7 @@ def wait_streamed_pre_push_live_vision(
                     (255, 255, 255),
                 ),
                 (
-                    "waiting for one in-band live vision frame; no FinishCode wait",
+                    "waiting for box alignment + EEF pre-push pose; no FinishCode wait",
                     (0, 220, 255),
                 ),
             ]
@@ -3429,11 +3466,17 @@ def wait_streamed_pre_push_live_vision(
             if sample["abort"]:
                 raise UserAbortRequested("streamed pre-push aborted from the live view")
 
+            latest_eef_errors = eef_errors(sample["q"])
+            eef_ok = (
+                latest_eef_errors["max_pos_m"] <= float(eef_position_tolerance_m) + 1e-9
+                and latest_eef_errors["max_rot_deg"] <= float(eef_rotation_tolerance_deg) + 1e-9
+            )
             usable = (
                 sample["usable"]
                 and sample["center_base_m"] is not None
                 and sample["long_axis_base"] is not None
             )
+            vision_ok = False
             if usable:
                 measurement = synced_servo_sample_to_measurement(sample)
                 if measurement is not None:
@@ -3445,13 +3488,19 @@ def wait_streamed_pre_push_live_vision(
                         y_tolerance_m=y_tolerance_m,
                         yaw_tolerance_deg=yaw_tolerance_deg,
                     )
-                    if bool(latest_status["within_target_band"]):
-                        ok_frames += 1
-                    else:
-                        ok_frames = 0
+                    vision_ok = bool(latest_status["within_target_band"])
+            if vision_ok and eef_ok:
+                ok_frames += 1
+            else:
+                ok_frames = 0
 
             if time.monotonic() - start >= min_wait and ok_frames >= 1:
-                print_stage(stage, "live vision gate accepted streamed pre-push")
+                print_stage(
+                    stage,
+                    "live vision + EEF FK gate accepted streamed pre-push "
+                    f"(max_eef_pos={latest_eef_errors['max_pos_m'] * 100:.1f}cm "
+                    f"max_eef_rot={latest_eef_errors['max_rot_deg']:.1f}deg)",
+                )
                 return latest_measurement
 
         if latest_status is None:
@@ -3461,10 +3510,16 @@ def wait_streamed_pre_push_live_vision(
         residual_xy = np.asarray(xy_status["residual_xy_m"], dtype=np.float64)
         residual_yaw = latest_status["residual_yaw_deg"]
         yaw_text = "n/a" if residual_yaw is None else f"{float(residual_yaw):+.2f}deg"
+        eef_pos_text = "n/a"
+        eef_rot_text = "n/a"
+        if latest_eef_errors is not None:
+            eef_pos_text = f"{latest_eef_errors['max_pos_m'] * 100:.1f}cm"
+            eef_rot_text = f"{latest_eef_errors['max_rot_deg']:.1f}deg"
         print_stage(
             stage,
             "FAILED: live vision gate never reached target band after streamed pre-push "
-            f"(x={residual_xy[0] * 100:+.1f}cm y={residual_xy[1] * 100:+.1f}cm yaw={yaw_text})",
+            f"(x={residual_xy[0] * 100:+.1f}cm y={residual_xy[1] * 100:+.1f}cm yaw={yaw_text}; "
+            f"max_eef_pos={eef_pos_text} max_eef_rot={eef_rot_text})",
         )
         return None
     finally:
@@ -4429,7 +4484,7 @@ def main(
         handoff_live_view = measurement.pop("_handoff_live_view", None)
         try:
             if handoff_stream is not None:
-                command = build_streamed_vision_pre_push_command(
+                command, streamed_pre_push_targets = build_streamed_vision_pre_push_command(
                     dyn_model,
                     dyn_state,
                     robot_model,
@@ -4454,6 +4509,8 @@ def main(
                     live_view=handoff_live_view,
                     visualize=visualize,
                     minimum_wait_sec=approach_time + hold_time + STREAMED_PRE_PUSH_EXTRA_WAIT_SEC,
+                    right_target=streamed_pre_push_targets["right_target"],
+                    left_target=streamed_pre_push_targets["left_target"],
                     target_x_m=mobile_base_target_x_m,
                     x_tolerance_m=mobile_base_x_tolerance_m,
                     y_tolerance_m=mobile_base_y_tolerance_m,

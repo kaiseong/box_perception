@@ -96,6 +96,18 @@ class PickingBox5DebugTests(unittest.TestCase):
         self.assertIn("wait_streamed_pre_push_live_vision", handoff_source)
         self.assertNotIn("send_stage", handoff_source)
 
+    def test_streamed_pre_push_wait_requires_eef_fk_gate(self) -> None:
+        source = Path(debug.__file__).read_text()
+        wait_start = source.index("def wait_streamed_pre_push_live_vision(")
+        wait_end = source.index("def run_mobile_base_combined_alignment(", wait_start)
+        wait_source = source[wait_start:wait_end]
+
+        self.assertIn("right_target", wait_source)
+        self.assertIn("left_target", wait_source)
+        self.assertIn("compute_transformation", wait_source)
+        self.assertIn("eef_ok", wait_source)
+        self.assertIn("vision_ok and eef_ok", wait_source)
+
 
 if __name__ == "__main__":
     unittest.main()
