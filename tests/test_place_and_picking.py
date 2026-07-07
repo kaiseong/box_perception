@@ -22,7 +22,7 @@ sys.modules.setdefault(
     ),
 )
 
-import picking_and_place as pap
+import place_and_picking as pap
 
 
 class PickingAndPlaceTests(unittest.TestCase):

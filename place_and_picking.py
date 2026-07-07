@@ -1616,7 +1616,7 @@ class ContinuousLiveBoxView:
             fps=CAMERA_FPS,
             view_rotation=view_rotation,
         )
-        self.window_name = "picking_and_place mobile align vision (q/ESC abort)"
+        self.window_name = "place_and_picking mobile align vision (q/ESC abort)"
         # show=False keeps the same per-frame estimation available headless
         # (e.g. the servo loop without --visualize); no window, no abort key.
         self.show = bool(show)
@@ -3844,7 +3844,7 @@ def main(
                 return done
             done = True
             print("=" * 60)
-            print(f"[picking_and_place] place/regrasp COMPLETED. done = {done}")
+            print(f"[place_and_picking] place/regrasp COMPLETED. done = {done}")
             print("=" * 60)
             return done
 
@@ -4310,7 +4310,7 @@ def main(
         if not place_regrasp:
             done = True
             print("=" * 60)
-            print(f"[picking_and_place] initial pick COMPLETED. done = {done}")
+            print(f"[place_and_picking] initial pick COMPLETED. done = {done}")
             print("=" * 60)
             return done
 
@@ -4333,7 +4333,7 @@ def main(
 
         done = True
         print("=" * 60)
-        print(f"[picking_and_place] full cycle COMPLETED. done = {done}")
+        print(f"[place_and_picking] full cycle COMPLETED. done = {done}")
         print("=" * 60)
         return done
     except UserAbortRequested as abort:
