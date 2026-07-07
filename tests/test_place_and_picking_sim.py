@@ -15,6 +15,8 @@ class PlaceAndPickingSimTests(unittest.TestCase):
 
         self.assertEqual(args.address, "localhost:50051")
         self.assertEqual(args.model, "m")
+        self.assertFalse(args.skip_held_start)
+        self.assertAlmostEqual(args.setup_minimum_time, pap.MINIMUM_TIME)
         self.assertAlmostEqual(args.place_wait_sec, pap.PLACE_WAIT_AFTER_RELEASE_SEC)
         self.assertAlmostEqual(args.push_ramp_time_sec, pap.PUSH_RAMP_TIME)
 
@@ -37,7 +39,7 @@ class PlaceAndPickingSimTests(unittest.TestCase):
 
         self.assertTrue(ok)
 
-    def test_run_invokes_destination_sequence_only(self) -> None:
+    def test_run_prepares_held_start_before_destination_sequence(self) -> None:
         calls: list[tuple[str, object]] = []
 
         class FakeRobot:
@@ -49,30 +51,70 @@ class PlaceAndPickingSimTests(unittest.TestCase):
 
         args = sim.parse_args(["--skip-enable", "--place-wait-sec", "1.25"])
         original_connect = sim.connect_and_enable_robot
+        original_prepare = sim.prepare_held_box_pose
         original_perform = pap.perform_place_regrasp_sequence
 
         def fake_connect_and_enable_robot(**kwargs):
             calls.append(("connect", kwargs))
             return FakeRobot()
 
+        def fake_prepare(robot, dyn_model, dyn_state, **kwargs) -> bool:
+            calls.append(("prepare", kwargs, dyn_state))
+            return True
+
         def fake_perform(robot, dyn_model, dyn_state, **kwargs) -> bool:
             calls.append(("perform", kwargs, dyn_state))
             return True
 
         sim.connect_and_enable_robot = fake_connect_and_enable_robot
+        sim.prepare_held_box_pose = fake_prepare
         pap.perform_place_regrasp_sequence = fake_perform
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 ok = sim.run(args)
         finally:
             sim.connect_and_enable_robot = original_connect
+            sim.prepare_held_box_pose = original_prepare
             pap.perform_place_regrasp_sequence = original_perform
 
         self.assertTrue(ok)
         self.assertEqual(calls[0][0], "connect")
-        self.assertEqual(calls[1][0], "perform")
-        self.assertAlmostEqual(calls[1][1]["place_wait_sec"], 1.25)
-        self.assertEqual(calls[1][2], (tuple(pap.DYN_LINK_NAMES), ("j0",)))
+        self.assertEqual(calls[1][0], "prepare")
+        self.assertEqual(calls[2][0], "perform")
+        self.assertAlmostEqual(calls[2][1]["place_wait_sec"], 1.25)
+        self.assertEqual(calls[2][2], (tuple(pap.DYN_LINK_NAMES), ("j0",)))
+
+    def test_skip_held_start_invokes_destination_sequence_only(self) -> None:
+        calls: list[str] = []
+
+        class FakeRobot:
+            def model(self) -> object:
+                return types.SimpleNamespace(robot_joint_names=["j0"])
+
+            def get_dynamics(self) -> object:
+                return types.SimpleNamespace(make_state=lambda links, joints: object())
+
+        args = sim.parse_args(["--skip-enable", "--skip-held-start"])
+        original_connect = sim.connect_and_enable_robot
+        original_prepare = sim.prepare_held_box_pose
+        original_perform = pap.perform_place_regrasp_sequence
+
+        def fake_prepare(*_args, **_kwargs) -> bool:
+            raise AssertionError("--skip-held-start must not prepare the held posture")
+
+        sim.connect_and_enable_robot = lambda **_kwargs: FakeRobot()
+        sim.prepare_held_box_pose = fake_prepare
+        pap.perform_place_regrasp_sequence = lambda *_args, **_kwargs: calls.append("perform") or True
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ok = sim.run(args)
+        finally:
+            sim.connect_and_enable_robot = original_connect
+            sim.prepare_held_box_pose = original_prepare
+            pap.perform_place_regrasp_sequence = original_perform
+
+        self.assertTrue(ok)
+        self.assertEqual(calls, ["perform"])
 
 
 if __name__ == "__main__":

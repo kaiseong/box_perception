@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """Simulator entrypoint for the destination place/regrasp motion.
 
-This intentionally runs only the no-vision, no-gripper destination sequence:
+This intentionally runs the no-vision, no-gripper simulator sequence:
 
+  ready -> start_to_picking -> inward_push_pick -> lift_pick ->
   place_lower -> release_push_reverse -> release_wait -> regrasp_push -> regrasp_lift
 
-Use it to check the arm motion in the RBY1 simulator after the robot is already
-in the held-box posture. The physical Dynamixel gripper setup is not exposed or
-called here.
+The first four stages put the simulated robot into the held-box posture that
+place_and_picking.py normally reaches after picking. The physical Dynamixel
+gripper setup is not exposed or called here.
 """
 
 from __future__ import annotations
 
 import argparse
+import time
 from urllib.parse import urlparse
 
 import place_and_picking as pap
@@ -28,6 +30,7 @@ DEFAULT_ADDRESS = "localhost:50051"
 DEFAULT_MODEL = "m"
 DEFAULT_POWER = ".*"
 DEFAULT_SERVO = ".*"
+DEFAULT_SETUP_HOLD_SEC = 0.2
 
 
 def _host_from_address(address: str) -> str:
@@ -51,6 +54,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Robot model name.")
     parser.add_argument("--power", default=DEFAULT_POWER, help="Power device regex.")
     parser.add_argument("--servo", default=DEFAULT_SERVO, help="Servo regex.")
+    parser.add_argument(
+        "--setup-minimum-time",
+        type=float,
+        default=pap.MINIMUM_TIME,
+        help="Minimum time for ready/start_to_picking setup joint moves.",
+    )
+    parser.add_argument(
+        "--setup-hold-sec",
+        type=float,
+        default=DEFAULT_SETUP_HOLD_SEC,
+        help="Small pause after each setup stage.",
+    )
     parser.add_argument(
         "--place-wait-sec",
         type=float,
@@ -86,6 +101,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Connect only; do not power/servo/enable control manager.",
     )
     parser.add_argument(
+        "--skip-held-start",
+        action="store_true",
+        help="Skip ready/start_to_picking/push/lift setup and start from the current posture.",
+    )
+    parser.add_argument(
         "--allow-real",
         action="store_true",
         help="Allow non-local addresses. Use only when intentionally moving hardware.",
@@ -94,6 +114,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.setup_minimum_time <= 0.0:
+        raise SystemExit("--setup-minimum-time must be positive")
+    if args.setup_hold_sec < 0.0:
+        raise SystemExit("--setup-hold-sec must be non-negative")
     if args.place_wait_sec < 0.0:
         raise SystemExit("--place-wait-sec must be non-negative")
     if args.push_ramp_time_sec < 0.0:
@@ -163,17 +187,122 @@ def connect_and_enable_robot(
     return robot
 
 
+def send_setup_pose(
+    robot: object,
+    pose_name: str,
+    pose: dict[str, list[float]],
+    *,
+    minimum_time: float,
+    hold_sec: float,
+    command_timeout_margin_sec: float,
+    min_command_timeout_sec: float,
+) -> bool:
+    stage = f"setup:{pose_name}"
+    pap.print_stage(stage, f"joint position move over {minimum_time:.2f}s")
+    ok = pap.send_stage(
+        robot,
+        pap.build_pose_command(pose, minimum_time),
+        stage,
+        timeout_sec=pap.stage_timeout_sec(
+            minimum_time,
+            min_timeout_sec=min_command_timeout_sec,
+            margin_sec=command_timeout_margin_sec,
+        ),
+    )
+    if not ok:
+        pap.print_stage(stage, "FAILED; aborting")
+        return False
+    pap.print_stage(stage, "reached")
+    if hold_sec > 0.0:
+        time.sleep(hold_sec)
+    return True
+
+
+def prepare_held_box_pose(
+    robot: object,
+    dyn_model: object,
+    dyn_state: object,
+    *,
+    setup_minimum_time: float,
+    setup_hold_sec: float,
+    push_ramp_time_sec: float,
+    command_timeout_margin_sec: float,
+    min_command_timeout_sec: float,
+) -> bool:
+    """Move the simulator to the post-pick held-box posture without gripper IO."""
+    if not send_setup_pose(
+        robot,
+        "ready",
+        pap.READY,
+        minimum_time=setup_minimum_time,
+        hold_sec=setup_hold_sec,
+        command_timeout_margin_sec=command_timeout_margin_sec,
+        min_command_timeout_sec=min_command_timeout_sec,
+    ):
+        return False
+    if not send_setup_pose(
+        robot,
+        "start_to_picking",
+        pap.START_TO_PICKING,
+        minimum_time=setup_minimum_time,
+        hold_sec=setup_hold_sec,
+        command_timeout_margin_sec=command_timeout_margin_sec,
+        min_command_timeout_sec=min_command_timeout_sec,
+    ):
+        return False
+
+    pap.print_stage("setup:inward_push_pick", "building ramped target stream")
+    q = robot.get_state().position
+    if not pap.stream_impedance_push_stage(
+        robot,
+        dyn_model,
+        dyn_state,
+        q,
+        target_inward=+pap.PUSH_DISTANCE,
+        ramp_time_sec=push_ramp_time_sec,
+        hold_time_sec=pap.PUSH_HOLD_TIME,
+        stage="setup:inward_push_pick",
+    ):
+        pap.print_stage("setup:inward_push_pick", "FAILED; aborting")
+        return False
+    if setup_hold_sec > 0.0:
+        time.sleep(setup_hold_sec)
+
+    pap.print_stage("setup:lift_pick", "building target")
+    q = robot.get_state().position
+    if not pap.send_stage(
+        robot,
+        pap.build_impedance_lift_command(dyn_model, dyn_state, q),
+        "setup:lift_pick",
+        timeout_sec=pap.stage_timeout_sec(
+            pap.LIFT_MINIMUM_TIME,
+            pap.VERTICAL_MOVE_HOLD_TIME,
+            min_timeout_sec=min_command_timeout_sec,
+            margin_sec=command_timeout_margin_sec,
+        ),
+    ):
+        pap.print_stage("setup:lift_pick", "FAILED; aborting")
+        return False
+    pap.print_stage("setup:lift_pick", "held-box posture reached")
+    if setup_hold_sec > 0.0:
+        time.sleep(setup_hold_sec)
+    return True
+
+
 def run(args: argparse.Namespace) -> bool:
+    sequence = (
+        "place_lower -> release_push_reverse -> release_wait -> regrasp_push -> regrasp_lift"
+        if args.skip_held_start
+        else "ready -> start_to_picking -> inward_push_pick -> lift_pick -> "
+        "place_lower -> release_push_reverse -> release_wait -> regrasp_push -> regrasp_lift"
+    )
     print(
         "[place_and_picking_sim] "
         f"address={args.address} model={args.model} "
         f"place_wait={args.place_wait_sec:.2f}s "
         f"push_ramp={args.push_ramp_time_sec:.2f}s"
     )
-    print(
-        "[sequence] "
-        "place_lower -> release_push_reverse -> release_wait -> regrasp_push -> regrasp_lift"
-    )
+    print(f"[sequence] {sequence}")
     print("[mode] no live vision, no initial pick, no Dynamixel gripper setup")
     if args.dry_run:
         return True
@@ -194,6 +323,22 @@ def run(args: argparse.Namespace) -> bool:
     robot_model = robot.model()
     dyn_model = robot.get_dynamics()
     dyn_state = dyn_model.make_state(pap.DYN_LINK_NAMES, robot_model.robot_joint_names)
+
+    if not args.skip_held_start:
+        if not prepare_held_box_pose(
+            robot,
+            dyn_model,
+            dyn_state,
+            setup_minimum_time=float(args.setup_minimum_time),
+            setup_hold_sec=float(args.setup_hold_sec),
+            push_ramp_time_sec=float(args.push_ramp_time_sec),
+            command_timeout_margin_sec=float(args.command_timeout_margin_sec),
+            min_command_timeout_sec=float(args.min_command_timeout_sec),
+        ):
+            print("[place_and_picking_sim] failed during held-box setup")
+            return False
+    else:
+        print("[place_and_picking_sim] held-box setup skipped; using current posture")
 
     ok = pap.perform_place_regrasp_sequence(
         robot,
