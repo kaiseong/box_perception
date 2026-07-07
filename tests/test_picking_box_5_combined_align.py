@@ -37,10 +37,6 @@ def measurement(*, center: tuple[float, float, float], yaw_deg: float) -> dict:
 
 
 class PickingBox5CombinedAlignTests(unittest.TestCase):
-    def test_timing_flag_defaults_off_and_can_be_enabled(self) -> None:
-        self.assertFalse(pb5.parse_args(["--address", "localhost:50051"]).timing)
-        self.assertTrue(pb5.parse_args(["--address", "localhost:50051", "--timing"]).timing)
-
     def test_combined_plan_moves_xy_even_when_yaw_is_coarse_by_default(self) -> None:
         plan = pb5.mobile_base_combined_alignment_plan(
             measurement(center=(0.52, 0.03, 0.0), yaw_deg=105.0),

@@ -2288,15 +2288,6 @@ def print_stage(stage: str, message: str) -> None:
     print(f"[stage] {stage} | {message}", flush=True)
 
 
-def print_timing(enabled: bool, label: str, start_sec: float, *, detail: str = "") -> None:
-    """Print elapsed wall-clock time for operator-facing timing checks."""
-    if not enabled:
-        return
-    elapsed = time.monotonic() - float(start_sec)
-    suffix = f" | {detail}" if detail else ""
-    print_stage("timing", f"{label}: {elapsed:.3f}s{suffix}")
-
-
 def stage_timeout_sec(
     *expected_durations_sec: float,
     min_timeout_sec: float = COMMAND_TIMEOUT_MIN_SEC,
@@ -3595,7 +3586,6 @@ def main(
     mobile_base_vision_timeout_sec: float,
     command_timeout_margin_sec: float,
     min_command_timeout_sec: float,
-    timing: bool = False,
 ) -> bool:
     robot = rby.create_robot(address, model)
     robot.connect()
@@ -3665,12 +3655,9 @@ def main(
             print_stage(stage, "reached")
 
         using_live_vision = box_center_camera_m is None
-        vision_to_pre_push_start_sec: float | None = None
         if box_center_camera_m is None:
             # Live capture AT this pose, so the FK-based camera->base above and
             # the measurement share the exact same posture.
-            vision_to_pre_push_start_sec = time.monotonic()
-            live_capture_start_sec = time.monotonic()
             print_stage("2/7 live_vision", "capturing D405 frames")
             measurement = capture_live_box_measurement(
                 robot,
@@ -3684,24 +3671,12 @@ def main(
                 hold_after_capture=visualize,
             )
             if measurement is None:
-                print_timing(
-                    timing,
-                    "live_vision_capture",
-                    live_capture_start_sec,
-                    detail="failed",
-                )
                 print_stage(
                     "2/7 live_vision",
                     "FAILED: not enough usable center frames within "
                     f"{live_vision_timeout_sec:.0f}s; aborting before contact",
                 )
                 return done
-            print_timing(
-                timing,
-                "live_vision_capture",
-                live_capture_start_sec,
-                detail=f"usable_frames={measurement['frames_used']}",
-            )
             print_stage(
                 "2/7 live_vision",
                 f"done; usable frames={measurement['frames_used']} "
@@ -3722,7 +3697,6 @@ def main(
                     f"y=0.000m±{mobile_base_y_tolerance_m:.3f}m, "
                     f"yaw≤{mobile_base_yaw_tolerance_deg:.1f}deg ({xy_policy})",
                 )
-                combined_align_start_sec = time.monotonic()
                 if discrete_align:
                     combined_measurement = run_mobile_base_combined_alignment(
                         robot,
@@ -3781,12 +3755,6 @@ def main(
                         ),
                         max_center_spread_m=live_center_spread_m,
                     )
-                print_timing(
-                    timing,
-                    "mobile_base_se2_align",
-                    combined_align_start_sec,
-                    detail="combined stage returned",
-                )
                 if combined_measurement is None:
                     print_stage(
                         "3-4/7 mobile_base_se2_align",
@@ -3874,7 +3842,6 @@ def main(
                     "closed-loop target box long-axis -> base y "
                     f"(tolerance={mobile_base_yaw_tolerance_deg:.1f}deg)",
                 )
-                yaw_align_start_sec = time.monotonic()
                 yaw_measurement = run_mobile_base_yaw_alignment(
                     robot,
                     dyn_model,
@@ -3891,12 +3858,6 @@ def main(
                     vision_frames_needed=mobile_base_yaw_vision_frames_needed,
                     vision_timeout_sec=mobile_base_yaw_vision_timeout_sec,
                     max_center_spread_m=live_center_spread_m,
-                )
-                print_timing(
-                    timing,
-                    "mobile_base_yaw_align",
-                    yaw_align_start_sec,
-                    detail="separate yaw stage returned",
                 )
                 if yaw_measurement is None:
                     print_stage(
@@ -3934,7 +3895,6 @@ def main(
                     f"x={mobile_base_target_x_m:.3f}m±{mobile_base_x_tolerance_m:.3f}m, "
                     f"y=0.000m±{mobile_base_y_tolerance_m:.3f}m",
                 )
-                xy_align_start_sec = time.monotonic()
                 aligned_measurement = run_mobile_base_alignment(
                     robot,
                     dyn_model,
@@ -3956,12 +3916,6 @@ def main(
                     min_command_timeout_sec=min_command_timeout_sec,
                     command_timeout_margin_sec=command_timeout_margin_sec,
                     stage="4/7 mobile_base_xy_align",
-                )
-                print_timing(
-                    timing,
-                    "mobile_base_xy_align",
-                    xy_align_start_sec,
-                    detail="separate xy stage returned",
                 )
                 if aligned_measurement is None:
                     print_stage(
@@ -4092,13 +4046,6 @@ def main(
             stage="pre_contact_yaw_gate",
         ):
             return done
-        if vision_to_pre_push_start_sec is not None:
-            print_timing(
-                timing,
-                "vision_to_pre_push_ready",
-                vision_to_pre_push_start_sec,
-                detail="pre-contact gates passed; building arm target next",
-            )
 
         print_stage("5/7 vision_pre_push", "building target")
         q = robot.get_state().position
@@ -4282,14 +4229,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--visualize-only",
         action="store_true",
         help="Observation mode: stream the visualization at the current posture, send NO motion commands.",
-    )
-    parser.add_argument(
-        "--timing",
-        action="store_true",
-        help=(
-            "Print wall-clock timings for live vision capture, mobile-base alignment, "
-            "and the vision-to-pre-push transition."
-        ),
     )
     parser.set_defaults(gripper_open=GRIPPER_OPEN_DEFAULT)
     parser.add_argument(
@@ -4556,8 +4495,9 @@ def combined_midpoint_offset_xy(args: argparse.Namespace) -> tuple[float, float]
     return midpoint_dx + box_dx, midpoint_dy
 
 
-if __name__ == "__main__":
-    args = parse_args()
+def run_cli(argv: list[str] | None = None) -> int:
+    """Run the picking CLI and return a process exit code."""
+    args = parse_args(argv)
     if args.command_timeout_margin_sec < 0.0:
         raise SystemExit("--command-timeout-margin-sec must be non-negative")
     if args.min_command_timeout_sec <= 0.0:
@@ -4622,60 +4562,60 @@ if __name__ == "__main__":
     midpoint_offset_xy = combined_midpoint_offset_xy(args)
     if any(abs(v) > 1e-12 for v in midpoint_offset_xy):
         print(f"[vision_pre_push] configured base-frame grasp offset xy: {midpoint_offset_xy}")
-    raise SystemExit(
-        0
-        if main(
-            address=args.address,
-            model=args.model,
-            power=args.power,
-            box_center_camera_m=center_camera,
-            view_rotation=args.view_rotation,
-            approach_time=float(args.approach_time),
-            hold_time=float(args.hold_time),
-            max_reference_xy_shift_m=max_shift,
-            midpoint_offset_xy_m=midpoint_offset_xy,
-            live_vision_frames_needed=int(args.live_vision_frames),
-            live_vision_timeout_sec=float(args.live_vision_timeout_sec),
-            live_center_spread_m=float(args.live_center_spread_m),
-            continue_pick=bool(args.continue_pick),
-            push_ramp_time_sec=float(args.push_ramp_time_sec),
-            visualize=bool(args.visualize or args.visualize_only),
-            visualize_only=bool(args.visualize_only),
-            discrete_align=bool(args.discrete_align),
-            servo_kp_xy=float(args.servo_kp_xy),
-            servo_kp_yaw=float(args.servo_kp_yaw),
-            servo_settled_frames=int(args.servo_settled_frames),
-            servo_timeout_sec=float(args.servo_timeout_sec),
-            servo_command_hold_time_sec=float(args.servo_command_hold_time_sec),
-            servo_command_stale_stop_sec=float(args.servo_command_stale_stop_sec),
-            servo_filter_window_frames=int(args.servo_filter_window_frames),
-            gripper_open=bool(args.gripper_open),
-            mobile_base_yaw_align=bool(args.mobile_base_yaw_align),
-            mobile_base_yaw_tolerance_deg=float(args.mobile_base_yaw_tolerance_deg),
-            mobile_base_yaw_max_speed_radps=float(args.mobile_base_yaw_max_speed_radps),
-            mobile_base_yaw_max_step_deg=float(args.mobile_base_yaw_max_step_deg),
-            mobile_base_yaw_max_iterations=int(args.mobile_base_yaw_max_iterations),
-            mobile_base_yaw_total_timeout_sec=float(args.mobile_base_yaw_timeout_sec),
-            mobile_base_yaw_move_duration_sec=float(args.mobile_base_yaw_move_duration_sec),
-            mobile_base_yaw_vision_frames_needed=int(args.mobile_base_yaw_vision_frames),
-            mobile_base_yaw_vision_timeout_sec=float(args.mobile_base_yaw_vision_timeout_sec),
-            mobile_base_combined_coarse_yaw_threshold_deg=float(
-                args.mobile_base_combined_coarse_yaw_threshold_deg
-            ),
-            mobile_base_align=bool(args.mobile_base_align),
-            mobile_base_target_x_m=float(args.mobile_base_target_x_m),
-            mobile_base_x_tolerance_m=float(args.mobile_base_x_tolerance_m),
-            mobile_base_y_tolerance_m=float(args.mobile_base_y_tolerance_m),
-            mobile_base_max_speed_mps=float(args.mobile_base_max_speed_mps),
-            mobile_base_max_step_m=float(args.mobile_base_max_step_m),
-            mobile_base_max_iterations=int(args.mobile_base_max_iterations),
-            mobile_base_total_timeout_sec=float(args.mobile_base_timeout_sec),
-            mobile_base_move_duration_sec=float(args.mobile_base_move_duration_sec),
-            mobile_base_vision_frames_needed=int(args.mobile_base_vision_frames),
-            mobile_base_vision_timeout_sec=float(args.mobile_base_vision_timeout_sec),
-            command_timeout_margin_sec=float(args.command_timeout_margin_sec),
-            min_command_timeout_sec=float(args.min_command_timeout_sec),
-            timing=bool(args.timing),
-        )
-        else 1
+    ok = main(
+        address=args.address,
+        model=args.model,
+        power=args.power,
+        box_center_camera_m=center_camera,
+        view_rotation=args.view_rotation,
+        approach_time=float(args.approach_time),
+        hold_time=float(args.hold_time),
+        max_reference_xy_shift_m=max_shift,
+        midpoint_offset_xy_m=midpoint_offset_xy,
+        live_vision_frames_needed=int(args.live_vision_frames),
+        live_vision_timeout_sec=float(args.live_vision_timeout_sec),
+        live_center_spread_m=float(args.live_center_spread_m),
+        continue_pick=bool(args.continue_pick),
+        push_ramp_time_sec=float(args.push_ramp_time_sec),
+        visualize=bool(args.visualize or args.visualize_only),
+        visualize_only=bool(args.visualize_only),
+        discrete_align=bool(args.discrete_align),
+        servo_kp_xy=float(args.servo_kp_xy),
+        servo_kp_yaw=float(args.servo_kp_yaw),
+        servo_settled_frames=int(args.servo_settled_frames),
+        servo_timeout_sec=float(args.servo_timeout_sec),
+        servo_command_hold_time_sec=float(args.servo_command_hold_time_sec),
+        servo_command_stale_stop_sec=float(args.servo_command_stale_stop_sec),
+        servo_filter_window_frames=int(args.servo_filter_window_frames),
+        gripper_open=bool(args.gripper_open),
+        mobile_base_yaw_align=bool(args.mobile_base_yaw_align),
+        mobile_base_yaw_tolerance_deg=float(args.mobile_base_yaw_tolerance_deg),
+        mobile_base_yaw_max_speed_radps=float(args.mobile_base_yaw_max_speed_radps),
+        mobile_base_yaw_max_step_deg=float(args.mobile_base_yaw_max_step_deg),
+        mobile_base_yaw_max_iterations=int(args.mobile_base_yaw_max_iterations),
+        mobile_base_yaw_total_timeout_sec=float(args.mobile_base_yaw_timeout_sec),
+        mobile_base_yaw_move_duration_sec=float(args.mobile_base_yaw_move_duration_sec),
+        mobile_base_yaw_vision_frames_needed=int(args.mobile_base_yaw_vision_frames),
+        mobile_base_yaw_vision_timeout_sec=float(args.mobile_base_yaw_vision_timeout_sec),
+        mobile_base_combined_coarse_yaw_threshold_deg=float(
+            args.mobile_base_combined_coarse_yaw_threshold_deg
+        ),
+        mobile_base_align=bool(args.mobile_base_align),
+        mobile_base_target_x_m=float(args.mobile_base_target_x_m),
+        mobile_base_x_tolerance_m=float(args.mobile_base_x_tolerance_m),
+        mobile_base_y_tolerance_m=float(args.mobile_base_y_tolerance_m),
+        mobile_base_max_speed_mps=float(args.mobile_base_max_speed_mps),
+        mobile_base_max_step_m=float(args.mobile_base_max_step_m),
+        mobile_base_max_iterations=int(args.mobile_base_max_iterations),
+        mobile_base_total_timeout_sec=float(args.mobile_base_timeout_sec),
+        mobile_base_move_duration_sec=float(args.mobile_base_move_duration_sec),
+        mobile_base_vision_frames_needed=int(args.mobile_base_vision_frames),
+        mobile_base_vision_timeout_sec=float(args.mobile_base_vision_timeout_sec),
+        command_timeout_margin_sec=float(args.command_timeout_margin_sec),
+        min_command_timeout_sec=float(args.min_command_timeout_sec),
     )
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_cli())
