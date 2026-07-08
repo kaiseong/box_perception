@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 import unittest
 
@@ -152,6 +153,24 @@ class PickingBox6ParityTests(unittest.TestCase):
 
         self.assertEqual(pb6.SCRIPT_NAME, "picking_box_6")
         self.assertNotIn("picking_box_5", source)
+
+    def test_stage_duration_printer_groups_repeated_stage_logs(self) -> None:
+        times = iter([10.0, 11.0, 12.5])
+        output = io.StringIO()
+        printer = pb6.StageDurationPrinter(output=output, clock=lambda: next(times))
+
+        printer.mark("2/7 live_vision")
+        printer.mark("2/7 live_vision")
+        printer.mark("3-4/7 mobile_base_se2_align")
+        printer.finish()
+
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            [
+                "[timing] 2/7 live_vision: 1.000s",
+                "[timing] 3-4/7 mobile_base_se2_align: 1.500s",
+            ],
+        )
 
 
 if __name__ == "__main__":

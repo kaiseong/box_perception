@@ -2481,9 +2481,50 @@ def build_pose_command(pose: dict[str, list[float]], minimum_time: float) -> Any
     )
 
 
+class StageDurationPrinter:
+    """Emit elapsed seconds once when the active stage changes."""
+
+    def __init__(self, *, output: Any | None = None, clock: Any = time.monotonic) -> None:
+        self.output = output
+        self.clock = clock
+        self._stage: str | None = None
+        self._stage_start: float | None = None
+
+    def mark(self, stage: str) -> None:
+        if stage == self._stage:
+            return
+        now = float(self.clock())
+        if self._stage is not None and self._stage_start is not None:
+            self._write(self._stage, now - self._stage_start)
+        self._stage = stage
+        self._stage_start = now
+
+    def finish(self) -> None:
+        if self._stage is None or self._stage_start is None:
+            return
+        now = float(self.clock())
+        self._write(self._stage, now - self._stage_start)
+        self._stage = None
+        self._stage_start = None
+
+    def _write(self, stage: str, elapsed_sec: float) -> None:
+        output = self.output if self.output is not None else sys.stdout
+        output.write(f"[timing] {stage}: {elapsed_sec:.3f}s\n")
+        output.flush()
+
+
+_STAGE_DURATION_PRINTER = StageDurationPrinter()
+
+
 def print_stage(stage: str, message: str) -> None:
     """Print the currently active picking stage immediately."""
+    _STAGE_DURATION_PRINTER.mark(stage)
     print(f"[stage] {stage} | {message}", flush=True)
+
+
+def finish_stage_timing() -> None:
+    """Flush the currently active stage timing line."""
+    _STAGE_DURATION_PRINTER.finish()
 
 
 def stage_timeout_sec(
@@ -4732,10 +4773,13 @@ def main(
         print_stage("interrupted", "KeyboardInterrupt while waiting in the last printed stage")
         raise
     finally:
-        close_streamed_mobile_handoff(measurement, robot, stage="cleanup")
-        if gripper_device is not None:
-            print_stage("0/7 gripper_home_open", "stopping max-open background loop")
-            gripper_device.stop()
+        try:
+            close_streamed_mobile_handoff(measurement, robot, stage="cleanup")
+            if gripper_device is not None:
+                print_stage("0/7 gripper_home_open", "stopping max-open background loop")
+                gripper_device.stop()
+        finally:
+            finish_stage_timing()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
