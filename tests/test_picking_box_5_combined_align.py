@@ -296,7 +296,9 @@ class PickingBox5CombinedAlignTests(unittest.TestCase):
     def test_pre_push_uses_stream_handoff_fk_gate_with_non_stream_fallback(self) -> None:
         source = inspect.getsource(pb5.main)
 
+        self.assertTrue(callable(pb5.checked_vision_pre_push_targets))
         self.assertIn('handoff_stream = measurement.pop("_handoff_stream"', source)
+        self.assertIn("checked_vision_pre_push_targets", source)
         self.assertIn("pre_push_stream = robot.create_command_stream", source)
         self.assertIn("wait_streamed_eef_arrival", source)
         self.assertIn("sent as new-stream first command", source)

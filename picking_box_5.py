@@ -2285,6 +2285,77 @@ def print_current_to_target_delta(
         )
 
 
+def checked_vision_pre_push_targets(
+    dyn_model: Any,
+    dyn_state: Any,
+    robot_model: Any,
+    q_template: np.ndarray,
+    box_center_base_m: np.ndarray,
+    *,
+    max_reference_xy_shift_m: float | None,
+    midpoint_offset_xy_m: tuple[float, float],
+    drop_delta_axis_base_xy: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Compute pre-push EEF targets with the shift safety check and logging."""
+    targets = vision_pre_push_targets(
+        dyn_model,
+        dyn_state,
+        robot_model,
+        q_template,
+        box_center_base_m,
+        midpoint_offset_xy_m=midpoint_offset_xy_m,
+        drop_delta_axis_base_xy=drop_delta_axis_base_xy,
+    )
+    if targets["dropped_delta_m"]:
+        print(
+            "[vision_pre_push] long axis underconstrained: dropped "
+            f"{targets['dropped_delta_m']:+.3f} m of correction along it "
+            "(that direction keeps the recorded pose)."
+        )
+
+    xy_delta = targets["xy_delta"]
+    xy_shift = float(np.linalg.norm(xy_delta))
+    if max_reference_xy_shift_m is not None and xy_shift > max_reference_xy_shift_m:
+        raise ValueError(
+            "vision x/y shift is too large: "
+            f"{xy_shift:.3f} m > {max_reference_xy_shift_m:.3f} m. "
+            "Re-run with --allow-large-vision-shift or a larger --max-reference-xy-shift-m "
+            "only after checking the vision estimate."
+        )
+
+    print("[vision_pre_push] reference frame:", VISION_PRE_PUSH_REFERENCE_LINK)
+    print("[vision_pre_push] box center in base:", np.asarray(box_center_base_m, dtype=np.float64))
+    print(
+        "[vision_pre_push] hand midpoint xy "
+        f"{targets['reference_midpoint_xy']} -> {targets['target_midpoint_xy']} "
+        f"(delta={xy_delta}, |delta|={xy_shift:.3f} m)"
+    )
+    print(
+        "[vision_pre_push] right target xyz:",
+        targets["right_target"][:3, 3],
+        "| left target xyz:",
+        targets["left_target"][:3, 3],
+    )
+    print(
+        "[vision_pre_push] extra y clearance:",
+        f"{targets['hand_y_margin_m']:.3f} m per hand",
+    )
+    print_current_to_target_delta(
+        label="vision_pre_push",
+        dyn_model=dyn_model,
+        dyn_state=dyn_state,
+        q=q_template,
+        ref_index=VISION_PRE_PUSH_REFERENCE_INDEX,
+        right_target=targets["right_target"],
+        left_target=targets["left_target"],
+    )
+    print(
+        "[vision_pre_push] base-frame z and rotation are inherited from "
+        "recorded START_TO_PICKING; base x/y midpoint is shifted and y spacing is widened."
+    )
+    return targets
+
+
 def build_vision_pre_push_command(
     dyn_model: Any,
     dyn_state: Any,
