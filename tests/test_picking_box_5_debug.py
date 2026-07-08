@@ -58,17 +58,35 @@ class PickingBox5DebugTests(unittest.TestCase):
 
         self.assertNotIn("picking_box_5", imports)
 
-    def test_print_stage_keeps_failures_visible_on_stderr(self) -> None:
+    def test_print_stage_traces_every_message_to_stderr(self) -> None:
+        # Keyword-filtered visibility silenced the servo's exit reason twice on
+        # hardware; every stage event must reach stderr with a timestamp.
         stderr = io.StringIO()
         with mock.patch.object(sys, "stderr", stderr):
             debug.print_stage("5/7 vision_pre_push", "FAILED; aborting")
-        self.assertIn("[stage] 5/7 vision_pre_push | FAILED; aborting", stderr.getvalue())
-
-    def test_print_stage_silences_normal_progress_messages(self) -> None:
-        stderr = io.StringIO()
-        with mock.patch.object(sys, "stderr", stderr):
             debug.print_stage("3-4/7 mobile_base_se2_align", "servoing error x=+1.0cm settled=0")
-        self.assertEqual(stderr.getvalue(), "")
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("5/7 vision_pre_push | FAILED; aborting", lines[0])
+        self.assertIn("servoing error x=+1.0cm settled=0", lines[1])
+        for line in lines:
+            self.assertRegex(line, r"^\[stage \+\s*\d+\.\d{3}s\]")
+
+    def test_print_stage_keeps_stdout_clean_for_timing(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
+            debug.print_stage("2/7 live_vision", "capturing")
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_servo_no_vision_abort_reports_unusable_breakdown(self) -> None:
+        source = Path(debug.__file__).read_text()
+        servo_start = source.index("def run_mobile_base_visual_servo_alignment(")
+        servo_end = source.index("def run_mobile_base_combined_alignment(", servo_start)
+        servo_source = source[servo_start:servo_end]
+        self.assertIn("unusable breakdown=", servo_source)
+        self.assertIn("filter_rejected", servo_source)
+        self.assertIn("no_yaw_from_axis", servo_source)
 
     def test_mobile_servo_settled_path_hands_off_live_stream(self) -> None:
         source = Path(debug.__file__).read_text()
@@ -121,22 +139,6 @@ class PickingBox5DebugTests(unittest.TestCase):
         self.assertIn("def close_streamed_mobile_handoff(", source)
         # Discrete-align retry, yaw-gate abort, and main cleanup all release it.
         self.assertGreaterEqual(source.count("close_streamed_mobile_handoff("), 5)
-
-    def test_failure_keywords_cover_known_failure_messages(self) -> None:
-        for message in (
-            "FAILED: residual error exceeds safety band",
-            "stop send failed (boom); calling robot.cancel_control()",
-            "servo alignment aborted from the live view",
-            "robot.cancel_control() requested",
-        ):
-            self.assertTrue(debug.stage_message_is_failure(message), message)
-        for message in (
-            "building target",
-            "servo settled: error x=+0.3cm y=-0.2cm yaw=+0.5deg",
-            "reached",
-        ):
-            self.assertFalse(debug.stage_message_is_failure(message), message)
-
 
 if __name__ == "__main__":
     unittest.main()

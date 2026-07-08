@@ -81,15 +81,13 @@ class StageDurationPrinter:
 
 
 _STAGE_DURATION_PRINTER = StageDurationPrinter()
+_STAGE_TRACE_STARTED_AT = time.monotonic()
 
-# Substrings that mark a stage message as a failure that must stay visible even
-# in timing-only mode. Silent failures made the robot "not move with no logs".
-STAGE_FAILURE_KEYWORDS = ("fail", "abort", "cancel")
-
-
-def stage_message_is_failure(message: str) -> bool:
-    lowered = message.lower()
-    return any(keyword in lowered for keyword in STAGE_FAILURE_KEYWORDS)
+# A keyword allowlist for stderr visibility silently ate the servo's exit
+# reason twice ("no usable vision...", "live vision stream ended...") and made
+# hardware runs undiagnosable. Stage events are low-frequency by design, so the
+# debug script now traces EVERY stage message to stderr with a timestamp;
+# stdout stays a clean [timing] summary.
 
 
 def _debug_silent_print(*_args: Any, **_kwargs: Any) -> None:
@@ -2567,11 +2565,11 @@ def build_pose_command(pose: dict[str, list[float]], minimum_time: float) -> Any
 
 
 def print_stage(stage: str, message: str) -> None:
-    """Mark a stage boundary for timing; failures always stay visible on stderr."""
+    """Mark a stage boundary for timing; trace every event to stderr."""
     _STAGE_DURATION_PRINTER.mark(stage, message)
-    if stage_message_is_failure(message):
-        sys.stderr.write(f"[stage] {stage} | {message}\n")
-        sys.stderr.flush()
+    elapsed = time.monotonic() - _STAGE_TRACE_STARTED_AT
+    sys.stderr.write(f"[stage +{elapsed:8.3f}s] {stage} | {message}\n")
+    sys.stderr.flush()
 
 
 def finish_stage_timing() -> None:
@@ -3262,7 +3260,9 @@ def run_mobile_base_visual_servo_alignment(
     paths still stop fully and reconfirm as in production.
     """
     del measurement  # servoing must not act on a pre-motion sample
+    print_stage(stage, "opening live view for servoing (camera pipeline start)")
     live_view = ContinuousLiveBoxView(view_rotation, show=visualize)
+    print_stage(stage, "live view open; starting command stream")
     guard = ServoDivergenceGuard()
     try:
         try:
@@ -3292,6 +3292,8 @@ def run_mobile_base_visual_servo_alignment(
         yaw_error: float | None = None
         settled_measurement: dict[str, Any] | None = None
         handoff_ready = False
+        unusable_counts: dict[str, int] = {}
+        frame_count = 0
 
         try:
             while True:
@@ -3325,22 +3327,28 @@ def run_mobile_base_visual_servo_alignment(
                         status_lines=status_lines,
                     )
                 except StopIteration:
-                    print_stage(stage, "live vision stream ended during servoing")
+                    print_stage(
+                        stage,
+                        f"FAILED: live vision stream ended during servoing "
+                        f"(frames={frame_count}, unusable breakdown={unusable_counts})",
+                    )
                     return None
                 if sample["abort"]:
                     raise UserAbortRequested("servo alignment aborted from the live view")
 
                 now = time.monotonic()
-                usable = (
-                    sample["usable"]
-                    and sample["center_base_m"] is not None
-                    and sample["long_axis_base"] is not None
-                )
-                if usable:
+                unusable_reason: str | None = None
+                if not sample["usable"]:
+                    unusable_reason = "estimate_not_usable"
+                elif sample["center_base_m"] is None:
+                    unusable_reason = "no_center"
+                elif sample["long_axis_base"] is None:
+                    unusable_reason = "no_long_axis"
+                else:
                     raw_center_base = np.asarray(sample["center_base_m"], dtype=np.float64)
                     raw_yaw_error = box_long_axis_base_yaw_error_deg(sample["long_axis_base"])
                     if raw_yaw_error is None:
-                        usable = False
+                        unusable_reason = "no_yaw_from_axis"
                     else:
                         filtered = measurement_filter.update(
                             raw_center_base,
@@ -3348,12 +3356,22 @@ def run_mobile_base_visual_servo_alignment(
                             target_x_m=target_x_m,
                         )
                         if filtered is None:
-                            usable = False
+                            unusable_reason = "filter_rejected"
                         else:
                             last_usable = now
                             center_base = np.asarray(filtered["center_base_m"], dtype=np.float64)
                             error_xy = np.asarray(filtered["error_xy_m"], dtype=np.float64)
                             yaw_error = float(filtered["yaw_error_deg"])
+                usable = unusable_reason is None
+                if unusable_reason is not None:
+                    unusable_counts[unusable_reason] = unusable_counts.get(unusable_reason, 0) + 1
+                frame_count += 1
+                if frame_count == 1:
+                    print_stage(
+                        stage,
+                        f"first vision frame processed (usable={usable}"
+                        + (f", reason={unusable_reason})" if unusable_reason else ")"),
+                    )
                 if usable:
                     aligned = (
                         abs(float(error_xy[0])) <= float(x_tolerance_m) + 1e-9
@@ -3417,8 +3435,9 @@ def run_mobile_base_visual_servo_alignment(
                     if now - last_usable > SERVO_NO_MEASUREMENT_ABORT_SEC:
                         print_stage(
                             stage,
-                            f"no usable vision for {SERVO_NO_MEASUREMENT_ABORT_SEC:.0f}s "
-                            "while servoing; stopping",
+                            f"FAILED: no usable vision for {SERVO_NO_MEASUREMENT_ABORT_SEC:.0f}s "
+                            f"while servoing; stopping (frames={frame_count}, "
+                            f"unusable breakdown={unusable_counts})",
                         )
                         return None
 
@@ -3431,7 +3450,8 @@ def run_mobile_base_visual_servo_alignment(
                         stage,
                         f"servoing ({now - start:.1f}/{float(total_timeout_sec):.1f}s) "
                         f"error x={error_xy[0] * 100:+.1f}cm y={error_xy[1] * 100:+.1f}cm "
-                        f"yaw={yaw_text} settled={settled}",
+                        f"yaw={yaw_text} settled={settled} frames={frame_count} "
+                        f"unusable={unusable_counts}",
                     )
                     next_log = now + COMMAND_WAIT_LOG_INTERVAL_SEC
         finally:
