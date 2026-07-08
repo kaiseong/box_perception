@@ -101,6 +101,8 @@ LIFT_JOINT_TORQUE_LIMIT = [70.0, 70.0, 70.0, 40.0, 10.0, 10.0, 8.0]
 LIFT_HOLD_TIME = 100.0
 LIFT_ENGAGE_MIN_RAISE_FRACTION = 0.5
 LIFT_ENGAGE_EXTRA_WAIT_SEC = 0.5
+LIFT_TARGET_RECORD_VERSION = "box-perception-lift-target-v1"
+DEFAULT_LIFT_TARGET_OUTPUT = ".omx/runtime/latest_pick_lift_target.json"
 # CartesianCommandBuilder.add_target's last argument is a DIMENSIONLESS scaling
 # of the internal Cartesian acceleration limits (0.5 = half), NOT m/s^2.
 CARTESIAN_ACCELERATION_LIMIT_SCALING = 0.5
@@ -3902,28 +3904,55 @@ def stream_impedance_push_stage(
     return False
 
 
-def build_impedance_lift_command(dyn_model: Any, dyn_state: Any, q: Any) -> Any:
-    """Raise both hands straight up by LIFT_HEIGHT along base +z, compliantly.
-
-    Uses per-arm CartesianImpedanceControlCommand (timed trajectory + joint
-    stiffness/damping/torque limit) so the box keeps being HELD while it rises:
-    a pure position-control lift maintains no inward preload once the push
-    command's hold expires, and the box can slip.
-    """
+def base_eef_transforms(dyn_model: Any, dyn_state: Any, q: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Return right/left EEF transforms in base frame for a joint vector."""
     dyn_state.set_q(q)
     dyn_model.compute_forward_kinematics(dyn_state)
-    T_base2right = dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_RIGHT_INDEX)
-    T_base2left = dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_LEFT_INDEX)
+    T_base2right = np.asarray(
+        dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_RIGHT_INDEX),
+        dtype=np.float64,
+    )
+    T_base2left = np.asarray(
+        dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_LEFT_INDEX),
+        dtype=np.float64,
+    )
+    return T_base2right, T_base2left
 
-    T_right_target = offset_translation(T_base2right, 0.0, +LIFT_HEIGHT)
-    T_left_target = offset_translation(T_base2left, 0.0, +LIFT_HEIGHT)
 
+def lift_targets_from_current_fk(
+    dyn_model: Any,
+    dyn_state: Any,
+    q: Any,
+    *,
+    lift_height_m: float = LIFT_HEIGHT,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the final pick-lift targets in base frame from current FK."""
+    T_base2right, T_base2left = base_eef_transforms(dyn_model, dyn_state, q)
+    return (
+        offset_translation(T_base2right, 0.0, +float(lift_height_m)),
+        offset_translation(T_base2left, 0.0, +float(lift_height_m)),
+    )
+
+
+def print_lift_target_summary(
+    current_right: np.ndarray,
+    current_left: np.ndarray,
+    target_right: np.ndarray,
+    target_left: np.ndarray,
+) -> None:
+    """Print the same lift summary whether the command is built directly or exported."""
     print(
-        f"[lift] right EEF z: {T_base2right[2, 3]:+.3f} -> {T_right_target[2, 3]:+.3f} m"
-        f"  |  left EEF z: {T_base2left[2, 3]:+.3f} -> {T_left_target[2, 3]:+.3f} m"
+        f"[lift] right EEF z: {current_right[2, 3]:+.3f} -> {target_right[2, 3]:+.3f} m"
+        f"  |  left EEF z: {current_left[2, 3]:+.3f} -> {target_left[2, 3]:+.3f} m"
         f"  (over {LIFT_MINIMUM_TIME:.0f}s, Cartesian impedance)"
     )
 
+
+def build_impedance_lift_command_from_targets(
+    right_target: np.ndarray,
+    left_target: np.ndarray,
+) -> Any:
+    """Build the dual-arm Cartesian impedance lift command from explicit targets."""
     def arm_cartesian_impedance(link_name: str, T_target: np.ndarray) -> Any:
         return (
             rby.CartesianImpedanceControlCommandBuilder()
@@ -3944,9 +3973,64 @@ def build_impedance_lift_command(dyn_model: Any, dyn_state: Any, q: Any) -> Any:
     return rby.RobotCommandBuilder().set_command(
         rby.ComponentBasedCommandBuilder().set_body_command(
             rby.BodyComponentBasedCommandBuilder()
-            .set_right_arm_command(arm_cartesian_impedance("ee_right", T_right_target))
-            .set_left_arm_command(arm_cartesian_impedance("ee_left", T_left_target))
+            .set_right_arm_command(arm_cartesian_impedance("ee_right", right_target))
+            .set_left_arm_command(arm_cartesian_impedance("ee_left", left_target))
         )
+    )
+
+
+def build_impedance_lift_command(dyn_model: Any, dyn_state: Any, q: Any) -> Any:
+    """Raise both hands straight up by LIFT_HEIGHT along base +z, compliantly.
+
+    Uses per-arm CartesianImpedanceControlCommand (timed trajectory + joint
+    stiffness/damping/torque limit) so the box keeps being HELD while it rises:
+    a pure position-control lift maintains no inward preload once the push
+    command's hold expires, and the box can slip.
+    """
+    T_base2right, T_base2left = base_eef_transforms(dyn_model, dyn_state, q)
+    T_right_target = offset_translation(T_base2right, 0.0, +LIFT_HEIGHT)
+    T_left_target = offset_translation(T_base2left, 0.0, +LIFT_HEIGHT)
+    print_lift_target_summary(T_base2right, T_base2left, T_right_target, T_left_target)
+    return build_impedance_lift_command_from_targets(T_right_target, T_left_target)
+
+
+def lift_target_record(
+    right_target: np.ndarray,
+    left_target: np.ndarray,
+    *,
+    source: str = "picking_box_5",
+) -> dict[str, Any]:
+    """Return the JSON-serializable target record consumed by placing_and_picking."""
+    return {
+        "format_version": LIFT_TARGET_RECORD_VERSION,
+        "source": source,
+        "reference_link": IMPEDANCE_LIFT_REFERENCE_LINK,
+        "right_target": np.asarray(right_target, dtype=np.float64).tolist(),
+        "left_target": np.asarray(left_target, dtype=np.float64).tolist(),
+        "lift_height_m": float(LIFT_HEIGHT),
+        "push_distance_m": float(PUSH_DISTANCE),
+        "created_unix_time_sec": float(time.time()),
+    }
+
+
+def write_lift_target_record(
+    path: str | Path,
+    right_target: np.ndarray,
+    left_target: np.ndarray,
+    *,
+    source: str = "picking_box_5",
+) -> None:
+    """Persist the final lift target so placing_and_picking can replay from target poses."""
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(
+            lift_target_record(right_target, left_target, source=source),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
     )
 
 
@@ -4003,6 +4087,7 @@ def main(
     mobile_base_vision_timeout_sec: float,
     command_timeout_margin_sec: float,
     min_command_timeout_sec: float,
+    lift_target_output: str | Path | None = DEFAULT_LIFT_TARGET_OUTPUT,
 ) -> bool:
     robot = rby.create_robot(address, model)
     robot.connect()
@@ -4591,7 +4676,21 @@ def main(
         print_stage("7/7 lift", "building target")
         q = robot.get_state().position
         z_before = eef_base_heights(dyn_model, dyn_state, q)
-        lift_command = build_impedance_lift_command(dyn_model, dyn_state, q)
+        current_right, current_left = base_eef_transforms(dyn_model, dyn_state, q)
+        lift_right_target, lift_left_target = lift_targets_from_current_fk(dyn_model, dyn_state, q)
+        print_lift_target_summary(
+            current_right,
+            current_left,
+            lift_right_target,
+            lift_left_target,
+        )
+        if lift_target_output is not None:
+            write_lift_target_record(lift_target_output, lift_right_target, lift_left_target)
+            print_stage("7/7 lift", f"saved lift target: {lift_target_output}")
+        lift_command = build_impedance_lift_command_from_targets(
+            lift_right_target,
+            lift_left_target,
+        )
         print_stage("7/7 lift", "cancel_control to release push hold; sending lift")
         try:
             robot.cancel_control()
@@ -4998,6 +5097,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Increase this if the grippers hit the box too hard."
         ),
     )
+    parser.add_argument(
+        "--lift-target-output",
+        type=str,
+        default=DEFAULT_LIFT_TARGET_OUTPUT,
+        help=(
+            "JSON path where the final base-frame lift target is saved for "
+            "placing_and_picking.py. Use an empty string to disable."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -5146,6 +5254,7 @@ def run_cli(argv: list[str] | None = None) -> int:
         mobile_base_vision_timeout_sec=float(args.mobile_base_vision_timeout_sec),
         command_timeout_margin_sec=float(args.command_timeout_margin_sec),
         min_command_timeout_sec=float(args.min_command_timeout_sec),
+        lift_target_output=(args.lift_target_output or None),
     )
     return 0 if ok else 1
 
