@@ -170,6 +170,12 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
         default=placing_and_picking.EEF_WAIT_TIMEOUT_SEC,
         help="Key 3: FK/gap verification timeout per stage.",
     )
+    parser.add_argument(
+        "--place-ready-time-sec",
+        type=float,
+        default=picking_box_new.MINIMUM_TIME,
+        help="Key 3: joint-position READY return duration after place-only release.",
+    )
     args, unknown = parser.parse_known_args(argv)
     return args, unknown
 
@@ -452,8 +458,9 @@ def perform_place_only_sequence(
     lower_ramp_time_sec: float,
     release_ramp_time_sec: float,
     eef_wait_timeout_sec: float,
+    ready_time_sec: float,
 ) -> bool:
-    """Lower from the exported lift target and open the arms, without regrasp/lift."""
+    """Lower from the exported lift target, open the arms, then return to READY."""
     targets = place_module.build_place_regrasp_target_chain(
         lifted,
         lower_delta_m=float(place_lower_delta_m),
@@ -514,13 +521,40 @@ def perform_place_only_sequence(
     ):
         return False
 
-    return True
+    place_module.print_stage(stage, "cancel_control for READY return")
+    if not place_module.cancel_control_for_next_stream(robot, stage):
+        return False
+
+    return send_ready_after_place(robot, ready_time_sec=float(ready_time_sec))
+
+
+def send_ready_after_place(robot: Any, *, ready_time_sec: float) -> bool:
+    stage = "place_only 3/3 ready"
+    picking_box_new.print_stage(stage, "joint position move")
+    ok = picking_box_new.send_stage(
+        robot,
+        picking_box_new.build_pose_command(
+            picking_box_new.READY,
+            float(ready_time_sec),
+        ),
+        stage,
+        timeout_sec=picking_box_new.stage_timeout_sec(
+            float(ready_time_sec),
+            min_timeout_sec=picking_box_new.COMMAND_TIMEOUT_MIN_SEC,
+            margin_sec=picking_box_new.COMMAND_TIMEOUT_MARGIN_SEC,
+        ),
+    )
+    if ok:
+        picking_box_new.print_stage(stage, "reached")
+    else:
+        picking_box_new.print_stage(stage, "FAILED")
+    return ok
 
 
 def run_place_only(args: argparse.Namespace) -> dict[str, Any]:
     print(
         f"[compare] START key={PLACE_ONLY_KEY} label=place_only "
-        "source=placing_and_picking.py target lower/release",
+        "source=placing_and_picking.py target lower/release/ready",
         flush=True,
     )
     print("[compare] timer starts now; warm vision is excluded", flush=True)
@@ -541,6 +575,7 @@ def run_place_only(args: argparse.Namespace) -> dict[str, Any]:
             lower_ramp_time_sec=float(args.lower_ramp_time_sec),
             release_ramp_time_sec=float(args.release_ramp_time_sec),
             eef_wait_timeout_sec=float(args.eef_wait_timeout_sec),
+            ready_time_sec=float(args.place_ready_time_sec),
         )
     except Exception as exc:  # pragma: no cover - hardware/runtime dependent
         ok = False
@@ -551,13 +586,14 @@ def run_place_only(args: argparse.Namespace) -> dict[str, Any]:
     record = {
         "candidate": "place_only",
         "key": PLACE_ONLY_KEY,
-        "source": "placing_and_picking.py target lower/release",
+        "source": "placing_and_picking.py target lower/release/ready",
         "ok": ok,
         "exit_code": 0 if ok else 1,
         "elapsed_sec": elapsed,
         "lift_target_json": str(args.lift_target_json),
         "place_lower_delta_m": float(args.place_lower_delta_m),
         "place_release_distance_m": float(args.place_release_distance_m),
+        "place_ready_time_sec": float(args.place_ready_time_sec),
         "unix_time_sec": time.time(),
     }
     if error is not None:

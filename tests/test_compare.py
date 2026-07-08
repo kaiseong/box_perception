@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -49,7 +50,7 @@ class CompareHarnessTests(unittest.TestCase):
             self.assertEqual(len(lines), 1)
             self.assertEqual(json.loads(lines[0]), {"candidate": "new", "elapsed_sec": 1.25})
 
-    def test_place_only_sequence_lowers_and_releases_without_regrasp(self) -> None:
+    def test_place_only_sequence_lowers_releases_and_returns_ready_without_regrasp(self) -> None:
         target_pair = compare.placing_and_picking.TargetPair
         lifted_right = np.eye(4, dtype=np.float64)
         lifted_left = np.eye(4, dtype=np.float64)
@@ -91,18 +92,27 @@ class CompareHarnessTests(unittest.TestCase):
             wait_for_gap_motion=wait_for_gap_motion,
         )
 
-        ok = compare.perform_place_only_sequence(
-            fake_module,
-            robot=object(),
-            dyn_model=object(),
-            dyn_state=object(),
-            lifted=lifted,
-            place_lower_delta_m=0.08,
-            place_release_distance_m=0.10,
-            lower_ramp_time_sec=1.0,
-            release_ramp_time_sec=0.5,
-            eef_wait_timeout_sec=4.0,
-        )
+        with mock.patch.object(
+            compare,
+            "send_ready_after_place",
+            side_effect=lambda _robot, *, ready_time_sec: calls.append(
+                ("ready", f"{ready_time_sec:.1f}")
+            )
+            or True,
+        ):
+            ok = compare.perform_place_only_sequence(
+                fake_module,
+                robot=object(),
+                dyn_model=object(),
+                dyn_state=object(),
+                lifted=lifted,
+                place_lower_delta_m=0.08,
+                place_release_distance_m=0.10,
+                lower_ramp_time_sec=1.0,
+                release_ramp_time_sec=0.5,
+                eef_wait_timeout_sec=4.0,
+                ready_time_sec=2.0,
+            )
 
         self.assertTrue(ok)
         self.assertEqual(
@@ -113,6 +123,7 @@ class CompareHarnessTests(unittest.TestCase):
             ],
         )
         self.assertNotIn(("stream", "4/5 regrasp_push"), calls)
+        self.assertIn(("ready", "2.0"), calls)
         self.assertAlmostEqual(observed["lowered_z"], 1.02)
         self.assertAlmostEqual(observed["initial_gap"], 0.10)
         self.assertAlmostEqual(observed["target_gap"], 0.30)
