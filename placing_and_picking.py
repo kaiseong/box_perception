@@ -6,7 +6,7 @@ it does not run vision, mobile-base alignment, initial picking, or gripper
 homing. It starts from the final lift target exported by picking_box_5.py and
 replays only the destination-table sequence:
 
-  1. lower from the exported lift target by 0.06 m in base z
+  1. lower from the exported lift target to base z=0.90 m
   2. release by moving both hands outward by the exact push distance
   3. wait on the table
   4. regrasp by returning both hands to the lowered push target
@@ -42,7 +42,7 @@ LIFT_TARGET_RECORD_VERSION = "box-perception-lift-target-v1"
 DEFAULT_LIFT_TARGET_JSON = ".omx/runtime/latest_pick_lift_target.json"
 
 PUSH_DISTANCE = 0.10
-PLACE_LOWER_HEIGHT = 0.06
+PLACE_LOWER_TARGET_Z_M = 0.90
 PLACE_WAIT_AFTER_RELEASE_SEC = 1.0
 
 REFERENCE_LINK = "base"
@@ -51,6 +51,9 @@ STREAM_PERIOD_SEC = 1.0 / 30.0
 STREAM_COMMAND_HOLD_TIME_SEC = 1.0
 STREAM_FINAL_HOLD_SEC = 3.0
 FINAL_LIFT_HOLD_SEC = 100.0
+STREAM_SEND_ATTEMPTS = 2
+STREAM_RETRY_IDLE_SLEEP_SEC = 0.3
+STREAM_CANCEL_SLEEP_SEC = 0.3
 
 LOWER_RAMP_TIME_SEC = 1.0
 RELEASE_RAMP_TIME_SEC = 0.5
@@ -117,11 +120,11 @@ def load_lift_target_record(path: str | Path) -> TargetPair:
     )
 
 
-def offset_z(pair: TargetPair, dz_m: float) -> TargetPair:
+def set_z(pair: TargetPair, z_m: float) -> TargetPair:
     right = pair.right.copy()
     left = pair.left.copy()
-    right[2, 3] += float(dz_m)
-    left[2, 3] += float(dz_m)
+    right[2, 3] = float(z_m)
+    left[2, 3] = float(z_m)
     return TargetPair(right=right, left=left)
 
 
@@ -150,11 +153,11 @@ def offset_outward_y(pair: TargetPair, distance_m: float) -> TargetPair:
 def build_place_regrasp_target_chain(
     lifted: TargetPair,
     *,
-    lower_height_m: float = PLACE_LOWER_HEIGHT,
+    lower_z_m: float = PLACE_LOWER_TARGET_Z_M,
     push_distance_m: float = PUSH_DISTANCE,
 ) -> PlaceRegraspTargets:
     """Build all place/regrasp targets from the exported pick-lift target."""
-    lowered = offset_z(lifted, -float(lower_height_m))
+    lowered = set_z(lifted, float(lower_z_m))
     released = offset_outward_y(lowered, float(push_distance_m))
     return PlaceRegraspTargets(
         lifted=lifted,
@@ -231,34 +234,32 @@ def stream_target_ramp_stage(
     ramp_hold = max(period * 2.0, STREAM_COMMAND_HOLD_TIME_SEC)
     final_hold = max(float(final_hold_sec), ramp_hold)
 
-    try:
-        stream = robot.create_command_stream(priority=COMMAND_STREAM_PRIORITY)
-    except Exception as exc:  # pragma: no cover - SDK/hardware dependent
-        print_stage(stage, f"failed to create command stream: {exc}")
-        return False
+    last_successful_sends = 0
 
-    def send_progress(progress: float, *, hold_time_sec: float) -> None:
-        right_target = interpolate_transform(start.right, end.right, progress)
-        left_target = interpolate_transform(start.left, end.left, progress)
-        stream.send_command(
-            build_dual_arm_impedance_target_command(
-                right_target,
-                left_target,
-                hold_time_sec=hold_time_sec,
-                minimum_time_sec=period,
+    def run_ramp_once(stream: Any) -> int:
+        nonlocal last_successful_sends
+        last_successful_sends = 0
+
+        def send_progress(progress: float, *, hold_time_sec: float) -> None:
+            nonlocal last_successful_sends
+            right_target = interpolate_transform(start.right, end.right, progress)
+            left_target = interpolate_transform(start.left, end.left, progress)
+            stream.send_command(
+                build_dual_arm_impedance_target_command(
+                    right_target,
+                    left_target,
+                    hold_time_sec=hold_time_sec,
+                    minimum_time_sec=period,
+                )
             )
-        )
+            last_successful_sends += 1
 
-    print_stage(stage, f"streaming target ramp over {ramp_time:.2f}s")
-    start_time = time.monotonic()
-    sends = 0
-    try:
+        print_stage(stage, f"streaming target ramp over {ramp_time:.2f}s")
+        start_time = time.monotonic()
         if ramp_time <= 0.0:
             send_progress(1.0, hold_time_sec=final_hold)
-            sends += 1
         else:
             send_progress(0.0, hold_time_sec=ramp_hold)
-            sends += 1
             next_send = start_time + period
             deadline = start_time + ramp_time
             while time.monotonic() < deadline:
@@ -266,28 +267,50 @@ def stream_target_ramp_stage(
                 if now >= next_send:
                     progress = min(1.0, max(0.0, (now - start_time) / ramp_time))
                     send_progress(progress, hold_time_sec=ramp_hold)
-                    sends += 1
                     next_send = now + period
                 sleep_sec = max(0.0, min(next_send, deadline) - time.monotonic())
                 time.sleep(min(0.005, sleep_sec))
         send_progress(1.0, hold_time_sec=final_hold)
-        sends += 1
-    except Exception as exc:  # pragma: no cover - SDK/hardware dependent
-        print_stage(stage, f"FAILED: stream send failed: {exc}")
-        return False
+        return last_successful_sends
 
-    print_stage(stage, f"ramp sent; stream sends={sends}")
-    return True
+    for attempt in range(1, STREAM_SEND_ATTEMPTS + 1):
+        try:
+            stream = robot.create_command_stream(priority=COMMAND_STREAM_PRIORITY)
+        except Exception as exc:  # pragma: no cover - SDK/hardware dependent
+            print_stage(stage, f"failed to create command stream: {exc}")
+            return False
+        try:
+            sends = run_ramp_once(stream)
+        except Exception as exc:  # pragma: no cover - SDK/hardware dependent
+            print_stage(stage, f"FAILED: stream send failed on attempt {attempt}: {exc}")
+            if attempt >= STREAM_SEND_ATTEMPTS or last_successful_sends > 0:
+                return False
+            print_stage(stage, "cancel_control; retrying target stream from idle")
+            if not cancel_control_for_next_stream(
+                robot,
+                stage,
+                sleep_sec=STREAM_RETRY_IDLE_SLEEP_SEC,
+            ):
+                return False
+            continue
+        print_stage(stage, f"ramp sent; stream sends={sends}")
+        return True
+    return False
 
 
-def cancel_control_for_next_stream(robot: Any, stage: str) -> bool:
+def cancel_control_for_next_stream(
+    robot: Any,
+    stage: str,
+    *,
+    sleep_sec: float = STREAM_CANCEL_SLEEP_SEC,
+) -> bool:
     """Release the held body stream so the next body stream starts from idle."""
     try:
         robot.cancel_control()
     except Exception as exc:  # pragma: no cover - SDK/hardware dependent
         print_stage(stage, f"FAILED: cancel_control before next stream failed: {exc}")
         return False
-    time.sleep(0.05)
+    time.sleep(max(0.0, float(sleep_sec)))
     return True
 
 
@@ -356,6 +379,7 @@ def perform_place_regrasp_sequence(
     dyn_state: Any,
     lifted: TargetPair,
     *,
+    place_lower_z_m: float = PLACE_LOWER_TARGET_Z_M,
     place_wait_sec: float = PLACE_WAIT_AFTER_RELEASE_SEC,
     lower_ramp_time_sec: float = LOWER_RAMP_TIME_SEC,
     release_ramp_time_sec: float = RELEASE_RAMP_TIME_SEC,
@@ -363,7 +387,7 @@ def perform_place_regrasp_sequence(
     lift_ramp_time_sec: float = LIFT_RAMP_TIME_SEC,
     eef_wait_timeout_sec: float = EEF_WAIT_TIMEOUT_SEC,
 ) -> bool:
-    targets = build_place_regrasp_target_chain(lifted)
+    targets = build_place_regrasp_target_chain(lifted, lower_z_m=float(place_lower_z_m))
 
     stages = [
         ("1/5 place_lower", targets.lifted, targets.lowered, lower_ramp_time_sec),
@@ -372,6 +396,10 @@ def perform_place_regrasp_sequence(
         ("5/5 regrasp_lift", targets.regrasped, targets.lifted, lift_ramp_time_sec),
     ]
     wait_after_stage = "2/5 release_open"
+
+    print_stage("placing_and_picking", "cancel_control before first target stream")
+    if not cancel_control_for_next_stream(robot, "placing_and_picking"):
+        return False
 
     for index, (stage, start, end, ramp_time) in enumerate(stages):
         print_stage(stage, "building target ramp")
@@ -428,6 +456,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=PLACE_WAIT_AFTER_RELEASE_SEC,
         help="Seconds to wait after opening/releasing before regrasp.",
     )
+    parser.add_argument(
+        "--place-lower-z-m",
+        type=float,
+        default=PLACE_LOWER_TARGET_Z_M,
+        help="Absolute base-frame z target for the lower/place pose.",
+    )
     parser.add_argument("--lower-ramp-time-sec", type=float, default=LOWER_RAMP_TIME_SEC)
     parser.add_argument("--release-ramp-time-sec", type=float, default=RELEASE_RAMP_TIME_SEC)
     parser.add_argument("--regrasp-ramp-time-sec", type=float, default=REGRASP_RAMP_TIME_SEC)
@@ -447,6 +481,7 @@ def main(
     model: str,
     power: str,
     lift_target_json: str | Path,
+    place_lower_z_m: float,
     place_wait_sec: float,
     lower_ramp_time_sec: float,
     release_ramp_time_sec: float,
@@ -491,6 +526,7 @@ def main(
         dyn_model,
         dyn_state,
         lifted,
+        place_lower_z_m=float(place_lower_z_m),
         place_wait_sec=float(place_wait_sec),
         lower_ramp_time_sec=float(lower_ramp_time_sec),
         release_ramp_time_sec=float(release_ramp_time_sec),
@@ -507,6 +543,8 @@ def run_cli(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.place_wait_sec < 0.0:
         raise SystemExit("--place-wait-sec must be non-negative")
+    if args.place_lower_z_m <= 0.0:
+        raise SystemExit("--place-lower-z-m must be positive")
     for attr in (
         "lower_ramp_time_sec",
         "release_ramp_time_sec",
@@ -523,6 +561,7 @@ def run_cli(argv: list[str] | None = None) -> int:
         model=args.model,
         power=args.power,
         lift_target_json=args.lift_target_json,
+        place_lower_z_m=float(args.place_lower_z_m),
         place_wait_sec=float(args.place_wait_sec),
         lower_ramp_time_sec=float(args.lower_ramp_time_sec),
         release_ramp_time_sec=float(args.release_ramp_time_sec),

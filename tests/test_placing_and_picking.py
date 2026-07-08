@@ -38,6 +38,7 @@ class PlacingAndPickingTests(unittest.TestCase):
 
         self.assertEqual(args.lift_target_json, pap.DEFAULT_LIFT_TARGET_JSON)
         self.assertAlmostEqual(args.place_wait_sec, 1.0)
+        self.assertAlmostEqual(args.place_lower_z_m, 0.9)
         self.assertFalse(hasattr(args, "initial_pick"))
         self.assertFalse(hasattr(args, "gripper_open"))
         self.assertFalse(hasattr(args, "visualize"))
@@ -51,10 +52,10 @@ class PlacingAndPickingTests(unittest.TestCase):
 
         targets = pap.build_place_regrasp_target_chain(lifted)
 
-        np.testing.assert_allclose(targets.lowered.right[:3, 3], [0.45, -0.24, 1.06])
-        np.testing.assert_allclose(targets.lowered.left[:3, 3], [0.45, +0.24, 1.06])
-        np.testing.assert_allclose(targets.released.right[:3, 3], [0.45, -0.34, 1.06])
-        np.testing.assert_allclose(targets.released.left[:3, 3], [0.45, +0.34, 1.06])
+        np.testing.assert_allclose(targets.lowered.right[:3, 3], [0.45, -0.24, 0.90])
+        np.testing.assert_allclose(targets.lowered.left[:3, 3], [0.45, +0.24, 0.90])
+        np.testing.assert_allclose(targets.released.right[:3, 3], [0.45, -0.34, 0.90])
+        np.testing.assert_allclose(targets.released.left[:3, 3], [0.45, +0.34, 0.90])
         np.testing.assert_allclose(targets.regrasped.right, targets.lowered.right)
         np.testing.assert_allclose(targets.regrasped.left, targets.lowered.left)
         np.testing.assert_allclose(targets.lifted.right, lifted.right)
@@ -68,8 +69,8 @@ class PlacingAndPickingTests(unittest.TestCase):
 
         targets = pap.build_place_regrasp_target_chain(lifted)
 
-        np.testing.assert_allclose(targets.released.right[:3, 3], [0.45, +0.34, 1.06])
-        np.testing.assert_allclose(targets.released.left[:3, 3], [0.45, -0.34, 1.06])
+        np.testing.assert_allclose(targets.released.right[:3, 3], [0.45, +0.34, 0.90])
+        np.testing.assert_allclose(targets.released.left[:3, 3], [0.45, -0.34, 0.90])
 
     def test_picking_box_5_writes_placing_target_record(self) -> None:
         right = transform(0.4, -0.2, 1.1)
@@ -145,21 +146,82 @@ class PlacingAndPickingTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("stream", "1/5 place_lower", 1.1, 3.0, (0.45, -0.24, 1.06)),
-                ("wait", "1/5 place_lower", (0.45, -0.24, 1.06)),
                 ("cancel",),
-                ("sleep", 0.05),
-                ("stream", "2/5 release_open", 0.5, 3.0, (0.45, -0.34, 1.06)),
-                ("wait", "2/5 release_open", (0.45, -0.34, 1.06)),
+                ("sleep", 0.3),
+                ("stream", "1/5 place_lower", 1.1, 3.0, (0.45, -0.24, 0.9)),
+                ("wait", "1/5 place_lower", (0.45, -0.24, 0.9)),
+                ("cancel",),
+                ("sleep", 0.3),
+                ("stream", "2/5 release_open", 0.5, 3.0, (0.45, -0.34, 0.9)),
+                ("wait", "2/5 release_open", (0.45, -0.34, 0.9)),
                 ("sleep", 1.0),
                 ("cancel",),
-                ("sleep", 0.05),
-                ("stream", "4/5 regrasp_push", 0.6, 3.0, (0.45, -0.24, 1.06)),
-                ("wait", "4/5 regrasp_push", (0.45, -0.24, 1.06)),
+                ("sleep", 0.3),
+                ("stream", "4/5 regrasp_push", 0.6, 3.0, (0.45, -0.24, 0.9)),
+                ("wait", "4/5 regrasp_push", (0.45, -0.24, 0.9)),
                 ("cancel",),
-                ("sleep", 0.05),
+                ("sleep", 0.3),
                 ("stream", "5/5 regrasp_lift", 1.2, 100.0, (0.45, -0.24, 1.12)),
                 ("wait", "5/5 regrasp_lift", (0.45, -0.24, 1.12)),
+            ],
+        )
+
+    def test_target_stream_retries_first_expired_send_from_idle(self) -> None:
+        calls: list[tuple[str, object]] = []
+        lifted = pap.TargetPair(
+            right=transform(0.45, -0.24, 1.12),
+            left=transform(0.45, +0.24, 0.90),
+        )
+
+        class FakeStream:
+            def __init__(self, stream_id: int) -> None:
+                self.stream_id = stream_id
+
+            def send_command(self, _command: object) -> None:
+                calls.append(("send", self.stream_id))
+                if self.stream_id == 1:
+                    raise RuntimeError("This command stream is expired")
+
+        class FakeRobot:
+            def __init__(self) -> None:
+                self.stream_id = 0
+
+            def create_command_stream(self, *, priority: int) -> FakeStream:
+                self.stream_id += 1
+                calls.append(("create", priority, self.stream_id))
+                return FakeStream(self.stream_id)
+
+            def cancel_control(self) -> None:
+                calls.append(("cancel",))
+
+        original_build = pap.build_dual_arm_impedance_target_command
+        original_sleep = pap.time.sleep
+        pap.build_dual_arm_impedance_target_command = lambda *_args, **_kwargs: object()
+        pap.time.sleep = lambda seconds: calls.append(("sleep", float(seconds)))
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ok = pap.stream_target_ramp_stage(
+                    FakeRobot(),
+                    start=lifted,
+                    end=lifted,
+                    stage="unit",
+                    ramp_time_sec=0.0,
+                )
+        finally:
+            pap.build_dual_arm_impedance_target_command = original_build
+            pap.time.sleep = original_sleep
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            calls,
+            [
+                ("create", pap.COMMAND_STREAM_PRIORITY, 1),
+                ("send", 1),
+                ("cancel",),
+                ("sleep", pap.STREAM_RETRY_IDLE_SLEEP_SEC),
+                ("create", pap.COMMAND_STREAM_PRIORITY, 2),
+                ("send", 2),
+                ("send", 2),
             ],
         )
 
@@ -213,6 +275,7 @@ class PlacingAndPickingTests(unittest.TestCase):
                         model="m",
                         power=".*",
                         lift_target_json=target_path,
+                        place_lower_z_m=0.9,
                         place_wait_sec=1.0,
                         lower_ramp_time_sec=1.0,
                         release_ramp_time_sec=0.5,
