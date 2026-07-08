@@ -165,7 +165,10 @@ SERVO_TOTAL_TIMEOUT_SEC = 40.0
 SERVO_UNUSABLE_DECAY = 0.5      # velocity decay per unusable frame
 SERVO_NO_MEASUREMENT_STOP_SEC = 1.0
 SERVO_NO_MEASUREMENT_ABORT_SEC = 5.0
-SERVO_COMMAND_HOLD_TIME_SEC = 0.25
+# Hold must survive the longest Python-side stall between 30Hz sender ticks.
+# On Jetson the vision estimator holds the GIL ~0.3s per frame; with 0.25s the
+# hardware run died with "This command stream is expired" at servo start.
+SERVO_COMMAND_HOLD_TIME_SEC = 1.0
 SERVO_COMMAND_STALE_STOP_SEC = 0.70
 SERVO_FILTER_WINDOW_FRAMES = 3
 SERVO_FILTER_CENTER_OUTLIER_M = 0.03

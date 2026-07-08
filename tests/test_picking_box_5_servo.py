@@ -231,6 +231,14 @@ class ServoControlTests(unittest.TestCase):
     def test_default_stale_stop_exceeds_orin_frame_jitter_budget(self) -> None:
         self.assertGreaterEqual(pb5.SERVO_COMMAND_STALE_STOP_SEC, 0.70)
 
+    def test_default_command_hold_survives_orin_vision_gil_stall(self) -> None:
+        # A 0.25s hold expired the stream on hardware: the Jetson vision
+        # estimator holds the GIL ~0.3s per frame, starving the 30Hz sender.
+        self.assertGreaterEqual(pb5.SERVO_COMMAND_HOLD_TIME_SEC, 1.0)
+        # The stale watchdog must still fire while the hold keeps the stream
+        # alive, so zeroing stays the faster of the two safety nets.
+        self.assertLess(pb5.SERVO_COMMAND_STALE_STOP_SEC, pb5.SERVO_COMMAND_HOLD_TIME_SEC)
+
 
 if __name__ == "__main__":
     unittest.main()
