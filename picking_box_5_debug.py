@@ -260,9 +260,11 @@ STREAMED_PRE_PUSH_EEF_ROTATION_TOLERANCE_DEG = 8.0
 STREAMED_PRE_PUSH_TIMEOUT_MARGIN_SEC = 3.0
 STREAMED_EEF_POLL_PERIOD_SEC = 0.05
 STREAMED_PUSH_FINAL_HOLD_SEC = 3.0
-# Contact engagement verification (streamed commands have no FinishCode).
+# Contact/lift engagement verification.
 PUSH_ENGAGE_MIN_GAP_SHRINK_M = 0.02
 PUSH_ENGAGE_ATTEMPTS = 2
+LIFT_ENGAGE_MIN_RAISE_FRACTION = 0.5
+LIFT_ENGAGE_EXTRA_WAIT_SEC = 0.5
 SERVO_DIVERGENCE_REFERENCE_PERCENTILE = 25.0
 SERVO_DIVERGENCE_REFERENCE_MIN_SAMPLES = 3
 SERVO_DIVERGENCE_CONSECUTIVE_FRAMES = 2
@@ -2692,6 +2694,95 @@ def send_stage(robot: Any, builder: Any, stage: str, *, timeout_sec: float) -> b
     return feedback.finish_code == rby.RobotCommandFeedback.FinishCode.Ok
 
 
+def eef_base_heights(dyn_model: Any, dyn_state: Any, q: Any) -> tuple[float, float]:
+    """Return right/left EEF z in base frame for FK-based stage gates."""
+    dyn_state.set_q(q)
+    dyn_model.compute_forward_kinematics(dyn_state)
+    T_right = np.asarray(
+        dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_RIGHT_INDEX),
+        dtype=np.float64,
+    )
+    T_left = np.asarray(
+        dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_LEFT_INDEX),
+        dtype=np.float64,
+    )
+    return float(T_right[2, 3]), float(T_left[2, 3])
+
+
+def send_lift_stage_with_fk_gate(
+    robot: Any,
+    builder: Any,
+    dyn_model: Any,
+    dyn_state: Any,
+    z_before: tuple[float, float],
+    stage: str,
+    *,
+    timeout_sec: float,
+    poll_sec: float = STREAMED_EEF_POLL_PERIOD_SEC,
+) -> bool:
+    """Send lift and verify motion by FK instead of waiting for 100s hold.
+
+    The lift command intentionally carries LIFT_HOLD_TIME so the arms keep
+    holding after the rise. Waiting for FinishCode would block until that hold
+    expires, which made the debug run look stuck at 7/7 despite a valid command.
+    """
+    print_stage(stage, "sending command")
+    command = robot.send_command(builder)
+    min_raise_m = LIFT_HEIGHT * LIFT_ENGAGE_MIN_RAISE_FRACTION
+    print_stage(
+        stage,
+        f"waiting for FK lift engage (min raise {min_raise_m * 100:.1f}cm; "
+        f"not waiting for {LIFT_HOLD_TIME:.0f}s hold FinishCode)",
+    )
+    deadline = time.monotonic() + max(0.1, float(timeout_sec))
+    next_log = time.monotonic() + COMMAND_WAIT_LOG_INTERVAL_SEC
+    best_raise_m = -float("inf")
+
+    while time.monotonic() < deadline:
+        z_after = eef_base_heights(dyn_model, dyn_state, robot.get_state().position)
+        raised_m = min(z_after[0] - z_before[0], z_after[1] - z_before[1])
+        best_raise_m = max(best_raise_m, raised_m)
+        if raised_m >= min_raise_m:
+            print_stage(
+                stage,
+                f"engaged: raised {raised_m * 100:.1f}cm by FK; "
+                f"command holds up to {LIFT_HOLD_TIME:.0f}s",
+            )
+            return True
+
+        try:
+            finished = command.wait_for(1)
+        except Exception as exc:  # pragma: no cover - SDK/hardware dependent
+            print_stage(stage, f"command wait poll failed while FK-gating lift: {exc}")
+            finished = False
+        if finished:
+            feedback = command.get()
+            print_stage(stage, f"finish_code={feedback.finish_code}")
+            if feedback.finish_code == rby.RobotCommandFeedback.FinishCode.Ok:
+                return True
+            return False
+
+        now = time.monotonic()
+        if now >= next_log:
+            elapsed = max(0.0, float(timeout_sec) - max(0.0, deadline - now))
+            print_stage(
+                stage,
+                f"still raising ({elapsed:.1f}/{float(timeout_sec):.1f}s, "
+                f"best={best_raise_m * 100:.1f}cm)",
+            )
+            next_log = now + COMMAND_WAIT_LOG_INTERVAL_SEC
+
+        time.sleep(max(0.001, min(float(poll_sec), deadline - time.monotonic())))
+
+    print_stage(
+        stage,
+        f"FAILED: lift FK gate timed out (best raise {best_raise_m * 100:.1f}cm "
+        f"< {min_raise_m * 100:.1f}cm)",
+    )
+    cancel_timed_out_command(robot, command, stage)
+    return False
+
+
 def wait_streamed_eef_arrival(
     robot: Any,
     dyn_model: Any,
@@ -4732,6 +4823,7 @@ def main(
 
         print_stage("7/7 lift", "building target")
         q = robot.get_state().position
+        z_before = eef_base_heights(dyn_model, dyn_state, q)
         lift_command = build_impedance_lift_command(dyn_model, dyn_state, q)
         # The push stream's final target is still holding, and neither a plain
         # command (G) nor another body stream (live run) can preempt it.
@@ -4743,13 +4835,16 @@ def main(
             robot.cancel_control()
         except Exception as cancel_exc:  # pragma: no cover - SDK/hardware dependent
             print_stage("7/7 lift", f"cancel_control failed: {cancel_exc}")
-        if not send_stage(
+        if not send_lift_stage_with_fk_gate(
             robot,
             lift_command,
+            dyn_model,
+            dyn_state,
+            z_before,
             "7/7 lift",
             timeout_sec=stage_timeout_sec(
                 LIFT_MINIMUM_TIME,
-                LIFT_HOLD_TIME,
+                LIFT_ENGAGE_EXTRA_WAIT_SEC,
                 min_timeout_sec=min_command_timeout_sec,
                 margin_sec=command_timeout_margin_sec,
             ),

@@ -130,20 +130,30 @@ class PickingBox5DebugTests(unittest.TestCase):
         self.assertIn("STREAMED_PUSH_FINAL_HOLD_SEC", push_source)
         self.assertIn("robot.cancel_control()", push_source)
 
-    def test_lift_releases_push_hold_right_before_sending(self) -> None:
+    def test_lift_releases_push_hold_then_fk_gates_without_waiting_for_hold_finish(self) -> None:
         # Neither a plain command (G) nor another body stream can preempt the
         # holding push stream, so lift must build first, cancel_control, and
-        # send immediately -- minimizing the unavoidable idle gap.
+        # send immediately. The command intentionally holds for 100s, so debug
+        # completion must be FK-gated rather than waiting for FinishCode.
         source = Path(debug.__file__).read_text()
         lift_start = source.index('print_stage("7/7 lift", "building target")')
         lift_end = source.index("except UserAbortRequested", lift_start)
         lift_source = source[lift_start:lift_end]
         build_at = lift_source.index("build_impedance_lift_command")
         cancel_at = lift_source.index("robot.cancel_control()")
-        send_at = lift_source.index("send_stage")
+        send_at = lift_source.index("send_lift_stage_with_fk_gate")
         self.assertLess(build_at, cancel_at)
         self.assertLess(cancel_at, send_at)
         self.assertNotIn("robot.create_command_stream", lift_source)
+        self.assertNotIn("send_stage", lift_source)
+
+        helper_start = source.index("def send_lift_stage_with_fk_gate(")
+        helper_end = source.index("def wait_streamed_eef_arrival(", helper_start)
+        helper_source = source[helper_start:helper_end]
+        self.assertIn("eef_base_heights", helper_source)
+        self.assertIn("LIFT_ENGAGE_MIN_RAISE_FRACTION", helper_source)
+        self.assertIn("not waiting for", helper_source)
+        self.assertIn("cancel_timed_out_command", helper_source)
 
     def test_pre_push_arrival_releases_control_for_idle_push_start(self) -> None:
         # A body stream cannot preempt a holding body stream, so after the FK
