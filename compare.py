@@ -135,40 +135,10 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
         help="JSONL path for measured A/B timing results. Empty disables logging.",
     )
     parser.add_argument(
-        "--lift-target-json",
-        type=str,
-        default=placing_and_picking.DEFAULT_LIFT_TARGET_JSON,
-        help="Lift target JSON used by key 3 place-only.",
-    )
-    parser.add_argument(
-        "--place-lower-delta-m",
-        type=float,
-        default=placing_and_picking.PLACE_LOWER_DELTA_M,
-        help="Key 3: base-frame z distance to lower from the exported lift target.",
-    )
-    parser.add_argument(
-        "--place-release-distance-m",
-        type=float,
-        default=placing_and_picking.PUSH_DISTANCE,
-        help="Key 3: outward y distance per hand for release.",
-    )
-    parser.add_argument(
-        "--lower-ramp-time-sec",
-        type=float,
-        default=placing_and_picking.LOWER_RAMP_TIME_SEC,
-        help="Key 3: lower ramp duration.",
-    )
-    parser.add_argument(
         "--release-ramp-time-sec",
         type=float,
-        default=placing_and_picking.RELEASE_RAMP_TIME_SEC,
+        default=placing_and_picking.PUSH_RAMP_TIME,
         help="Key 3: release/open ramp duration.",
-    )
-    parser.add_argument(
-        "--eef-wait-timeout-sec",
-        type=float,
-        default=placing_and_picking.EEF_WAIT_TIMEOUT_SEC,
-        help="Key 3: FK/gap verification timeout per stage.",
     )
     parser.add_argument(
         "--place-ready-time-sec",
@@ -451,78 +421,19 @@ def perform_place_only_sequence(
     robot: Any,
     dyn_model: Any,
     dyn_state: Any,
-    lifted: Any,
     *,
-    place_lower_delta_m: float,
-    place_release_distance_m: float,
-    lower_ramp_time_sec: float,
     release_ramp_time_sec: float,
-    eef_wait_timeout_sec: float,
     ready_time_sec: float,
 ) -> bool:
-    """Lower from the exported lift target, open the arms, then return to READY."""
-    targets = place_module.build_place_regrasp_target_chain(
-        lifted,
-        lower_delta_m=float(place_lower_delta_m),
-        push_distance_m=float(place_release_distance_m),
-    )
-
-    stage = "place_only 1/2 place_lower"
-    place_module.print_stage(
-        "compare_place_only",
-        "cancel_control before first target stream",
-    )
-    if not place_module.cancel_control_for_next_stream(robot, "compare_place_only"):
-        return False
-    place_module.print_stage(stage, "building target ramp")
-    if not place_module.stream_target_ramp_stage(
-        robot,
-        start=targets.lifted,
-        end=targets.lowered,
-        stage=stage,
-        ramp_time_sec=float(lower_ramp_time_sec),
-    ):
-        return False
-    if not place_module.wait_for_eef_targets(
+    """Place/release from the current held posture, then return to READY."""
+    if not place_module.perform_place_release_sequence(
         robot,
         dyn_model,
         dyn_state,
-        targets.lowered,
-        stage=stage,
-        timeout_sec=float(eef_wait_timeout_sec),
+        push_ramp_time_sec=float(release_ramp_time_sec),
+        command_timeout_margin_sec=place_module.COMMAND_TIMEOUT_MARGIN_SEC,
+        min_command_timeout_sec=place_module.COMMAND_TIMEOUT_MIN_SEC,
     ):
-        return False
-
-    place_module.print_stage(stage, "cancel_control for release stream")
-    if not place_module.cancel_control_for_next_stream(robot, stage):
-        return False
-
-    stage = "place_only 2/2 release_open"
-    initial_gap = place_module.hand_gap_m(
-        place_module.current_eef_pair(robot, dyn_model, dyn_state)
-    )
-    place_module.print_stage(stage, "building target ramp")
-    if not place_module.stream_target_ramp_stage(
-        robot,
-        start=targets.lowered,
-        end=targets.released,
-        stage=stage,
-        ramp_time_sec=float(release_ramp_time_sec),
-    ):
-        return False
-    if not place_module.wait_for_gap_motion(
-        robot,
-        dyn_model,
-        dyn_state,
-        initial_gap_m=initial_gap,
-        target_gap_m=place_module.hand_gap_m(targets.released),
-        stage=stage,
-        timeout_sec=float(eef_wait_timeout_sec),
-    ):
-        return False
-
-    place_module.print_stage(stage, "cancel_control for READY return")
-    if not place_module.cancel_control_for_next_stream(robot, stage):
         return False
 
     return send_ready_after_place(robot, ready_time_sec=float(ready_time_sec))
@@ -554,7 +465,7 @@ def send_ready_after_place(robot: Any, *, ready_time_sec: float) -> bool:
 def run_place_only(args: argparse.Namespace) -> dict[str, Any]:
     print(
         f"[compare] START key={PLACE_ONLY_KEY} label=place_only "
-        "source=placing_and_picking.py target lower/release/ready",
+        "source=placing_and_picking.py current-FK lower/release/ready",
         flush=True,
     )
     print("[compare] timer starts now; warm vision is excluded", flush=True)
@@ -562,19 +473,13 @@ def run_place_only(args: argparse.Namespace) -> dict[str, Any]:
     ok = False
     error: str | None = None
     try:
-        lifted = placing_and_picking.load_lift_target_record(args.lift_target_json)
         robot, dyn_model, dyn_state = connect_place_robot(args)
         ok = perform_place_only_sequence(
             placing_and_picking,
             robot,
             dyn_model,
             dyn_state,
-            lifted,
-            place_lower_delta_m=float(args.place_lower_delta_m),
-            place_release_distance_m=float(args.place_release_distance_m),
-            lower_ramp_time_sec=float(args.lower_ramp_time_sec),
             release_ramp_time_sec=float(args.release_ramp_time_sec),
-            eef_wait_timeout_sec=float(args.eef_wait_timeout_sec),
             ready_time_sec=float(args.place_ready_time_sec),
         )
     except Exception as exc:  # pragma: no cover - hardware/runtime dependent
@@ -586,13 +491,12 @@ def run_place_only(args: argparse.Namespace) -> dict[str, Any]:
     record = {
         "candidate": "place_only",
         "key": PLACE_ONLY_KEY,
-        "source": "placing_and_picking.py target lower/release/ready",
+        "source": "placing_and_picking.py current-FK lower/release/ready",
         "ok": ok,
         "exit_code": 0 if ok else 1,
         "elapsed_sec": elapsed,
-        "lift_target_json": str(args.lift_target_json),
-        "place_lower_delta_m": float(args.place_lower_delta_m),
-        "place_release_distance_m": float(args.place_release_distance_m),
+        "place_lower_delta_m": float(placing_and_picking.LIFT_HEIGHT),
+        "place_release_distance_m": float(placing_and_picking.PUSH_DISTANCE),
         "place_ready_time_sec": float(args.place_ready_time_sec),
         "unix_time_sec": time.time(),
     }

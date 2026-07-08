@@ -1496,7 +1496,7 @@ def capture_box_live(
     timeout_sec: float = LIVE_VISION_TIMEOUT_SEC,
     max_center_spread_m: float = LIVE_VISION_MAX_CENTER_SPREAD_M,
     visualize: bool = False,
-    hold_after_capture: bool = False,
+    hold_after_capture: bool = False,   
     camera_to_base: Any = None,
     run_forever: bool = False,
 ) -> dict[str, Any] | None:
@@ -1512,7 +1512,7 @@ def capture_box_live(
     within the timeout.
 
     With visualize=True an OpenCV window shows each frame with the fitted box
-    and, when camera_to_base is given, the base-frame x/y/yaw the robot would
+    and, when camera_to_base is given, the base-frame x/y/yaw the robot would   
     act on -- exactly what the grasp-reach experiments need. If
     hold_after_capture=True, the live window stays up after enough usable frames
     are captured until c/space/enter continues or q/ESC aborts. run_forever=True

@@ -50,46 +50,17 @@ class CompareHarnessTests(unittest.TestCase):
             self.assertEqual(len(lines), 1)
             self.assertEqual(json.loads(lines[0]), {"candidate": "new", "elapsed_sec": 1.25})
 
-    def test_place_only_sequence_lowers_releases_and_returns_ready_without_regrasp(self) -> None:
-        target_pair = compare.placing_and_picking.TargetPair
-        lifted_right = np.eye(4, dtype=np.float64)
-        lifted_left = np.eye(4, dtype=np.float64)
-        lifted_right[:3, 3] = [0.45, -0.05, 1.10]
-        lifted_left[:3, 3] = [0.45, 0.05, 1.10]
-        lifted = target_pair(right=lifted_right, left=lifted_left)
-
+    def test_place_only_sequence_reuses_current_fk_place_release_and_returns_ready(self) -> None:
         calls: list[tuple[str, str]] = []
-        observed: dict[str, float] = {}
 
-        def stream_target_ramp_stage(*_args: object, **kwargs: object) -> bool:
-            calls.append(("stream", str(kwargs["stage"])))
-            return True
-
-        def wait_for_eef_targets(*_args: object, **kwargs: object) -> bool:
-            calls.append(("eef", str(kwargs["stage"])))
-            target = kwargs["target"] if "target" in kwargs else _args[3]
-            observed["lowered_z"] = float(target.right[2, 3])
-            return True
-
-        def wait_for_gap_motion(*_args: object, **kwargs: object) -> bool:
-            calls.append(("gap", str(kwargs["stage"])))
-            observed["initial_gap"] = float(kwargs["initial_gap_m"])
-            observed["target_gap"] = float(kwargs["target_gap_m"])
-            return True
-
-        def cancel_control_for_next_stream(_robot: object, stage: str, **_kwargs: object) -> bool:
-            calls.append(("cancel", stage))
+        def perform_place_release_sequence(*_args: object, **kwargs: object) -> bool:
+            calls.append(("place_release", f"{float(kwargs['push_ramp_time_sec']):.1f}"))
             return True
 
         fake_module = SimpleNamespace(
-            build_place_regrasp_target_chain=compare.placing_and_picking.build_place_regrasp_target_chain,
-            print_stage=lambda *_args, **_kwargs: None,
-            cancel_control_for_next_stream=cancel_control_for_next_stream,
-            stream_target_ramp_stage=stream_target_ramp_stage,
-            wait_for_eef_targets=wait_for_eef_targets,
-            current_eef_pair=lambda *_args, **_kwargs: compare.placing_and_picking.offset_z(lifted, -0.08),
-            hand_gap_m=compare.placing_and_picking.hand_gap_m,
-            wait_for_gap_motion=wait_for_gap_motion,
+            perform_place_release_sequence=perform_place_release_sequence,
+            COMMAND_TIMEOUT_MARGIN_SEC=5.0,
+            COMMAND_TIMEOUT_MIN_SEC=8.0,
         )
 
         with mock.patch.object(
@@ -105,28 +76,18 @@ class CompareHarnessTests(unittest.TestCase):
                 robot=object(),
                 dyn_model=object(),
                 dyn_state=object(),
-                lifted=lifted,
-                place_lower_delta_m=0.08,
-                place_release_distance_m=0.10,
-                lower_ramp_time_sec=1.0,
                 release_ramp_time_sec=0.5,
-                eef_wait_timeout_sec=4.0,
                 ready_time_sec=2.0,
             )
 
         self.assertTrue(ok)
         self.assertEqual(
-            [call for call in calls if call[0] == "stream"],
+            calls,
             [
-                ("stream", "place_only 1/2 place_lower"),
-                ("stream", "place_only 2/2 release_open"),
+                ("place_release", "0.5"),
+                ("ready", "2.0"),
             ],
         )
-        self.assertNotIn(("stream", "4/5 regrasp_push"), calls)
-        self.assertIn(("ready", "2.0"), calls)
-        self.assertAlmostEqual(observed["lowered_z"], 1.02)
-        self.assertAlmostEqual(observed["initial_gap"], 0.10)
-        self.assertAlmostEqual(observed["target_gap"], 0.30)
 
 
 if __name__ == "__main__":

@@ -75,8 +75,8 @@ VISION_PRE_PUSH_ACCELERATION_LIMIT_SCALING = 0.80
 IMPEDANCE_REFERENCE_LINK = "link_torso_5"
 # Actual inward travel from the widened vision pre-push pose.
 PUSH_DISTANCE = 0.10
-IMPEDANCE_TRANSLATION_WEIGHT = [500.0, 1000.0, 500.0]
-IMPEDANCE_ROTATION_WEIGHT = [50.0, 50.0, 50.0]
+IMPEDANCE_TRANSLATION_WEIGHT = [500.0, 650.0, 500.0]
+IMPEDANCE_ROTATION_WEIGHT = [50.0, 50.0, 0.0]
 # ImpedanceControlCommandBuilder has no trajectory minimum_time in the SDK
 # examples. Ramp the target itself over this duration to avoid a spring target
 # jump that slams into the box.
