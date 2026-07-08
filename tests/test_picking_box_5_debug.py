@@ -99,22 +99,47 @@ class PickingBox5DebugTests(unittest.TestCase):
         self.assertIn('settled_measurement["_handoff_stream"] = stream', servo_source)
         self.assertIn("skipping stationary confirm", servo_source)
 
-    def test_pre_push_releases_handoff_stream_for_minimal_gap(self) -> None:
-        # Probe-verified: a mobility stream never executes composite body
-        # commands, so pre-push must release control and immediately use the
-        # proven non-stream path -- and never abort just because a stream
-        # handoff was present.
+    def test_pre_push_uses_new_stream_first_command_with_fk_gate_and_fallback(self) -> None:
+        # E-pattern (probe-verified): pre-push starts as a NEW stream's first
+        # body command so it preempts the servo bridge with no idle gap; FK
+        # gates arrival and any failure falls back to the proven non-stream
+        # path instead of aborting.
         source = Path(debug.__file__).read_text()
         stage_start = source.index('print_stage("5/7 vision_pre_push", "building target")')
         stage_end = source.index('print_stage("6/7 inward_push", "building ramped target stream")', stage_start)
         stage_source = source[stage_start:stage_end]
 
         handoff_start = stage_source.index("if handoff_stream is not None:")
-        handoff_end = stage_source.index("command = build_vision_pre_push_command(", handoff_start)
+        handoff_end = stage_source.index("if not streamed_pre_push_done:", handoff_start)
         handoff_source = stage_source[handoff_start:handoff_end]
+        self.assertIn("robot.create_command_stream", handoff_source)
+        self.assertIn("wait_streamed_eef_arrival", handoff_source)
         self.assertIn("robot.cancel_control()", handoff_source)
         self.assertNotIn("return done", handoff_source)
+        self.assertNotIn("send_stage", handoff_source)
         self.assertIn("send_stage", stage_source)
+
+    def test_push_stage_fk_verifies_engagement_and_retries_once(self) -> None:
+        source = Path(debug.__file__).read_text()
+        push_start = source.index("def stream_impedance_push_stage(")
+        push_end = source.index("def build_impedance_lift_command(", push_start)
+        push_source = source[push_start:push_end]
+        self.assertIn("hands_gap_m", push_source)
+        self.assertIn("PUSH_ENGAGE_MIN_GAP_SHRINK_M", push_source)
+        self.assertIn("PUSH_ENGAGE_ATTEMPTS", push_source)
+        self.assertIn("STREAMED_PUSH_FINAL_HOLD_SEC", push_source)
+        self.assertIn("robot.cancel_control()", push_source)
+
+    def test_lift_streams_first_command_with_fk_check_and_fallback(self) -> None:
+        source = Path(debug.__file__).read_text()
+        lift_start = source.index('print_stage("7/7 lift", "building target")')
+        lift_end = source.index("except UserAbortRequested", lift_start)
+        lift_source = source[lift_start:lift_end]
+        self.assertIn("robot.create_command_stream", lift_source)
+        self.assertIn("LIFT_ENGAGE_MIN_RAISE_FRACTION", lift_source)
+        self.assertIn("holding box on stream", lift_source)
+        # Fallback path must still exist and use the FinishCode wait.
+        self.assertIn("send_stage", lift_source)
 
     def test_synced_sample_includes_q_for_handoff_conversion(self) -> None:
         # synced_servo_sample_to_measurement requires "q"; without it the

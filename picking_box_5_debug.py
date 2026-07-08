@@ -235,20 +235,30 @@ SERVO_DIVERGENCE_WINDOW_SEC = 3.0
 SERVO_DIVERGENCE_GROWTH = 1.3
 SERVO_DIVERGENCE_GRACE_SEC = 1.5
 # ---- Streamed stage handoff (debug-only) ----
-# Keep ONE command stream alive from mobile servoing through pre-push, push and
-# lift so control never drops between stages (no blue->green->blue LED cycle).
-# stream_transition_probe.py on hardware (2026-07-08) showed: a live stream
-# accepts new body components and a Cartesian -> Impedance switch while
-# control_state stays Executing; it dies ONLY when a command's
-# control_hold_time expires before the next send ("This command stream is
-# expired"). So every streamed command must out-hold the gap to the next send.
-STREAM_HANDOFF_BRIDGE_HOLD_SEC = 3.0
+# Zero-idle stage chaining, built on stream_transition_probe.py hardware
+# results (2026-07-08):
+#   - a stream only executes the controller set of its FIRST command; adding a
+#     body component to a mobility stream is accepted but NEVER executed;
+#   - a stream dies when its command's control_hold_time expires;
+#   - plain robot.send_command does NOT preempt a holding stream command (G);
+#   - a NEW stream's FIRST body command DOES preempt a holding command (E),
+#     and a composite executes when it is a stream's first command (F).
+# So each stage starts as a NEW stream's first command while the previous
+# stage's command is still holding: control never drops to idle between
+# stages. Every streamed stage is FK-verified with a fallback to the proven
+# non-stream path.
+STREAM_HANDOFF_BRIDGE_HOLD_SEC = 0.8
 STREAMED_STAGE_MOBILITY_HOLD_MARGIN_SEC = 5.0
 STREAMED_PRE_PUSH_EEF_POSITION_TOLERANCE_M = 0.02
 STREAMED_PRE_PUSH_EEF_ROTATION_TOLERANCE_DEG = 8.0
 STREAMED_PRE_PUSH_TIMEOUT_MARGIN_SEC = 3.0
 STREAMED_EEF_POLL_PERIOD_SEC = 0.05
 STREAMED_PUSH_FINAL_HOLD_SEC = 3.0
+# Contact/lift engagement verification (streamed commands have no FinishCode).
+PUSH_ENGAGE_MIN_GAP_SHRINK_M = 0.02
+PUSH_ENGAGE_ATTEMPTS = 2
+LIFT_ENGAGE_MIN_RAISE_FRACTION = 0.5
+LIFT_ENGAGE_EXTRA_WAIT_SEC = 0.5
 SERVO_DIVERGENCE_REFERENCE_PERCENTILE = 25.0
 SERVO_DIVERGENCE_REFERENCE_MIN_SAMPLES = 3
 SERVO_DIVERGENCE_CONSECUTIVE_FRAMES = 2
@@ -3857,106 +3867,136 @@ def stream_impedance_push_stage(
     ramp_time_sec: float = PUSH_RAMP_TIME,
     hold_time_sec: float = PUSH_HOLD_TIME,
     stream_period_sec: float = PUSH_STREAM_PERIOD_SEC,
-    stream: Any | None = None,
     stage: str = "6/7 inward_push",
 ) -> bool:
     """Ramp the inward impedance target instead of jumping it in one command.
 
-    With `stream`, the ramp rides the given live command stream instead of
-    creating its own: each command carries a zero SE(2) mobility component, and
-    the FINAL command holds STREAMED_PUSH_FINAL_HOLD_SEC so the stream bridges
-    into the lift stage without the controller dropping between commands.
+    E-pattern chaining: the ramp's FIRST command on a NEW stream preempts the
+    still-holding pre-push command, and the FINAL target keeps holding
+    STREAMED_PUSH_FINAL_HOLD_SEC so the lift stream can preempt it the same
+    way -- control never drops to idle between the stages. Streamed commands
+    report no FinishCode, so engagement is FK-verified (the hand gap must
+    shrink onto the box); one cancel+retry covers a stream that failed to
+    take over.
     """
     q0 = np.asarray(q, dtype=np.float64).copy()
     period = max(0.01, float(stream_period_sec))
     ramp_time = max(0.0, float(ramp_time_sec))
     hold_time = max(0.0, float(hold_time_sec))
     ramp_command_hold_time = max(period * 2.0, float(PUSH_STREAM_COMMAND_HOLD_TIME))
-    shared_stream = stream is not None
-    final_command_hold_time = (
-        max(hold_time, STREAMED_PUSH_FINAL_HOLD_SEC) if shared_stream else hold_time
-    )
+    final_command_hold_time = max(hold_time, STREAMED_PUSH_FINAL_HOLD_SEC)
 
-    if not shared_stream:
+    def hands_gap_m() -> float:
+        q_now = robot.get_state().position
+        dyn_state.set_q(q_now)
+        dyn_model.compute_forward_kinematics(dyn_state)
+        T_right = np.asarray(
+            dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_RIGHT_INDEX),
+            dtype=np.float64,
+        )
+        T_left = np.asarray(
+            dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_LEFT_INDEX),
+            dtype=np.float64,
+        )
+        return float(abs(T_left[1, 3] - T_right[1, 3]))
+
+    def run_ramp_once(stream: Any) -> int:
+        def send_progress(progress: float, *, command_hold_time: float) -> float:
+            clamped = float(np.clip(progress, 0.0, 1.0))
+            stream.send_command(
+                build_impedance_push_command(
+                    dyn_model,
+                    dyn_state,
+                    q0,
+                    inward=PUSH_DISTANCE * clamped,
+                    hold_time=command_hold_time,
+                )
+            )
+            return clamped
+
+        print_stage(
+            stage,
+            f"streaming impedance target ramp over {ramp_time:.2f}s "
+            f"to inward={PUSH_DISTANCE:.3f}m at {1.0 / period:.1f}Hz",
+        )
+        start = time.monotonic()
+        next_send = start
+        next_log = start + COMMAND_WAIT_LOG_INTERVAL_SEC
+        sends = 0
+        last_progress = 0.0
+
+        if ramp_time <= 0.0:
+            last_progress = send_progress(1.0, command_hold_time=final_command_hold_time)
+            sends += 1
+        else:
+            last_progress = send_progress(0.0, command_hold_time=ramp_command_hold_time)
+            sends += 1
+            next_send = start + period
+            deadline = start + ramp_time
+            while time.monotonic() < deadline:
+                now = time.monotonic()
+                if now >= next_send:
+                    progress = min(1.0, max(0.0, (now - start) / ramp_time))
+                    last_progress = send_progress(
+                        progress,
+                        command_hold_time=ramp_command_hold_time,
+                    )
+                    sends += 1
+                    next_send = now + period
+
+                now = time.monotonic()
+                if now >= next_log:
+                    elapsed = min(ramp_time, max(0.0, now - start))
+                    print_stage(
+                        stage,
+                        f"ramping ({elapsed:.1f}/{ramp_time:.1f}s, "
+                        f"progress={last_progress * 100.0:.0f}%, sends={sends})",
+                    )
+                    next_log = now + COMMAND_WAIT_LOG_INTERVAL_SEC
+
+                sleep_sec = min(0.005, max(0.0, min(next_send, deadline) - time.monotonic()))
+                if sleep_sec > 0.0:
+                    time.sleep(sleep_sec)
+
+        # The final target always holds the bridge time so the lift stream can
+        # preempt it without an idle gap.
+        send_progress(1.0, command_hold_time=final_command_hold_time)
+        sends += 1
+        return sends
+
+    for attempt in range(1, PUSH_ENGAGE_ATTEMPTS + 1):
         try:
             stream = robot.create_command_stream(priority=PUSH_STREAM_PRIORITY)
         except Exception as exc:  # pragma: no cover - SDK/hardware dependent
             print_stage(stage, f"failed to create push command stream: {exc}")
             return False
-
-    def send_progress(progress: float, *, command_hold_time: float) -> float:
-        clamped = float(np.clip(progress, 0.0, 1.0))
-        stream.send_command(
-            build_impedance_push_command(
-                dyn_model,
-                dyn_state,
-                q0,
-                inward=PUSH_DISTANCE * clamped,
-                hold_time=command_hold_time,
-                zero_mobility_hold_sec=command_hold_time if shared_stream else None,
+        gap_before = hands_gap_m()
+        sends = run_ramp_once(stream)
+        print_stage(stage, f"ramp complete; holding final push target for {hold_time:.2f}s")
+        if hold_time > 0.0:
+            time.sleep(hold_time)
+        gap_shrink = gap_before - hands_gap_m()
+        if gap_shrink >= PUSH_ENGAGE_MIN_GAP_SHRINK_M:
+            print_stage(
+                stage,
+                f"engaged: hand gap shrank {gap_shrink * 100:.1f}cm (FK); "
+                f"done; stream sends={sends}",
             )
+            return True
+        print_stage(
+            stage,
+            f"FAILED: push did not engage (gap shrink {gap_shrink * 100:.1f}cm "
+            f"< {PUSH_ENGAGE_MIN_GAP_SHRINK_M * 100:.1f}cm) on attempt {attempt}",
         )
-        return clamped
-
-    print_stage(
-        stage,
-        f"streaming impedance target ramp over {ramp_time:.2f}s "
-        f"to inward={PUSH_DISTANCE:.3f}m at {1.0 / period:.1f}Hz",
-    )
-    start = time.monotonic()
-    next_send = start
-    next_log = start + COMMAND_WAIT_LOG_INTERVAL_SEC
-    sends = 0
-    last_progress = 0.0
-
-    if ramp_time <= 0.0:
-        last_progress = send_progress(1.0, command_hold_time=final_command_hold_time)
-        sends += 1
-    else:
-        last_progress = send_progress(0.0, command_hold_time=ramp_command_hold_time)
-        sends += 1
-        next_send = start + period
-        deadline = start + ramp_time
-        while time.monotonic() < deadline:
-            now = time.monotonic()
-            if now >= next_send:
-                progress = min(1.0, max(0.0, (now - start) / ramp_time))
-                last_progress = send_progress(
-                    progress,
-                    command_hold_time=ramp_command_hold_time,
-                )
-                sends += 1
-                next_send = now + period
-
-            now = time.monotonic()
-            if now >= next_log:
-                elapsed = min(ramp_time, max(0.0, now - start))
-                print_stage(
-                    stage,
-                    f"ramping ({elapsed:.1f}/{ramp_time:.1f}s, "
-                    f"progress={last_progress * 100.0:.0f}%, sends={sends})",
-                )
-                next_log = now + COMMAND_WAIT_LOG_INTERVAL_SEC
-
-            sleep_sec = min(0.005, max(0.0, min(next_send, deadline) - time.monotonic()))
-            if sleep_sec > 0.0:
-                time.sleep(sleep_sec)
-
-    if last_progress < 1.0:
-        send_progress(1.0, command_hold_time=final_command_hold_time)
-        sends += 1
-    elif shared_stream:
-        # Re-send the final target with the bridge hold: the ramp's last send
-        # used the short ramp hold, which could expire before the lift command
-        # replaces it on the shared stream.
-        send_progress(1.0, command_hold_time=final_command_hold_time)
-        sends += 1
-
-    print_stage(stage, f"ramp complete; holding final push target for {hold_time:.2f}s")
-    if hold_time > 0.0:
-        time.sleep(hold_time)
-    print_stage(stage, f"done; stream sends={sends}")
-    return True
+        if attempt < PUSH_ENGAGE_ATTEMPTS:
+            print_stage(stage, "cancel_control; retrying push on a fresh idle stream")
+            try:
+                robot.cancel_control()
+            except Exception as exc:  # pragma: no cover - SDK/hardware dependent
+                print_stage(stage, f"cancel_control failed: {exc}")
+                return False
+            time.sleep(0.3)
+    return False
 
 
 def build_impedance_lift_command(
@@ -4547,51 +4587,103 @@ def main(
         print_stage("5/7 vision_pre_push", "building target")
         q = robot.get_state().position
         handoff_stream = measurement.pop("_handoff_stream", None) if isinstance(measurement, dict) else None
+        streamed_pre_push_done = False
         if handoff_stream is not None:
-            # Probe-verified (2026-07-08): a mobility stream ACCEPTS composite
-            # body commands but never EXECUTES them, and expires when their
-            # hold lapses -- an RBY1 stream is bound to its first command's
-            # controller set. So the minimal-gap handoff is: keep the bridge
-            # holding the base through the residual checks above, then release
-            # control here and immediately start the proven non-stream
-            # pre-push. The visible idle gap is only cancel->controller-start.
-            print_stage(
-                "5/7 vision_pre_push",
-                "releasing mobile stream (cancel_control) for minimal-gap pre-push",
+            # E-pattern (probe-verified): a NEW stream's FIRST body command
+            # preempts the still-holding servo bridge, so control never drops
+            # between base alignment and arm motion. If preemption fails, the
+            # bridge expires within STREAM_HANDOFF_BRIDGE_HOLD_SEC and the FK
+            # gate + non-stream fallback below bound the damage.
+            targets = checked_vision_pre_push_targets(
+                dyn_model,
+                dyn_state,
+                robot_model,
+                q,
+                box_center_base_m,
+                max_reference_xy_shift_m=max_reference_xy_shift_m,
+                midpoint_offset_xy_m=midpoint_offset_xy_m,
+                drop_delta_axis_base_xy=drop_delta_axis_base_xy,
             )
-            handoff_stream = None
+            streamed_command = build_dual_target_cartesian_command(
+                reference_link=VISION_PRE_PUSH_REFERENCE_LINK,
+                right_target=targets["right_target"],
+                left_target=targets["left_target"],
+                minimum_time=approach_time,
+                # Hold the reached pose until the push stream preempts it.
+                hold_time=approach_time + STREAMED_STAGE_MOBILITY_HOLD_MARGIN_SEC,
+                linear_velocity_limit=vision_pre_push_linear_velocity_limit,
+                angular_velocity_limit=vision_pre_push_angular_velocity_limit,
+                acceleration_limit_scaling=vision_pre_push_acceleration_limit_scaling,
+            )
             try:
-                robot.cancel_control()
-            except Exception as cancel_exc:  # pragma: no cover - SDK/hardware dependent
-                print_stage("5/7 vision_pre_push", f"cancel_control failed: {cancel_exc}")
-        command = build_vision_pre_push_command(
-            dyn_model,
-            dyn_state,
-            robot_model,
-            q,
-            box_center_base_m,
-            approach_time=approach_time,
-            hold_time=hold_time,
-            linear_velocity_limit=vision_pre_push_linear_velocity_limit,
-            angular_velocity_limit=vision_pre_push_angular_velocity_limit,
-            acceleration_limit_scaling=vision_pre_push_acceleration_limit_scaling,
-            max_reference_xy_shift_m=max_reference_xy_shift_m,
-            midpoint_offset_xy_m=midpoint_offset_xy_m,
-            drop_delta_axis_base_xy=drop_delta_axis_base_xy,
-        )
-        if not send_stage(
-            robot,
-            command,
-            "5/7 vision_pre_push",
-            timeout_sec=stage_timeout_sec(
-                approach_time,
-                hold_time,
-                min_timeout_sec=min_command_timeout_sec,
-                margin_sec=command_timeout_margin_sec,
-            ),
-        ):
-            print_stage("5/7 vision_pre_push", "FAILED; aborting")
-            return done
+                pre_push_stream = robot.create_command_stream(
+                    priority=MOBILE_BASE_STREAM_PRIORITY
+                )
+                pre_push_stream.send_command(streamed_command)
+            except Exception as exc:  # pragma: no cover - SDK/hardware dependent
+                print_stage(
+                    "5/7 vision_pre_push",
+                    f"streamed send failed ({exc}); cancel_control + non-stream fallback",
+                )
+                try:
+                    robot.cancel_control()
+                except Exception as cancel_exc:
+                    print_stage("5/7 vision_pre_push", f"cancel_control failed: {cancel_exc}")
+            else:
+                print_stage(
+                    "5/7 vision_pre_push",
+                    "sent as new-stream first command (preempts servo bridge); FK gate",
+                )
+                if wait_streamed_eef_arrival(
+                    robot,
+                    dyn_model,
+                    dyn_state,
+                    right_target=targets["right_target"],
+                    left_target=targets["left_target"],
+                    reference_index=VISION_PRE_PUSH_REFERENCE_INDEX,
+                    timeout_sec=approach_time + STREAMED_PRE_PUSH_TIMEOUT_MARGIN_SEC,
+                    stage="5/7 vision_pre_push",
+                ):
+                    streamed_pre_push_done = True
+                else:
+                    print_stage(
+                        "5/7 vision_pre_push",
+                        "streamed pre-push did not engage; cancel_control + non-stream fallback",
+                    )
+                    try:
+                        robot.cancel_control()
+                    except Exception as cancel_exc:
+                        print_stage("5/7 vision_pre_push", f"cancel_control failed: {cancel_exc}")
+        if not streamed_pre_push_done:
+            q = robot.get_state().position
+            command = build_vision_pre_push_command(
+                dyn_model,
+                dyn_state,
+                robot_model,
+                q,
+                box_center_base_m,
+                approach_time=approach_time,
+                hold_time=hold_time,
+                linear_velocity_limit=vision_pre_push_linear_velocity_limit,
+                angular_velocity_limit=vision_pre_push_angular_velocity_limit,
+                acceleration_limit_scaling=vision_pre_push_acceleration_limit_scaling,
+                max_reference_xy_shift_m=max_reference_xy_shift_m,
+                midpoint_offset_xy_m=midpoint_offset_xy_m,
+                drop_delta_axis_base_xy=drop_delta_axis_base_xy,
+            )
+            if not send_stage(
+                robot,
+                command,
+                "5/7 vision_pre_push",
+                timeout_sec=stage_timeout_sec(
+                    approach_time,
+                    hold_time,
+                    min_timeout_sec=min_command_timeout_sec,
+                    margin_sec=command_timeout_margin_sec,
+                ),
+            ):
+                print_stage("5/7 vision_pre_push", "FAILED; aborting")
+                return done
         print_stage("5/7 vision_pre_push", "reached")
 
         if not continue_pick:
@@ -4615,18 +4707,70 @@ def main(
 
         print_stage("7/7 lift", "building target")
         q = robot.get_state().position
-        if not send_stage(
-            robot,
-            build_impedance_lift_command(dyn_model, dyn_state, q),
-            "7/7 lift",
-            timeout_sec=stage_timeout_sec(
-                LIFT_MINIMUM_TIME,
-                LIFT_HOLD_TIME,
-                min_timeout_sec=min_command_timeout_sec,
-                margin_sec=command_timeout_margin_sec,
-            ),
-        ):
-            print_stage("7/7 lift", "FAILED; aborting")
+
+        def eef_heights(q_sample: Any) -> tuple[float, float]:
+            dyn_state.set_q(q_sample)
+            dyn_model.compute_forward_kinematics(dyn_state)
+            T_right = np.asarray(
+                dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_RIGHT_INDEX),
+                dtype=np.float64,
+            )
+            T_left = np.asarray(
+                dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_LEFT_INDEX),
+                dtype=np.float64,
+            )
+            return float(T_right[2, 3]), float(T_left[2, 3])
+
+        z_before = eef_heights(q)
+        streamed_lift_done = False
+        try:
+            lift_stream = robot.create_command_stream(priority=PUSH_STREAM_PRIORITY)
+            lift_stream.send_command(build_impedance_lift_command(dyn_model, dyn_state, q))
+        except Exception as exc:  # pragma: no cover - SDK/hardware dependent
+            print_stage("7/7 lift", f"streamed lift send failed ({exc}); non-stream fallback")
+        else:
+            # E-pattern: this stream's first command preempts the held push
+            # target, so the grip preload transitions into the lift without an
+            # idle gap. No FinishCode on a stream: the trajectory is timed and
+            # FK-verified.
+            print_stage("7/7 lift", "sent as new-stream first command (preempts push hold)")
+            time.sleep(LIFT_MINIMUM_TIME + LIFT_ENGAGE_EXTRA_WAIT_SEC)
+            z_after = eef_heights(robot.get_state().position)
+            raised_m = min(z_after[0] - z_before[0], z_after[1] - z_before[1])
+            if raised_m >= LIFT_HEIGHT * LIFT_ENGAGE_MIN_RAISE_FRACTION:
+                print_stage("7/7 lift", f"engaged: raised {raised_m * 100:.1f}cm (FK)")
+                streamed_lift_done = True
+            else:
+                print_stage(
+                    "7/7 lift",
+                    f"FAILED: streamed lift raised only {raised_m * 100:.1f}cm; "
+                    "cancel_control + non-stream fallback",
+                )
+                try:
+                    robot.cancel_control()
+                except Exception as cancel_exc:
+                    print_stage("7/7 lift", f"cancel_control failed: {cancel_exc}")
+                time.sleep(0.3)
+        if not streamed_lift_done:
+            q = robot.get_state().position
+            if not send_stage(
+                robot,
+                build_impedance_lift_command(dyn_model, dyn_state, q),
+                "7/7 lift",
+                timeout_sec=stage_timeout_sec(
+                    LIFT_MINIMUM_TIME,
+                    LIFT_HOLD_TIME,
+                    min_timeout_sec=min_command_timeout_sec,
+                    margin_sec=command_timeout_margin_sec,
+                ),
+            ):
+                print_stage("7/7 lift", "FAILED; aborting")
+                return done
+            print_stage("7/7 lift", "done")
+            done = True
+            print("=" * 60)
+            print(f"[picking] picking motion COMPLETED. done = {done}")
+            print("=" * 60)
             return done
         print_stage("7/7 lift", "done")
 
@@ -4634,6 +4778,14 @@ def main(
         print("=" * 60)
         print(f"[picking] picking motion COMPLETED. done = {done}")
         print("=" * 60)
+        # The lift command lives on this process's stream; exiting would end
+        # the hold and release the box. Match production UX: keep holding
+        # until the operator stops the run.
+        print_stage(
+            "7/7 lift",
+            f"holding box on stream for up to {LIFT_HOLD_TIME:.0f}s; Ctrl+C to end",
+        )
+        time.sleep(LIFT_HOLD_TIME)
         return done
     except UserAbortRequested as abort:
         print_stage("aborted", f"operator abort: {abort}; no further motion")
