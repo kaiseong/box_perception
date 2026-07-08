@@ -134,6 +134,15 @@ class PickingBox5DebugTests(unittest.TestCase):
         lift_source = source[lift_call_start:lift_call_end]
         self.assertIn("zero_mobility_hold_sec=lift_stream_hold", lift_source)
 
+    def test_synced_sample_includes_q_for_handoff_conversion(self) -> None:
+        # synced_servo_sample_to_measurement requires "q"; without it the
+        # settled handoff silently fell back to the stationary-confirm path.
+        source = Path(debug.__file__).read_text()
+        grab_start = source.index("def grab_synced_estimate(")
+        grab_end = source.index("def collect_measurement(", grab_start)
+        grab_source = source[grab_start:grab_end]
+        self.assertIn('"q": q,', grab_source)
+
     def test_handoff_stream_is_released_on_fallback_and_cleanup_paths(self) -> None:
         source = Path(debug.__file__).read_text()
         self.assertIn("def close_streamed_mobile_handoff(", source)

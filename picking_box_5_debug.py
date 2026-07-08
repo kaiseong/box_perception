@@ -1936,6 +1936,9 @@ class ContinuousLiveBoxView:
             "center_base_m": center_base,
             "long_axis_base": axis_base,
             "abort": abort_requested,
+            # q at ~capture time: required to convert a settled synced sample
+            # into a full measurement for the stream handoff.
+            "q": q,
         }
 
     def collect_measurement(
@@ -3412,6 +3415,13 @@ def run_mobile_base_visual_servo_alignment(
                                 center_base_m=center_base,
                                 frames_used=filter_window_frames,
                             )
+                            if settled_measurement is None:
+                                print_stage(
+                                    stage,
+                                    "settled sample missing fields for handoff "
+                                    f"(keys={sorted(sample.keys())}); will fall back "
+                                    "to stationary confirm",
+                                )
                             commander.update(np.zeros(2, dtype=np.float64), 0.0)
                             break
                     else:
