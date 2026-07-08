@@ -6,7 +6,7 @@ it does not run vision, mobile-base alignment, initial picking, or gripper
 homing. It starts from the final lift target exported by picking_box_5.py and
 replays only the destination-table sequence:
 
-  1. lower from the exported lift target by 0.12 m in base z
+  1. lower from the exported lift target by 0.06 m in base z
   2. release by moving both hands outward by the exact push distance
   3. wait on the table
   4. regrasp by returning both hands to the lowered push target
@@ -42,7 +42,7 @@ LIFT_TARGET_RECORD_VERSION = "box-perception-lift-target-v1"
 DEFAULT_LIFT_TARGET_JSON = ".omx/runtime/latest_pick_lift_target.json"
 
 PUSH_DISTANCE = 0.10
-PLACE_LOWER_HEIGHT = 0.12
+PLACE_LOWER_HEIGHT = 0.06
 PLACE_WAIT_AFTER_RELEASE_SEC = 1.0
 
 REFERENCE_LINK = "base"

@@ -51,10 +51,10 @@ class PlacingAndPickingTests(unittest.TestCase):
 
         targets = pap.build_place_regrasp_target_chain(lifted)
 
-        np.testing.assert_allclose(targets.lowered.right[:3, 3], [0.45, -0.24, 1.00])
-        np.testing.assert_allclose(targets.lowered.left[:3, 3], [0.45, +0.24, 1.00])
-        np.testing.assert_allclose(targets.released.right[:3, 3], [0.45, -0.34, 1.00])
-        np.testing.assert_allclose(targets.released.left[:3, 3], [0.45, +0.34, 1.00])
+        np.testing.assert_allclose(targets.lowered.right[:3, 3], [0.45, -0.24, 1.06])
+        np.testing.assert_allclose(targets.lowered.left[:3, 3], [0.45, +0.24, 1.06])
+        np.testing.assert_allclose(targets.released.right[:3, 3], [0.45, -0.34, 1.06])
+        np.testing.assert_allclose(targets.released.left[:3, 3], [0.45, +0.34, 1.06])
         np.testing.assert_allclose(targets.regrasped.right, targets.lowered.right)
         np.testing.assert_allclose(targets.regrasped.left, targets.lowered.left)
         np.testing.assert_allclose(targets.lifted.right, lifted.right)
@@ -68,8 +68,8 @@ class PlacingAndPickingTests(unittest.TestCase):
 
         targets = pap.build_place_regrasp_target_chain(lifted)
 
-        np.testing.assert_allclose(targets.released.right[:3, 3], [0.45, +0.34, 1.00])
-        np.testing.assert_allclose(targets.released.left[:3, 3], [0.45, -0.34, 1.00])
+        np.testing.assert_allclose(targets.released.right[:3, 3], [0.45, +0.34, 1.06])
+        np.testing.assert_allclose(targets.released.left[:3, 3], [0.45, -0.34, 1.06])
 
     def test_picking_box_5_writes_placing_target_record(self) -> None:
         right = transform(0.4, -0.2, 1.1)
@@ -145,17 +145,17 @@ class PlacingAndPickingTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("stream", "1/5 place_lower", 1.1, 3.0, (0.45, -0.24, 1.0)),
-                ("wait", "1/5 place_lower", (0.45, -0.24, 1.0)),
+                ("stream", "1/5 place_lower", 1.1, 3.0, (0.45, -0.24, 1.06)),
+                ("wait", "1/5 place_lower", (0.45, -0.24, 1.06)),
                 ("cancel",),
                 ("sleep", 0.05),
-                ("stream", "2/5 release_open", 0.5, 3.0, (0.45, -0.34, 1.0)),
-                ("wait", "2/5 release_open", (0.45, -0.34, 1.0)),
+                ("stream", "2/5 release_open", 0.5, 3.0, (0.45, -0.34, 1.06)),
+                ("wait", "2/5 release_open", (0.45, -0.34, 1.06)),
                 ("sleep", 1.0),
                 ("cancel",),
                 ("sleep", 0.05),
-                ("stream", "4/5 regrasp_push", 0.6, 3.0, (0.45, -0.24, 1.0)),
-                ("wait", "4/5 regrasp_push", (0.45, -0.24, 1.0)),
+                ("stream", "4/5 regrasp_push", 0.6, 3.0, (0.45, -0.24, 1.06)),
+                ("wait", "4/5 regrasp_push", (0.45, -0.24, 1.06)),
                 ("cancel",),
                 ("sleep", 0.05),
                 ("stream", "5/5 regrasp_lift", 1.2, 100.0, (0.45, -0.24, 1.12)),
