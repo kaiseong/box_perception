@@ -5,18 +5,20 @@ Answers the four unknowns behind the smooth mobile-align -> pre-push -> push
 handoff before rebuilding it inside picking_box_5_debug.py:
 
   A. mobility-only SE(2) velocity streaming on one stream (known-good baseline)
-  B. same stream, then ONE composite command: body Cartesian hold + zero mobility
-     (can a stream gain a body component mid-life without a control drop?)
+  B. same stream, then ONE composite command: body Cartesian micro-move
+     (+3cm z, then revert) + zero mobility, FK-VERIFIED. Acceptance alone was a
+     false positive on hardware: the composite was accepted while the arms
+     never moved, so this phase checks actual EEF motion.
   C. same stream, then body Impedance hold + zero mobility
      (can the body controller type switch Cartesian -> Impedance on a stream?)
   D. let control_hold_time expire with no further sends, then try to send again
      (does the stream die on hold expiry, and with which exception?)
 
-Every command in this script targets the CURRENT pose with zero velocity, so a
-healthy robot should not visibly move at any point. Watch the LED during each
-phase; the script timestamps phase boundaries so you can correlate:
+Phase B RAISES AND LOWERS BOTH HANDS BY 3cm; everything else targets the
+current pose with zero velocity. Watch the LED during each phase; the script
+timestamps phase boundaries so you can correlate:
   - control active (command running) vs idle between phases
-  - whether B/C keep control engaged with no blue->green->blue cycle
+  - whether B/C keep control engaged without dropping to idle
 
 Run:  python stream_transition_probe.py --address <ROBOT_IP:PORT>
 Skip phases with e.g. --skip D. Abort any time with Ctrl+C (cancels control).
@@ -116,7 +118,12 @@ def current_eef_targets(robot: Any, dyn_model: Any, dyn_state: Any) -> dict[str,
     }
 
 
-def build_cartesian_hold_body(targets: dict[str, np.ndarray], *, hold_sec: float) -> Any:
+def build_cartesian_hold_body(
+    targets: dict[str, np.ndarray],
+    *,
+    hold_sec: float,
+    minimum_time_sec: float = 1.0,
+) -> Any:
     def arm(link_name: str, target: np.ndarray) -> Any:
         return (
             rby.CartesianCommandBuilder()
@@ -131,7 +138,7 @@ def build_cartesian_hold_body(targets: dict[str, np.ndarray], *, hold_sec: float
                 CARTESIAN_ANGULAR_VELOCITY_LIMIT,
                 CARTESIAN_ACCELERATION_LIMIT_SCALING,
             )
-            .set_minimum_time(1.0)
+            .set_minimum_time(float(minimum_time_sec))
         )
 
     return (
@@ -204,20 +211,97 @@ def phase_a_mobility_stream(stream: Any, duration_sec: float) -> bool:
     )
 
 
-def phase_b_add_body(stream: Any, targets: dict[str, np.ndarray]) -> bool:
-    log("phase B: ONE composite command on the SAME stream: "
-        "body Cartesian hold (current pose) + zero mobility. Watch the LED: "
-        "any green flash here means the stream cannot gain a body component seamlessly.")
-    ok = try_send(
+ARM_PROBE_DZ_M = 0.03
+ARM_PROBE_MIN_TIME_SEC = 1.5
+ARM_PROBE_WAIT_SEC = 3.0
+ARM_PROBE_MOVED_THRESHOLD_M = 0.02
+
+
+def read_eef_z(robot: Any, dyn_model: Any, dyn_state: Any) -> tuple[float, float]:
+    q = robot.get_state().position
+    dyn_state.set_q(q)
+    dyn_model.compute_forward_kinematics(dyn_state)
+    right = dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_RIGHT_INDEX)
+    left = dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_LEFT_INDEX)
+    return float(np.asarray(right)[2, 3]), float(np.asarray(left)[2, 3])
+
+
+def shifted_targets(targets: dict[str, np.ndarray], dz_m: float) -> dict[str, np.ndarray]:
+    shifted = dict(targets)
+    for key in ("base_to_right", "base_to_left"):
+        lifted = np.asarray(targets[key], dtype=np.float64).copy()
+        lifted[2, 3] += float(dz_m)
+        shifted[key] = lifted
+    return shifted
+
+
+def phase_b_add_body(
+    stream: Any,
+    robot: Any,
+    dyn_model: Any,
+    dyn_state: Any,
+    targets: dict[str, np.ndarray],
+) -> bool:
+    """Send an arm MICRO-MOVE (+3cm z) on the mobility stream and FK-verify it.
+
+    Acceptance alone proved nothing on hardware: a streamed composite body
+    command was accepted while the arms never moved 16cm to the pre-push pose.
+    This phase measures actual EEF motion, then reverts.
+    """
+    z0_right, z0_left = read_eef_z(robot, dyn_model, dyn_state)
+    log(f"phase B: streamed composite arm micro-move +{ARM_PROBE_DZ_M * 100:.0f}cm z "
+        f"(min_time {ARM_PROBE_MIN_TIME_SEC}s) + zero mobility on the SAME stream; "
+        "FK-verifying that the arms ACTUALLY track a streamed body command.")
+    if not try_send(
         stream,
         build_composite(
-            build_cartesian_hold_body(targets, hold_sec=BRIDGE_HOLD_SEC),
+            build_cartesian_hold_body(
+                shifted_targets(targets, ARM_PROBE_DZ_M),
+                hold_sec=BRIDGE_HOLD_SEC,
+                minimum_time_sec=ARM_PROBE_MIN_TIME_SEC,
+            ),
             hold_sec=BRIDGE_HOLD_SEC,
         ),
-        label="B composite",
+        label="B composite (arms +3cm z)",
+    ):
+        return False
+
+    deadline = time.monotonic() + ARM_PROBE_WAIT_SEC
+    best_dz = 0.0
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
+        z_right, z_left = read_eef_z(robot, dyn_model, dyn_state)
+        best_dz = max(best_dz, min(z_right - z0_right, z_left - z0_left))
+        log(f"B track: dz_right={(z_right - z0_right) * 100:+.1f}cm "
+            f"dz_left={(z_left - z0_left) * 100:+.1f}cm")
+        if best_dz >= ARM_PROBE_MOVED_THRESHOLD_M:
+            break
+    moved = best_dz >= ARM_PROBE_MOVED_THRESHOLD_M
+    log(f"phase B verdict: streamed body command {'EXECUTES' if moved else 'DOES NOT EXECUTE'} "
+        f"(best common dz={best_dz * 100:+.1f}cm)")
+
+    log("phase B: reverting arms to the original pose on the same stream")
+    reverted = try_send(
+        stream,
+        build_composite(
+            build_cartesian_hold_body(
+                targets,
+                hold_sec=BRIDGE_HOLD_SEC,
+                minimum_time_sec=ARM_PROBE_MIN_TIME_SEC,
+            ),
+            hold_sec=BRIDGE_HOLD_SEC,
+        ),
+        label="B revert",
     )
-    time.sleep(2.0)
-    return ok
+    time.sleep(ARM_PROBE_WAIT_SEC if moved else 0.5)
+    # Liveness: did the composite kill the command stream?
+    alive = try_send(
+        stream,
+        build_zero_se2_command(minimum_time=SEND_PERIOD_SEC, hold_sec=BRIDGE_HOLD_SEC),
+        label="B liveness zero-SE2",
+    )
+    log(f"phase B: stream {'still alive' if alive else 'DIED'} after composite commands")
+    return moved and reverted and alive
 
 
 def phase_c_switch_to_impedance(stream: Any, targets: dict[str, np.ndarray]) -> bool:
@@ -290,7 +374,8 @@ def main() -> int:
     dyn_model = robot.get_dynamics()
     dyn_state = dyn_model.make_state(DYN_LINK_NAMES, robot.model().robot_joint_names)
     targets = current_eef_targets(robot, dyn_model, dyn_state)
-    log("current EEF poses captured; every command below targets these (no motion expected)")
+    log("current EEF poses captured; phase B lifts both hands 3cm and reverts, "
+        "everything else holds the current pose")
     log_control_manager_state(robot, "before stream")
 
     stream = robot.create_command_stream(priority=STREAM_PRIORITY)
@@ -302,9 +387,10 @@ def main() -> int:
         log_control_manager_state(robot, "after A")
 
         if "B" not in args.skip:
-            if not phase_b_add_body(stream, targets):
-                log("phase B FAILED -> the rebuild must stream composite commands from "
-                    "the start of servoing (body hold + mobility velocity together)")
+            if not phase_b_add_body(stream, robot, dyn_model, dyn_state, targets):
+                log("phase B FAILED -> streamed composite body commands are accepted but "
+                    "not executed; the smooth handoff cannot ride this stream for arm "
+                    "motion and needs a different transport for pre-push")
                 return 1
             log_control_manager_state(robot, "after B")
 

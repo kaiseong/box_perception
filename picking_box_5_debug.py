@@ -4579,7 +4579,7 @@ def main(
                     print_stage("5/7 vision_pre_push", f"cancel_control failed: {cancel_exc}")
             else:
                 print_stage("5/7 vision_pre_push", "streaming on live mobile stream; FK gate")
-                if not wait_streamed_eef_arrival(
+                if wait_streamed_eef_arrival(
                     robot,
                     dyn_model,
                     dyn_state,
@@ -4589,15 +4589,24 @@ def main(
                     timeout_sec=approach_time + STREAMED_PRE_PUSH_TIMEOUT_MARGIN_SEC,
                     stage="5/7 vision_pre_push",
                 ):
-                    print_stage("5/7 vision_pre_push", "FAILED; aborting")
+                    streamed_pre_push_done = True
+                else:
+                    # Streamed body commands can be accepted without being
+                    # executed (observed on hardware). The box is aligned and
+                    # the arms are safe, so finish the pick on the proven
+                    # non-stream path instead of aborting.
+                    print_stage(
+                        "5/7 vision_pre_push",
+                        "streamed pre-push failed; cancel_control + non-stream fallback",
+                    )
+                    handoff_stream = None
                     try:
                         robot.cancel_control()
                     except Exception as cancel_exc:
                         print_stage("5/7 vision_pre_push", f"cancel_control failed: {cancel_exc}")
-                    return done
-                streamed_pre_push_done = True
         if not streamed_pre_push_done:
             handoff_stream = None
+            q = robot.get_state().position
             command = build_vision_pre_push_command(
                 dyn_model,
                 dyn_state,
