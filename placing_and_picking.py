@@ -74,6 +74,7 @@ EEF_WAIT_TIMEOUT_SEC = 4.0
 EEF_POLL_PERIOD_SEC = 0.02
 GAP_MOTION_MIN_FRACTION = 0.4
 GAP_TARGET_TOLERANCE_M = 0.02
+REGRASP_ENGAGE_MIN_GAP_SHRINK_M = 0.02
 
 
 @dataclass(frozen=True)
@@ -395,6 +396,7 @@ def wait_for_gap_motion(
     stage: str,
     timeout_sec: float = EEF_WAIT_TIMEOUT_SEC,
     min_fraction: float = GAP_MOTION_MIN_FRACTION,
+    min_delta_m: float | None = None,
     target_tolerance_m: float = GAP_TARGET_TOLERANCE_M,
 ) -> bool:
     commanded_delta = float(target_gap_m) - float(initial_gap_m)
@@ -404,6 +406,8 @@ def wait_for_gap_motion(
 
     direction = 1.0 if commanded_delta > 0.0 else -1.0
     required_delta = abs(commanded_delta) * float(min_fraction)
+    if min_delta_m is not None:
+        required_delta = min(required_delta, max(0.0, float(min_delta_m)))
     best_delta = 0.0
     best_target_error = float("inf")
     deadline = time.monotonic() + max(0.1, float(timeout_sec))
@@ -427,7 +431,7 @@ def wait_for_gap_motion(
     print_stage(
         stage,
         f"FAILED: hand gap did not {verb} enough "
-        f"(best delta={best_delta * 100:.1f}cm, "
+        f"(best delta={best_delta * 100:.1f}cm, required={required_delta * 100:.1f}cm, "
         f"best target error={best_target_error * 100:.1f}cm)",
     )
     return False
@@ -494,6 +498,11 @@ def perform_place_regrasp_sequence(
                 target_gap_m=hand_gap_m(end),
                 stage=stage,
                 timeout_sec=float(eef_wait_timeout_sec),
+                min_delta_m=(
+                    REGRASP_ENGAGE_MIN_GAP_SHRINK_M
+                    if stage == "4/5 regrasp_push"
+                    else None
+                ),
             ):
                 return False
         else:

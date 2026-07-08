@@ -136,6 +136,9 @@ class PlacingAndPickingTests(unittest.TestCase):
                     stage,
                     round(float(initial_gap_m), 6),
                     round(float(target_gap_m), 6),
+                    None
+                    if _kwargs.get("min_delta_m") is None
+                    else round(float(_kwargs["min_delta_m"]), 6),
                 )
             )
             return True
@@ -182,12 +185,12 @@ class PlacingAndPickingTests(unittest.TestCase):
                 ("cancel",),
                 ("sleep", 0.3),
                 ("stream", "2/5 release_open", 0.5, 3.0, (0.45, -0.34, 1.04)),
-                ("gap_wait", "2/5 release_open", 0.48, 0.68),
+                ("gap_wait", "2/5 release_open", 0.48, 0.68, None),
                 ("sleep", 1.0),
                 ("cancel",),
                 ("sleep", 0.3),
                 ("stream", "4/5 regrasp_push", 0.6, 3.0, (0.45, -0.24, 1.04)),
-                ("gap_wait", "4/5 regrasp_push", 0.48, 0.48),
+                ("gap_wait", "4/5 regrasp_push", 0.48, 0.48, 0.02),
                 ("cancel",),
                 ("sleep", 0.3),
                 ("stream", "5/5 regrasp_lift", 1.2, 100.0, (0.45, -0.24, 1.12)),
@@ -242,6 +245,60 @@ class PlacingAndPickingTests(unittest.TestCase):
                     target_gap_m=0.68,
                     stage="2/5 release_open",
                     timeout_sec=0.1,
+                )
+        finally:
+            pap.time.sleep = original_sleep
+
+        self.assertTrue(ok)
+
+    def test_regrasp_accepts_push_like_gap_engagement(self) -> None:
+        class FakeRobot:
+            def __init__(self) -> None:
+                self.positions = iter(
+                    [
+                        (-0.284, +0.284),
+                        (-0.265, +0.265),
+                    ]
+                )
+
+            def get_state(self) -> object:
+                return types.SimpleNamespace(position=np.zeros(1))
+
+        class FakeDynState:
+            def set_q(self, _q) -> None:
+                pass
+
+        class FakeDynModel:
+            def __init__(self, robot: FakeRobot) -> None:
+                self.robot = robot
+                self.current = (-0.284, +0.284)
+
+            def compute_forward_kinematics(self, _state) -> None:
+                try:
+                    self.current = next(self.robot.positions)
+                except StopIteration:
+                    pass
+
+            def compute_transformation(self, _state, _base_index, ee_index) -> np.ndarray:
+                y = self.current[0] if ee_index == pap.EE_RIGHT_INDEX else self.current[1]
+                return transform(0.45, y, 1.04)
+
+        robot = FakeRobot()
+        dyn_model = FakeDynModel(robot)
+
+        original_sleep = pap.time.sleep
+        pap.time.sleep = lambda _seconds: None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ok = pap.wait_for_gap_motion(
+                    robot,
+                    dyn_model,
+                    FakeDynState(),
+                    initial_gap_m=0.568,
+                    target_gap_m=0.466,
+                    stage="4/5 regrasp_push",
+                    timeout_sec=0.1,
+                    min_delta_m=pap.REGRASP_ENGAGE_MIN_GAP_SHRINK_M,
                 )
         finally:
             pap.time.sleep = original_sleep
