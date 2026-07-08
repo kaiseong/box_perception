@@ -302,7 +302,8 @@ class PickingBox5CombinedAlignTests(unittest.TestCase):
         self.assertIn("pre_push_stream = robot.create_command_stream", source)
         self.assertIn("wait_streamed_eef_arrival", source)
         self.assertIn("sent as new-stream first command", source)
-        self.assertIn("cancel_control so the push stream starts from idle", source)
+        self.assertIn("keeping body stream alive for push/lift handoff", source)
+        self.assertIn("active_body_stream = pre_push_stream", source)
         self.assertIn("build_vision_pre_push_command", source)
         self.assertIn("non-stream fallback", source)
 
@@ -313,18 +314,25 @@ class PickingBox5CombinedAlignTests(unittest.TestCase):
         self.assertIn("PUSH_ENGAGE_MIN_GAP_SHRINK_M", source)
         self.assertIn("PUSH_ENGAGE_ATTEMPTS", source)
         self.assertIn("STREAMED_PUSH_FINAL_HOLD_SEC", source)
+        self.assertIn("active_stream", source)
+        self.assertIn("stream_out.append(stream)", source)
         self.assertIn("robot.cancel_control()", source)
         self.assertIn("retrying push on a fresh idle stream", source)
 
     def test_lift_uses_fk_engage_gate_instead_of_waiting_for_hold_finishcode(self) -> None:
         main_source = inspect.getsource(pb5.main)
         gate_source = inspect.getsource(pb5.send_lift_stage_with_fk_gate)
+        streamed_gate_source = inspect.getsource(pb5.stream_lift_stage_with_fk_gate)
 
         self.assertIn("send_lift_stage_with_fk_gate", main_source)
-        self.assertIn("cancel_control to release push hold; sending lift", main_source)
+        self.assertIn("stream_lift_stage_with_fk_gate", main_source)
+        self.assertIn("streaming lift on held body stream", main_source)
+        self.assertNotIn("cancel_control to release push hold; sending lift", main_source)
         self.assertNotIn("LIFT_HOLD_TIME,", main_source)
         self.assertIn("eef_base_heights", gate_source)
+        self.assertIn("eef_base_heights", streamed_gate_source)
         self.assertIn("LIFT_ENGAGE_MIN_RAISE_FRACTION", gate_source)
+        self.assertIn("LIFT_ENGAGE_MIN_RAISE_FRACTION", streamed_gate_source)
         self.assertIn("not waiting for", gate_source)
         self.assertIn("cancel_timed_out_command", gate_source)
 
