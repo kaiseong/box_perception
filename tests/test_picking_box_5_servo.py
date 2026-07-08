@@ -151,6 +151,42 @@ class ServoControlTests(unittest.TestCase):
         np.testing.assert_allclose(result["error_xy_m"], [0.05, 0.020], atol=1e-12)
         self.assertAlmostEqual(float(result["yaw_error_deg"]), 5.0)
 
+    def test_measurement_filter_recovers_from_base_motion_latch_up(self) -> None:
+        # Hardware failure mode: the base moves during servoing, the median of
+        # ACCEPTED samples goes stale, and every fresh (correct) sample gets
+        # rejected forever. Sustained rejections must reset the window.
+        filt = pb5.ServoMeasurementFilter(
+            window_frames=3,
+            center_outlier_m=0.03,
+            yaw_outlier_deg=10.0,
+            rejection_reset_frames=3,
+        )
+        self.assertIsNotNone(filt.update([0.60, 0.050, 0.0], 8.0, target_x_m=0.45))
+        self.assertIsNotNone(filt.update([0.60, 0.049, 0.0], 8.0, target_x_m=0.45))
+        # Base displaced >3cm relative to the stale window (reality moved).
+        moved = [0.55, 0.010, 0.0]
+        self.assertIsNone(filt.update(moved, 4.0, target_x_m=0.45))
+        self.assertIsNone(filt.update(moved, 4.0, target_x_m=0.45))
+        result = filt.update(moved, 4.0, target_x_m=0.45)
+        self.assertIsNotNone(result)
+        np.testing.assert_allclose(result["center_base_m"][:2], moved[:2], atol=1e-12)
+        # After the reset the filter keeps tracking normally.
+        self.assertIsNotNone(filt.update([0.549, 0.011, 0.0], 3.8, target_x_m=0.45))
+
+    def test_measurement_filter_still_rejects_isolated_spikes_between_good_frames(self) -> None:
+        filt = pb5.ServoMeasurementFilter(
+            window_frames=3,
+            center_outlier_m=0.03,
+            yaw_outlier_deg=10.0,
+            rejection_reset_frames=3,
+        )
+        self.assertIsNotNone(filt.update([0.50, 0.020, 0.0], 5.0, target_x_m=0.45))
+        self.assertIsNotNone(filt.update([0.51, 0.021, 0.0], 4.0, target_x_m=0.45))
+        # Isolated spikes separated by good frames never accumulate to a reset.
+        for _ in range(4):
+            self.assertIsNone(filt.update([0.90, 0.300, 0.0], 40.0, target_x_m=0.45))
+            self.assertIsNotNone(filt.update([0.505, 0.020, 0.0], 4.5, target_x_m=0.45))
+
     def test_command_streamer_uses_short_hold_and_stale_zero(self) -> None:
         class FakeStream:
             def __init__(self) -> None:

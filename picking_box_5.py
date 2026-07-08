@@ -173,6 +173,12 @@ SERVO_COMMAND_STALE_STOP_SEC = 0.70
 SERVO_FILTER_WINDOW_FRAMES = 3
 SERVO_FILTER_CENTER_OUTLIER_M = 0.03
 SERVO_FILTER_YAW_OUTLIER_DEG = 10.0
+# The outlier gate compares against a median of ACCEPTED samples only. While
+# the base moves, a couple of rejections freeze that median and reality walks
+# out of the gate, after which every frame is rejected (observed on hardware:
+# 44/52 frames filter_rejected, servo aborted "no usable vision"). Sustained
+# rejections therefore mean the window is stale, not the samples: reset it.
+SERVO_FILTER_REJECTION_RESET_FRAMES = 3
 # Divergence guard: sustained growth of the normalized error is what an
 # inverted SE(2) sign convention looks like on the very first motion; abort
 # within ~one window instead of wandering until the timeout.
@@ -932,12 +938,15 @@ class ServoMeasurementFilter:
         window_frames: int = SERVO_FILTER_WINDOW_FRAMES,
         center_outlier_m: float = SERVO_FILTER_CENTER_OUTLIER_M,
         yaw_outlier_deg: float = SERVO_FILTER_YAW_OUTLIER_DEG,
+        rejection_reset_frames: int = SERVO_FILTER_REJECTION_RESET_FRAMES,
     ) -> None:
         self.window_frames = max(1, int(window_frames))
         self.center_outlier_m = float(center_outlier_m)
         self.yaw_outlier_deg = float(yaw_outlier_deg)
+        self.rejection_reset_frames = max(1, int(rejection_reset_frames))
         self._centers: list[np.ndarray] = []
         self._yaw_errors: list[float] = []
+        self._consecutive_rejections = 0
 
     def update(
         self,
@@ -964,8 +973,16 @@ class ServoMeasurementFilter:
             center_jump = float(np.linalg.norm(center[:2] - median_xy))
             yaw_jump = abs(float(yaw_error - median_yaw))
             if center_jump > self.center_outlier_m or yaw_jump > self.yaw_outlier_deg:
-                return None
+                self._consecutive_rejections += 1
+                if self._consecutive_rejections < self.rejection_reset_frames:
+                    return None
+                # Sustained rejections: the base moved and the accepted-sample
+                # median went stale (latch-up), so trust the fresh samples and
+                # re-seed the window instead of rejecting forever.
+                self._centers.clear()
+                self._yaw_errors.clear()
 
+        self._consecutive_rejections = 0
         self._centers.append(center)
         self._yaw_errors.append(yaw_error)
         if len(self._centers) > self.window_frames:
