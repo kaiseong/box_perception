@@ -97,6 +97,8 @@ class PlacingAndPickingTests(unittest.TestCase):
 
         original_stream = pap.stream_target_ramp_stage
         original_wait = pap.wait_for_eef_targets
+        original_gap_wait = pap.wait_for_gap_motion
+        original_current_pair = pap.current_eef_pair
         original_sleep = pap.time.sleep
 
         def xyz(target: pap.TargetPair) -> tuple[float, float, float]:
@@ -118,11 +120,36 @@ class PlacingAndPickingTests(unittest.TestCase):
             calls.append(("wait", stage, xyz(target)))
             return True
 
+        def fake_gap_wait(
+            _robot,
+            _dyn_model,
+            _dyn_state,
+            *,
+            initial_gap_m: float,
+            target_gap_m: float,
+            stage: str,
+            **_kwargs,
+        ) -> bool:
+            calls.append(
+                (
+                    "gap_wait",
+                    stage,
+                    round(float(initial_gap_m), 6),
+                    round(float(target_gap_m), 6),
+                )
+            )
+            return True
+
+        def fake_current_pair(_robot, _dyn_model, _dyn_state) -> pap.TargetPair:
+            return lifted
+
         def fake_sleep(seconds: float) -> None:
             calls.append(("sleep", float(seconds)))
 
         pap.stream_target_ramp_stage = fake_stream
         pap.wait_for_eef_targets = fake_wait
+        pap.wait_for_gap_motion = fake_gap_wait
+        pap.current_eef_pair = fake_current_pair
         pap.time.sleep = fake_sleep
         try:
             with contextlib.redirect_stdout(io.StringIO()):
@@ -140,6 +167,8 @@ class PlacingAndPickingTests(unittest.TestCase):
         finally:
             pap.stream_target_ramp_stage = original_stream
             pap.wait_for_eef_targets = original_wait
+            pap.wait_for_gap_motion = original_gap_wait
+            pap.current_eef_pair = original_current_pair
             pap.time.sleep = original_sleep
 
         self.assertTrue(ok)
@@ -153,18 +182,71 @@ class PlacingAndPickingTests(unittest.TestCase):
                 ("cancel",),
                 ("sleep", 0.3),
                 ("stream", "2/5 release_open", 0.5, 3.0, (0.45, -0.34, 1.04)),
-                ("wait", "2/5 release_open", (0.45, -0.34, 1.04)),
+                ("gap_wait", "2/5 release_open", 0.48, 0.68),
                 ("sleep", 1.0),
                 ("cancel",),
                 ("sleep", 0.3),
                 ("stream", "4/5 regrasp_push", 0.6, 3.0, (0.45, -0.24, 1.04)),
-                ("wait", "4/5 regrasp_push", (0.45, -0.24, 1.04)),
+                ("gap_wait", "4/5 regrasp_push", 0.48, 0.48),
                 ("cancel",),
                 ("sleep", 0.3),
                 ("stream", "5/5 regrasp_lift", 1.2, 100.0, (0.45, -0.24, 1.12)),
                 ("wait", "5/5 regrasp_lift", (0.45, -0.24, 1.12)),
             ],
         )
+
+    def test_release_open_accepts_partial_target_when_gap_increases_enough(self) -> None:
+        class FakeRobot:
+            def __init__(self) -> None:
+                self.positions = iter(
+                    [
+                        (-0.24, +0.24),
+                        (-0.29, +0.29),
+                    ]
+                )
+
+            def get_state(self) -> object:
+                return types.SimpleNamespace(position=np.zeros(1))
+
+        class FakeDynState:
+            def set_q(self, _q) -> None:
+                pass
+
+        class FakeDynModel:
+            def __init__(self, robot: FakeRobot) -> None:
+                self.robot = robot
+                self.current = (-0.24, +0.24)
+
+            def compute_forward_kinematics(self, _state) -> None:
+                try:
+                    self.current = next(self.robot.positions)
+                except StopIteration:
+                    pass
+
+            def compute_transformation(self, _state, _base_index, ee_index) -> np.ndarray:
+                y = self.current[0] if ee_index == pap.EE_RIGHT_INDEX else self.current[1]
+                return transform(0.45, y, 1.04)
+
+        robot = FakeRobot()
+        dyn_model = FakeDynModel(robot)
+
+        original_sleep = pap.time.sleep
+        pap.time.sleep = lambda _seconds: None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ok = pap.wait_for_gap_motion(
+                    robot,
+                    dyn_model,
+                    FakeDynState(),
+                    initial_gap_m=0.48,
+                    target_gap_m=0.68,
+                    stage="2/5 release_open",
+                    timeout_sec=0.1,
+                )
+        finally:
+            pap.time.sleep = original_sleep
+
+        self.assertTrue(ok)
 
     def test_target_stream_retries_first_expired_send_from_idle(self) -> None:
         calls: list[tuple[str, object]] = []

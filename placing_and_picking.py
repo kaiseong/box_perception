@@ -72,6 +72,8 @@ EEF_POSITION_TOLERANCE_M = 0.02
 EEF_ROTATION_TOLERANCE_DEG = 8.0
 EEF_WAIT_TIMEOUT_SEC = 4.0
 EEF_POLL_PERIOD_SEC = 0.02
+GAP_MOTION_MIN_FRACTION = 0.4
+GAP_TARGET_TOLERANCE_M = 0.02
 
 
 @dataclass(frozen=True)
@@ -324,6 +326,26 @@ def rotation_error_deg(current: np.ndarray, target: np.ndarray) -> float:
     return float(np.degrees(angle))
 
 
+def current_eef_pair(robot: Any, dyn_model: Any, dyn_state: Any) -> TargetPair:
+    q = robot.get_state().position
+    dyn_state.set_q(q)
+    dyn_model.compute_forward_kinematics(dyn_state)
+    return TargetPair(
+        right=np.asarray(
+            dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_RIGHT_INDEX),
+            dtype=np.float64,
+        ),
+        left=np.asarray(
+            dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_LEFT_INDEX),
+            dtype=np.float64,
+        ),
+    )
+
+
+def hand_gap_m(pair: TargetPair) -> float:
+    return float(abs(float(pair.left[1, 3]) - float(pair.right[1, 3])))
+
+
 def wait_for_eef_targets(
     robot: Any,
     dyn_model: Any,
@@ -339,24 +361,14 @@ def wait_for_eef_targets(
     best_pos_m = float("inf")
     best_rot_deg = float("inf")
     while time.monotonic() < deadline:
-        q = robot.get_state().position
-        dyn_state.set_q(q)
-        dyn_model.compute_forward_kinematics(dyn_state)
-        current_right = np.asarray(
-            dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_RIGHT_INDEX),
-            dtype=np.float64,
-        )
-        current_left = np.asarray(
-            dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_LEFT_INDEX),
-            dtype=np.float64,
-        )
+        current = current_eef_pair(robot, dyn_model, dyn_state)
         pos_m = max(
-            float(np.linalg.norm(current_right[:3, 3] - target.right[:3, 3])),
-            float(np.linalg.norm(current_left[:3, 3] - target.left[:3, 3])),
+            float(np.linalg.norm(current.right[:3, 3] - target.right[:3, 3])),
+            float(np.linalg.norm(current.left[:3, 3] - target.left[:3, 3])),
         )
         rot_deg = max(
-            rotation_error_deg(current_right, target.right),
-            rotation_error_deg(current_left, target.left),
+            rotation_error_deg(current.right, target.right),
+            rotation_error_deg(current.left, target.left),
         )
         best_pos_m = min(best_pos_m, pos_m)
         best_rot_deg = min(best_rot_deg, rot_deg)
@@ -369,6 +381,54 @@ def wait_for_eef_targets(
         stage,
         f"FAILED: FK target not reached (best pos={best_pos_m * 100:.1f}cm "
         f"rot={best_rot_deg:.1f}deg)",
+    )
+    return False
+
+
+def wait_for_gap_motion(
+    robot: Any,
+    dyn_model: Any,
+    dyn_state: Any,
+    *,
+    initial_gap_m: float,
+    target_gap_m: float,
+    stage: str,
+    timeout_sec: float = EEF_WAIT_TIMEOUT_SEC,
+    min_fraction: float = GAP_MOTION_MIN_FRACTION,
+    target_tolerance_m: float = GAP_TARGET_TOLERANCE_M,
+) -> bool:
+    commanded_delta = float(target_gap_m) - float(initial_gap_m)
+    if abs(commanded_delta) < 1e-6:
+        print_stage(stage, "gap target already satisfied")
+        return True
+
+    direction = 1.0 if commanded_delta > 0.0 else -1.0
+    required_delta = abs(commanded_delta) * float(min_fraction)
+    best_delta = 0.0
+    best_target_error = float("inf")
+    deadline = time.monotonic() + max(0.1, float(timeout_sec))
+    while time.monotonic() < deadline:
+        gap = hand_gap_m(current_eef_pair(robot, dyn_model, dyn_state))
+        achieved_delta = (gap - float(initial_gap_m)) * direction
+        target_error = abs(gap - float(target_gap_m))
+        best_delta = max(best_delta, achieved_delta)
+        best_target_error = min(best_target_error, target_error)
+        if achieved_delta >= required_delta or target_error <= float(target_tolerance_m):
+            verb = "increased" if direction > 0.0 else "decreased"
+            print_stage(
+                stage,
+                f"hand gap {verb} {max(0.0, achieved_delta) * 100:.1f}cm "
+                f"(target error={target_error * 100:.1f}cm)",
+            )
+            return True
+        time.sleep(EEF_POLL_PERIOD_SEC)
+
+    verb = "increase" if direction > 0.0 else "decrease"
+    print_stage(
+        stage,
+        f"FAILED: hand gap did not {verb} enough "
+        f"(best delta={best_delta * 100:.1f}cm, "
+        f"best target error={best_target_error * 100:.1f}cm)",
     )
     return False
 
@@ -399,6 +459,7 @@ def perform_place_regrasp_sequence(
         ("5/5 regrasp_lift", targets.regrasped, targets.lifted, lift_ramp_time_sec),
     ]
     wait_after_stage = "2/5 release_open"
+    gap_gated_stages = {"2/5 release_open", "4/5 regrasp_push"}
 
     print_stage("placing_and_picking", "cancel_control before first target stream")
     if not cancel_control_for_next_stream(robot, "placing_and_picking"):
@@ -406,6 +467,9 @@ def perform_place_regrasp_sequence(
 
     for index, (stage, start, end, ramp_time) in enumerate(stages):
         print_stage(stage, "building target ramp")
+        initial_gap = None
+        if stage in gap_gated_stages:
+            initial_gap = hand_gap_m(current_eef_pair(robot, dyn_model, dyn_state))
         if not stream_target_ramp_stage(
             robot,
             start=start,
@@ -419,15 +483,29 @@ def perform_place_regrasp_sequence(
             ),
         ):
             return False
-        if not wait_for_eef_targets(
-            robot,
-            dyn_model,
-            dyn_state,
-            end,
-            stage=stage,
-            timeout_sec=float(eef_wait_timeout_sec),
-        ):
-            return False
+        if stage in gap_gated_stages:
+            if initial_gap is None:
+                return False
+            if not wait_for_gap_motion(
+                robot,
+                dyn_model,
+                dyn_state,
+                initial_gap_m=initial_gap,
+                target_gap_m=hand_gap_m(end),
+                stage=stage,
+                timeout_sec=float(eef_wait_timeout_sec),
+            ):
+                return False
+        else:
+            if not wait_for_eef_targets(
+                robot,
+                dyn_model,
+                dyn_state,
+                end,
+                stage=stage,
+                timeout_sec=float(eef_wait_timeout_sec),
+            ):
+                return False
         if stage == wait_after_stage:
             print_stage("3/5 place_wait", f"waiting {float(place_wait_sec):.2f}s before regrasp")
             if place_wait_sec > 0.0:
