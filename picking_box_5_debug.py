@@ -241,12 +241,18 @@ SERVO_DIVERGENCE_GRACE_SEC = 1.5
 #     body component to a mobility stream is accepted but NEVER executed;
 #   - a stream dies when its command's control_hold_time expires;
 #   - plain robot.send_command does NOT preempt a holding stream command (G);
-#   - a NEW stream's FIRST body command DOES preempt a holding command (E),
-#     and a composite executes when it is a stream's first command (F).
-# So each stage starts as a NEW stream's first command while the previous
-# stage's command is still holding: control never drops to idle between
-# stages. Every streamed stage is FK-verified with a fallback to the proven
-# non-stream path.
+#   - a NEW stream's FIRST body command DOES preempt a holding non-stream
+#     command (E), and a composite executes as a stream's first command (F);
+#   - a body stream DOES take over from a holding MOBILITY stream (live pick
+#     run: pre-push preempted the servo bridge with zero gap), but a body
+#     stream CANNOT preempt another holding BODY stream: the new stream's
+#     first send raises "This command stream is expired" (live pick run,
+#     push after streamed pre-push).
+# Resulting chain: servo (mobility stream) -> pre-push (body stream, zero-gap
+# preemption) -> cancel_control -> push (body stream from idle) ->
+# cancel_control -> lift (plain command from idle). The two cancel gaps are
+# ~0.1-0.3s each, within the 0.5s budget; every streamed stage is FK-verified
+# with a fallback to the proven non-stream path.
 STREAM_HANDOFF_BRIDGE_HOLD_SEC = 0.8
 STREAMED_STAGE_MOBILITY_HOLD_MARGIN_SEC = 5.0
 STREAMED_PRE_PUSH_EEF_POSITION_TOLERANCE_M = 0.02
@@ -254,11 +260,9 @@ STREAMED_PRE_PUSH_EEF_ROTATION_TOLERANCE_DEG = 8.0
 STREAMED_PRE_PUSH_TIMEOUT_MARGIN_SEC = 3.0
 STREAMED_EEF_POLL_PERIOD_SEC = 0.05
 STREAMED_PUSH_FINAL_HOLD_SEC = 3.0
-# Contact/lift engagement verification (streamed commands have no FinishCode).
+# Contact engagement verification (streamed commands have no FinishCode).
 PUSH_ENGAGE_MIN_GAP_SHRINK_M = 0.02
 PUSH_ENGAGE_ATTEMPTS = 2
-LIFT_ENGAGE_MIN_RAISE_FRACTION = 0.5
-LIFT_ENGAGE_EXTRA_WAIT_SEC = 0.5
 SERVO_DIVERGENCE_REFERENCE_PERCENTILE = 25.0
 SERVO_DIVERGENCE_REFERENCE_MIN_SAMPLES = 3
 SERVO_DIVERGENCE_CONSECUTIVE_FRAMES = 2
@@ -3971,23 +3975,31 @@ def stream_impedance_push_stage(
             print_stage(stage, f"failed to create push command stream: {exc}")
             return False
         gap_before = hands_gap_m()
-        sends = run_ramp_once(stream)
-        print_stage(stage, f"ramp complete; holding final push target for {hold_time:.2f}s")
-        if hold_time > 0.0:
-            time.sleep(hold_time)
-        gap_shrink = gap_before - hands_gap_m()
-        if gap_shrink >= PUSH_ENGAGE_MIN_GAP_SHRINK_M:
+        try:
+            sends = run_ramp_once(stream)
+        except Exception as exc:  # pragma: no cover - SDK/hardware dependent
+            # A body stream cannot preempt a holding body stream; the first
+            # send then raises "This command stream is expired". Treat it as a
+            # failed attempt: cancel and retry from idle.
+            print_stage(stage, f"FAILED: push stream send ({exc}) on attempt {attempt}")
+            sends = None
+        if sends is not None:
+            print_stage(stage, f"ramp complete; holding final push target for {hold_time:.2f}s")
+            if hold_time > 0.0:
+                time.sleep(hold_time)
+            gap_shrink = gap_before - hands_gap_m()
+            if gap_shrink >= PUSH_ENGAGE_MIN_GAP_SHRINK_M:
+                print_stage(
+                    stage,
+                    f"engaged: hand gap shrank {gap_shrink * 100:.1f}cm (FK); "
+                    f"done; stream sends={sends}",
+                )
+                return True
             print_stage(
                 stage,
-                f"engaged: hand gap shrank {gap_shrink * 100:.1f}cm (FK); "
-                f"done; stream sends={sends}",
+                f"FAILED: push did not engage (gap shrink {gap_shrink * 100:.1f}cm "
+                f"< {PUSH_ENGAGE_MIN_GAP_SHRINK_M * 100:.1f}cm) on attempt {attempt}",
             )
-            return True
-        print_stage(
-            stage,
-            f"FAILED: push did not engage (gap shrink {gap_shrink * 100:.1f}cm "
-            f"< {PUSH_ENGAGE_MIN_GAP_SHRINK_M * 100:.1f}cm) on attempt {attempt}",
-        )
         if attempt < PUSH_ENGAGE_ATTEMPTS:
             print_stage(stage, "cancel_control; retrying push on a fresh idle stream")
             try:
@@ -4645,6 +4657,19 @@ def main(
                     stage="5/7 vision_pre_push",
                 ):
                     streamed_pre_push_done = True
+                    # A body stream cannot preempt this holding body stream
+                    # (hardware-verified), so release control now: the push
+                    # stream then starts from idle, the proven case. The arms
+                    # hold the reached pose on servo brakes for the ~0.2s gap.
+                    print_stage(
+                        "5/7 vision_pre_push",
+                        "arrived; cancel_control so the push stream starts from idle",
+                    )
+                    try:
+                        robot.cancel_control()
+                    except Exception as cancel_exc:
+                        print_stage("5/7 vision_pre_push", f"cancel_control failed: {cancel_exc}")
+                    time.sleep(0.1)
                 else:
                     print_stage(
                         "5/7 vision_pre_push",
@@ -4707,70 +4732,29 @@ def main(
 
         print_stage("7/7 lift", "building target")
         q = robot.get_state().position
-
-        def eef_heights(q_sample: Any) -> tuple[float, float]:
-            dyn_state.set_q(q_sample)
-            dyn_model.compute_forward_kinematics(dyn_state)
-            T_right = np.asarray(
-                dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_RIGHT_INDEX),
-                dtype=np.float64,
-            )
-            T_left = np.asarray(
-                dyn_model.compute_transformation(dyn_state, BASE_INDEX, EE_LEFT_INDEX),
-                dtype=np.float64,
-            )
-            return float(T_right[2, 3]), float(T_left[2, 3])
-
-        z_before = eef_heights(q)
-        streamed_lift_done = False
+        lift_command = build_impedance_lift_command(dyn_model, dyn_state, q)
+        # The push stream's final target is still holding, and neither a plain
+        # command (G) nor another body stream (live run) can preempt it.
+        # Release it right before sending: the arms keep the squeeze pose on
+        # servo brakes for the ~0.1s gap, exactly like production's
+        # hold-expiry window.
+        print_stage("7/7 lift", "cancel_control to release push hold; sending lift")
         try:
-            lift_stream = robot.create_command_stream(priority=PUSH_STREAM_PRIORITY)
-            lift_stream.send_command(build_impedance_lift_command(dyn_model, dyn_state, q))
-        except Exception as exc:  # pragma: no cover - SDK/hardware dependent
-            print_stage("7/7 lift", f"streamed lift send failed ({exc}); non-stream fallback")
-        else:
-            # E-pattern: this stream's first command preempts the held push
-            # target, so the grip preload transitions into the lift without an
-            # idle gap. No FinishCode on a stream: the trajectory is timed and
-            # FK-verified.
-            print_stage("7/7 lift", "sent as new-stream first command (preempts push hold)")
-            time.sleep(LIFT_MINIMUM_TIME + LIFT_ENGAGE_EXTRA_WAIT_SEC)
-            z_after = eef_heights(robot.get_state().position)
-            raised_m = min(z_after[0] - z_before[0], z_after[1] - z_before[1])
-            if raised_m >= LIFT_HEIGHT * LIFT_ENGAGE_MIN_RAISE_FRACTION:
-                print_stage("7/7 lift", f"engaged: raised {raised_m * 100:.1f}cm (FK)")
-                streamed_lift_done = True
-            else:
-                print_stage(
-                    "7/7 lift",
-                    f"FAILED: streamed lift raised only {raised_m * 100:.1f}cm; "
-                    "cancel_control + non-stream fallback",
-                )
-                try:
-                    robot.cancel_control()
-                except Exception as cancel_exc:
-                    print_stage("7/7 lift", f"cancel_control failed: {cancel_exc}")
-                time.sleep(0.3)
-        if not streamed_lift_done:
-            q = robot.get_state().position
-            if not send_stage(
-                robot,
-                build_impedance_lift_command(dyn_model, dyn_state, q),
-                "7/7 lift",
-                timeout_sec=stage_timeout_sec(
-                    LIFT_MINIMUM_TIME,
-                    LIFT_HOLD_TIME,
-                    min_timeout_sec=min_command_timeout_sec,
-                    margin_sec=command_timeout_margin_sec,
-                ),
-            ):
-                print_stage("7/7 lift", "FAILED; aborting")
-                return done
-            print_stage("7/7 lift", "done")
-            done = True
-            print("=" * 60)
-            print(f"[picking] picking motion COMPLETED. done = {done}")
-            print("=" * 60)
+            robot.cancel_control()
+        except Exception as cancel_exc:  # pragma: no cover - SDK/hardware dependent
+            print_stage("7/7 lift", f"cancel_control failed: {cancel_exc}")
+        if not send_stage(
+            robot,
+            lift_command,
+            "7/7 lift",
+            timeout_sec=stage_timeout_sec(
+                LIFT_MINIMUM_TIME,
+                LIFT_HOLD_TIME,
+                min_timeout_sec=min_command_timeout_sec,
+                margin_sec=command_timeout_margin_sec,
+            ),
+        ):
+            print_stage("7/7 lift", "FAILED; aborting")
             return done
         print_stage("7/7 lift", "done")
 
@@ -4778,14 +4762,6 @@ def main(
         print("=" * 60)
         print(f"[picking] picking motion COMPLETED. done = {done}")
         print("=" * 60)
-        # The lift command lives on this process's stream; exiting would end
-        # the hold and release the box. Match production UX: keep holding
-        # until the operator stops the run.
-        print_stage(
-            "7/7 lift",
-            f"holding box on stream for up to {LIFT_HOLD_TIME:.0f}s; Ctrl+C to end",
-        )
-        time.sleep(LIFT_HOLD_TIME)
         return done
     except UserAbortRequested as abort:
         print_stage("aborted", f"operator abort: {abort}; no further motion")

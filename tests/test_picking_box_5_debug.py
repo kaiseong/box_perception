@@ -130,16 +130,42 @@ class PickingBox5DebugTests(unittest.TestCase):
         self.assertIn("STREAMED_PUSH_FINAL_HOLD_SEC", push_source)
         self.assertIn("robot.cancel_control()", push_source)
 
-    def test_lift_streams_first_command_with_fk_check_and_fallback(self) -> None:
+    def test_lift_releases_push_hold_right_before_sending(self) -> None:
+        # Neither a plain command (G) nor another body stream can preempt the
+        # holding push stream, so lift must build first, cancel_control, and
+        # send immediately -- minimizing the unavoidable idle gap.
         source = Path(debug.__file__).read_text()
         lift_start = source.index('print_stage("7/7 lift", "building target")')
         lift_end = source.index("except UserAbortRequested", lift_start)
         lift_source = source[lift_start:lift_end]
-        self.assertIn("robot.create_command_stream", lift_source)
-        self.assertIn("LIFT_ENGAGE_MIN_RAISE_FRACTION", lift_source)
-        self.assertIn("holding box on stream", lift_source)
-        # Fallback path must still exist and use the FinishCode wait.
-        self.assertIn("send_stage", lift_source)
+        build_at = lift_source.index("build_impedance_lift_command")
+        cancel_at = lift_source.index("robot.cancel_control()")
+        send_at = lift_source.index("send_stage")
+        self.assertLess(build_at, cancel_at)
+        self.assertLess(cancel_at, send_at)
+        self.assertNotIn("robot.create_command_stream", lift_source)
+
+    def test_pre_push_arrival_releases_control_for_idle_push_start(self) -> None:
+        # A body stream cannot preempt a holding body stream, so after the FK
+        # gate passes, control must be released so the push stream starts from
+        # idle (the verified case).
+        source = Path(debug.__file__).read_text()
+        stage_start = source.index('print_stage("5/7 vision_pre_push", "building target")')
+        stage_end = source.index('print_stage("6/7 inward_push", "building ramped target stream")', stage_start)
+        stage_source = source[stage_start:stage_end]
+        arrived_at = stage_source.index("arrived; cancel_control so the push stream starts from idle")
+        self.assertIn("robot.cancel_control()", stage_source[arrived_at:])
+
+    def test_push_stream_send_failure_is_retried_not_crashed(self) -> None:
+        source = Path(debug.__file__).read_text()
+        push_start = source.index("def stream_impedance_push_stage(")
+        push_end = source.index("def build_impedance_lift_command(", push_start)
+        push_source = source[push_start:push_end]
+        attempt_at = push_source.index("for attempt in range(1, PUSH_ENGAGE_ATTEMPTS + 1):")
+        loop_source = push_source[attempt_at:]
+        self.assertIn("sends = run_ramp_once(stream)", loop_source)
+        self.assertIn("except Exception", loop_source)
+        self.assertIn("sends = None", loop_source)
 
     def test_synced_sample_includes_q_for_handoff_conversion(self) -> None:
         # synced_servo_sample_to_measurement requires "q"; without it the
