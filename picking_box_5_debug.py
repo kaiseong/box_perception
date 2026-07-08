@@ -4547,104 +4547,56 @@ def main(
         print_stage("5/7 vision_pre_push", "building target")
         q = robot.get_state().position
         handoff_stream = measurement.pop("_handoff_stream", None) if isinstance(measurement, dict) else None
-        streamed_pre_push_done = False
         if handoff_stream is not None:
-            # Smooth handoff: pre-push rides the live mobile-servo stream, so
-            # the controller never drops between base alignment and arm motion.
-            streamed_command, streamed_targets = build_streamed_vision_pre_push_command(
-                dyn_model,
-                dyn_state,
-                robot_model,
-                q,
-                box_center_base_m,
-                approach_time=approach_time,
-                linear_velocity_limit=vision_pre_push_linear_velocity_limit,
-                angular_velocity_limit=vision_pre_push_angular_velocity_limit,
-                acceleration_limit_scaling=vision_pre_push_acceleration_limit_scaling,
-                max_reference_xy_shift_m=max_reference_xy_shift_m,
-                midpoint_offset_xy_m=midpoint_offset_xy_m,
-                drop_delta_axis_base_xy=drop_delta_axis_base_xy,
-            )
-            try:
-                handoff_stream.send_command(streamed_command)
-            except Exception as exc:  # pragma: no cover - SDK/hardware dependent
-                print_stage(
-                    "5/7 vision_pre_push",
-                    f"streamed send failed ({exc}); cancel_control + non-stream fallback",
-                )
-                handoff_stream = None
-                try:
-                    robot.cancel_control()
-                except Exception as cancel_exc:
-                    print_stage("5/7 vision_pre_push", f"cancel_control failed: {cancel_exc}")
-            else:
-                print_stage("5/7 vision_pre_push", "streaming on live mobile stream; FK gate")
-                if wait_streamed_eef_arrival(
-                    robot,
-                    dyn_model,
-                    dyn_state,
-                    right_target=streamed_targets["right_target"],
-                    left_target=streamed_targets["left_target"],
-                    reference_index=VISION_PRE_PUSH_REFERENCE_INDEX,
-                    timeout_sec=approach_time + STREAMED_PRE_PUSH_TIMEOUT_MARGIN_SEC,
-                    stage="5/7 vision_pre_push",
-                ):
-                    streamed_pre_push_done = True
-                else:
-                    # Streamed body commands can be accepted without being
-                    # executed (observed on hardware). The box is aligned and
-                    # the arms are safe, so finish the pick on the proven
-                    # non-stream path instead of aborting.
-                    print_stage(
-                        "5/7 vision_pre_push",
-                        "streamed pre-push failed; cancel_control + non-stream fallback",
-                    )
-                    handoff_stream = None
-                    try:
-                        robot.cancel_control()
-                    except Exception as cancel_exc:
-                        print_stage("5/7 vision_pre_push", f"cancel_control failed: {cancel_exc}")
-        if not streamed_pre_push_done:
-            handoff_stream = None
-            q = robot.get_state().position
-            command = build_vision_pre_push_command(
-                dyn_model,
-                dyn_state,
-                robot_model,
-                q,
-                box_center_base_m,
-                approach_time=approach_time,
-                hold_time=hold_time,
-                linear_velocity_limit=vision_pre_push_linear_velocity_limit,
-                angular_velocity_limit=vision_pre_push_angular_velocity_limit,
-                acceleration_limit_scaling=vision_pre_push_acceleration_limit_scaling,
-                max_reference_xy_shift_m=max_reference_xy_shift_m,
-                midpoint_offset_xy_m=midpoint_offset_xy_m,
-                drop_delta_axis_base_xy=drop_delta_axis_base_xy,
-            )
-            if not send_stage(
-                robot,
-                command,
+            # Probe-verified (2026-07-08): a mobility stream ACCEPTS composite
+            # body commands but never EXECUTES them, and expires when their
+            # hold lapses -- an RBY1 stream is bound to its first command's
+            # controller set. So the minimal-gap handoff is: keep the bridge
+            # holding the base through the residual checks above, then release
+            # control here and immediately start the proven non-stream
+            # pre-push. The visible idle gap is only cancel->controller-start.
+            print_stage(
                 "5/7 vision_pre_push",
-                timeout_sec=stage_timeout_sec(
-                    approach_time,
-                    hold_time,
-                    min_timeout_sec=min_command_timeout_sec,
-                    margin_sec=command_timeout_margin_sec,
-                ),
-            ):
-                print_stage("5/7 vision_pre_push", "FAILED; aborting")
-                return done
+                "releasing mobile stream (cancel_control) for minimal-gap pre-push",
+            )
+            handoff_stream = None
+            try:
+                robot.cancel_control()
+            except Exception as cancel_exc:  # pragma: no cover - SDK/hardware dependent
+                print_stage("5/7 vision_pre_push", f"cancel_control failed: {cancel_exc}")
+        command = build_vision_pre_push_command(
+            dyn_model,
+            dyn_state,
+            robot_model,
+            q,
+            box_center_base_m,
+            approach_time=approach_time,
+            hold_time=hold_time,
+            linear_velocity_limit=vision_pre_push_linear_velocity_limit,
+            angular_velocity_limit=vision_pre_push_angular_velocity_limit,
+            acceleration_limit_scaling=vision_pre_push_acceleration_limit_scaling,
+            max_reference_xy_shift_m=max_reference_xy_shift_m,
+            midpoint_offset_xy_m=midpoint_offset_xy_m,
+            drop_delta_axis_base_xy=drop_delta_axis_base_xy,
+        )
+        if not send_stage(
+            robot,
+            command,
+            "5/7 vision_pre_push",
+            timeout_sec=stage_timeout_sec(
+                approach_time,
+                hold_time,
+                min_timeout_sec=min_command_timeout_sec,
+                margin_sec=command_timeout_margin_sec,
+            ),
+        ):
+            print_stage("5/7 vision_pre_push", "FAILED; aborting")
+            return done
         print_stage("5/7 vision_pre_push", "reached")
 
         if not continue_pick:
             done = True
             print_stage("5/7 vision_pre_push", "pre-push-only stop; done=True")
-            if handoff_stream is not None:
-                try:
-                    robot.cancel_control()
-                except Exception as cancel_exc:
-                    print_stage("5/7 vision_pre_push", f"cancel_control failed: {cancel_exc}")
             return done
 
         print_stage("6/7 inward_push", "building ramped target stream")
@@ -4656,7 +4608,6 @@ def main(
             q,
             ramp_time_sec=push_ramp_time_sec,
             hold_time_sec=PUSH_HOLD_TIME,
-            stream=handoff_stream,
             stage="6/7 inward_push",
         ):
             print_stage("6/7 inward_push", "FAILED; aborting")
@@ -4664,35 +4615,6 @@ def main(
 
         print_stage("7/7 lift", "building target")
         q = robot.get_state().position
-        if handoff_stream is not None:
-            lift_stream_hold = LIFT_MINIMUM_TIME + LIFT_HOLD_TIME
-            try:
-                handoff_stream.send_command(
-                    build_impedance_lift_command(
-                        dyn_model,
-                        dyn_state,
-                        q,
-                        zero_mobility_hold_sec=lift_stream_hold,
-                    )
-                )
-            except Exception as exc:  # pragma: no cover - SDK/hardware dependent
-                print_stage("7/7 lift", f"FAILED: streamed lift send ({exc}); aborting")
-                return done
-            # A streamed command reports no FinishCode; the lift trajectory is
-            # timed, so wait it out and keep the process (and thus the stream
-            # hold that maintains the grip) alive afterwards.
-            time.sleep(LIFT_MINIMUM_TIME + 1.0)
-            print_stage("7/7 lift", "done")
-            done = True
-            print("=" * 60)
-            print(f"[picking] picking motion COMPLETED. done = {done}")
-            print("=" * 60)
-            print_stage(
-                "7/7 lift",
-                f"holding box on stream for up to {LIFT_HOLD_TIME:.0f}s; Ctrl+C to end",
-            )
-            time.sleep(LIFT_HOLD_TIME)
-            return done
         if not send_stage(
             robot,
             build_impedance_lift_command(dyn_model, dyn_state, q),

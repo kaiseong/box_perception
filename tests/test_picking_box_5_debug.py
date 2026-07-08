@@ -99,40 +99,22 @@ class PickingBox5DebugTests(unittest.TestCase):
         self.assertIn('settled_measurement["_handoff_stream"] = stream', servo_source)
         self.assertIn("skipping stationary confirm", servo_source)
 
-    def test_streamed_pre_push_rides_handoff_stream_with_fk_gate(self) -> None:
+    def test_pre_push_releases_handoff_stream_for_minimal_gap(self) -> None:
+        # Probe-verified: a mobility stream never executes composite body
+        # commands, so pre-push must release control and immediately use the
+        # proven non-stream path -- and never abort just because a stream
+        # handoff was present.
         source = Path(debug.__file__).read_text()
         stage_start = source.index('print_stage("5/7 vision_pre_push", "building target")')
         stage_end = source.index('print_stage("6/7 inward_push", "building ramped target stream")', stage_start)
         stage_source = source[stage_start:stage_end]
+
         handoff_start = stage_source.index("if handoff_stream is not None:")
-        handoff_end = stage_source.index("if not streamed_pre_push_done:", handoff_start)
+        handoff_end = stage_source.index("command = build_vision_pre_push_command(", handoff_start)
         handoff_source = stage_source[handoff_start:handoff_end]
-
-        self.assertIn("build_streamed_vision_pre_push_command", handoff_source)
-        self.assertIn("handoff_stream.send_command(streamed_command)", handoff_source)
-        self.assertIn("wait_streamed_eef_arrival", handoff_source)
-        self.assertNotIn("send_stage", handoff_source)
-        # The composite must pair the arm targets with a held zero mobility.
-        builder_start = source.index("def build_streamed_vision_pre_push_command(")
-        builder_end = source.index("def build_pose_command(", builder_start)
-        builder_source = source[builder_start:builder_end]
-        self.assertIn(".set_body_command(body)", builder_source)
-        self.assertIn(".set_mobility_command(mobility)", builder_source)
-
-    def test_push_and_lift_reuse_handoff_stream_with_zero_mobility(self) -> None:
-        source = Path(debug.__file__).read_text()
-        self.assertIn("stream=handoff_stream,", source)
-
-        push_start = source.index("def stream_impedance_push_stage(")
-        push_end = source.index("def build_impedance_lift_command(", push_start)
-        push_source = source[push_start:push_end]
-        self.assertIn("zero_mobility_hold_sec=command_hold_time if shared_stream else None", push_source)
-        self.assertIn("STREAMED_PUSH_FINAL_HOLD_SEC", push_source)
-
-        lift_call_start = source.index('print_stage("7/7 lift", "building target")')
-        lift_call_end = source.index("except UserAbortRequested", lift_call_start)
-        lift_source = source[lift_call_start:lift_call_end]
-        self.assertIn("zero_mobility_hold_sec=lift_stream_hold", lift_source)
+        self.assertIn("robot.cancel_control()", handoff_source)
+        self.assertNotIn("return done", handoff_source)
+        self.assertIn("send_stage", stage_source)
 
     def test_synced_sample_includes_q_for_handoff_conversion(self) -> None:
         # synced_servo_sample_to_measurement requires "q"; without it the
