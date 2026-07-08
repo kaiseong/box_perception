@@ -163,10 +163,10 @@ push 스트림은 이미 30Hz로 `build_impedance_push_command(inward=...)`를
       먼저 위 항목들.
 
 ### P3 — production 이식/정리
-- [ ] 실기 검증 완료된 것부터 `picking_box_5.py`로 이식 (이미 반영: filter
-      래치업 수정, servo hold 1.0s). 이식 후보: E-패턴 pre-push(+FK 게이트),
-      push FK 물림 검증, settled-frame 사용(=stationary confirm 생략은 debug
-      전용으로 남길지 결정 — production은 confirm 유지가 보수적).
+- [x] 실기 검증 완료된 체인을 `picking_box_5.py`로 이식: filter 래치업 수정,
+      servo hold 1.0s, settled-frame handoff(정상 settle 시 stationary confirm
+      생략), E-패턴 pre-push(+FK 게이트/폴백), push FK 물림 검증+재시도,
+      lift FK 상승 게이트(100s hold FinishCode 대기 제거).
 - [ ] debug에 남은 미사용 코드 정리: `build_streamed_vision_pre_push_command`,
       `MobileBaseServoCommandStreamer.stop_thread`의 zero_mobility 관련 파라미터
       등 (P1.5 결과에 따라 부활 가능성 있어 보류 중).

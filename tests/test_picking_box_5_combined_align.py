@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import io
 import sys
 import types
@@ -281,6 +282,49 @@ class PickingBox5CombinedAlignTests(unittest.TestCase):
         velocity_xy, angular_velocity, _duration = stream_calls[0]
         self.assertGreater(float(np.linalg.norm(velocity_xy)), 0.0)
         self.assertGreater(angular_velocity, 0.0)
+
+    def test_visual_servo_settled_path_hands_off_stream_to_pre_push(self) -> None:
+        source = inspect.getsource(pb5.run_mobile_base_visual_servo_alignment)
+
+        self.assertIn("synced_servo_sample_to_measurement", source)
+        self.assertIn("commander.stop_thread()", source)
+        self.assertIn("STREAM_HANDOFF_BRIDGE_HOLD_SEC", source)
+        self.assertIn('settled_measurement["_handoff_stream"] = stream', source)
+        self.assertIn("using settled synced frame; skipping stationary confirm", source)
+        self.assertIn("stationary confirm after servo", source)
+
+    def test_pre_push_uses_stream_handoff_fk_gate_with_non_stream_fallback(self) -> None:
+        source = inspect.getsource(pb5.main)
+
+        self.assertIn('handoff_stream = measurement.pop("_handoff_stream"', source)
+        self.assertIn("pre_push_stream = robot.create_command_stream", source)
+        self.assertIn("wait_streamed_eef_arrival", source)
+        self.assertIn("sent as new-stream first command", source)
+        self.assertIn("cancel_control so the push stream starts from idle", source)
+        self.assertIn("build_vision_pre_push_command", source)
+        self.assertIn("non-stream fallback", source)
+
+    def test_push_stream_fk_verifies_gap_shrink_and_retries_from_idle(self) -> None:
+        source = inspect.getsource(pb5.stream_impedance_push_stage)
+
+        self.assertIn("hands_gap_m", source)
+        self.assertIn("PUSH_ENGAGE_MIN_GAP_SHRINK_M", source)
+        self.assertIn("PUSH_ENGAGE_ATTEMPTS", source)
+        self.assertIn("STREAMED_PUSH_FINAL_HOLD_SEC", source)
+        self.assertIn("robot.cancel_control()", source)
+        self.assertIn("retrying push on a fresh idle stream", source)
+
+    def test_lift_uses_fk_engage_gate_instead_of_waiting_for_hold_finishcode(self) -> None:
+        main_source = inspect.getsource(pb5.main)
+        gate_source = inspect.getsource(pb5.send_lift_stage_with_fk_gate)
+
+        self.assertIn("send_lift_stage_with_fk_gate", main_source)
+        self.assertIn("cancel_control to release push hold; sending lift", main_source)
+        self.assertNotIn("LIFT_HOLD_TIME,", main_source)
+        self.assertIn("eef_base_heights", gate_source)
+        self.assertIn("LIFT_ENGAGE_MIN_RAISE_FRACTION", gate_source)
+        self.assertIn("not waiting for", gate_source)
+        self.assertIn("cancel_timed_out_command", gate_source)
 
 
 if __name__ == "__main__":
