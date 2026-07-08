@@ -6,7 +6,7 @@ it does not run vision, mobile-base alignment, initial picking, or gripper
 homing. It starts from the final lift target exported by picking_box_5.py and
 replays only the destination-table sequence:
 
-  1. lower from the exported lift target to base z=0.90 m
+  1. lower from the exported lift target by 0.08 m in base z
   2. release by moving both hands outward by the exact push distance
   3. wait on the table
   4. regrasp by returning both hands to the lowered push target
@@ -42,7 +42,7 @@ LIFT_TARGET_RECORD_VERSION = "box-perception-lift-target-v1"
 DEFAULT_LIFT_TARGET_JSON = ".omx/runtime/latest_pick_lift_target.json"
 
 PUSH_DISTANCE = 0.10
-PLACE_LOWER_TARGET_Z_M = 0.90
+PLACE_LOWER_DELTA_M = 0.08
 PLACE_WAIT_AFTER_RELEASE_SEC = 1.0
 
 REFERENCE_LINK = "base"
@@ -120,11 +120,11 @@ def load_lift_target_record(path: str | Path) -> TargetPair:
     )
 
 
-def set_z(pair: TargetPair, z_m: float) -> TargetPair:
+def offset_z(pair: TargetPair, dz_m: float) -> TargetPair:
     right = pair.right.copy()
     left = pair.left.copy()
-    right[2, 3] = float(z_m)
-    left[2, 3] = float(z_m)
+    right[2, 3] += float(dz_m)
+    left[2, 3] += float(dz_m)
     return TargetPair(right=right, left=left)
 
 
@@ -153,11 +153,11 @@ def offset_outward_y(pair: TargetPair, distance_m: float) -> TargetPair:
 def build_place_regrasp_target_chain(
     lifted: TargetPair,
     *,
-    lower_z_m: float = PLACE_LOWER_TARGET_Z_M,
+    lower_delta_m: float = PLACE_LOWER_DELTA_M,
     push_distance_m: float = PUSH_DISTANCE,
 ) -> PlaceRegraspTargets:
     """Build all place/regrasp targets from the exported pick-lift target."""
-    lowered = set_z(lifted, float(lower_z_m))
+    lowered = offset_z(lifted, -float(lower_delta_m))
     released = offset_outward_y(lowered, float(push_distance_m))
     return PlaceRegraspTargets(
         lifted=lifted,
@@ -379,7 +379,7 @@ def perform_place_regrasp_sequence(
     dyn_state: Any,
     lifted: TargetPair,
     *,
-    place_lower_z_m: float = PLACE_LOWER_TARGET_Z_M,
+    place_lower_delta_m: float = PLACE_LOWER_DELTA_M,
     place_wait_sec: float = PLACE_WAIT_AFTER_RELEASE_SEC,
     lower_ramp_time_sec: float = LOWER_RAMP_TIME_SEC,
     release_ramp_time_sec: float = RELEASE_RAMP_TIME_SEC,
@@ -387,7 +387,10 @@ def perform_place_regrasp_sequence(
     lift_ramp_time_sec: float = LIFT_RAMP_TIME_SEC,
     eef_wait_timeout_sec: float = EEF_WAIT_TIMEOUT_SEC,
 ) -> bool:
-    targets = build_place_regrasp_target_chain(lifted, lower_z_m=float(place_lower_z_m))
+    targets = build_place_regrasp_target_chain(
+        lifted,
+        lower_delta_m=float(place_lower_delta_m),
+    )
 
     stages = [
         ("1/5 place_lower", targets.lifted, targets.lowered, lower_ramp_time_sec),
@@ -457,10 +460,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Seconds to wait after opening/releasing before regrasp.",
     )
     parser.add_argument(
-        "--place-lower-z-m",
+        "--place-lower-delta-m",
         type=float,
-        default=PLACE_LOWER_TARGET_Z_M,
-        help="Absolute base-frame z target for the lower/place pose.",
+        default=PLACE_LOWER_DELTA_M,
+        help="Base-frame z distance to lower from the exported lift target.",
     )
     parser.add_argument("--lower-ramp-time-sec", type=float, default=LOWER_RAMP_TIME_SEC)
     parser.add_argument("--release-ramp-time-sec", type=float, default=RELEASE_RAMP_TIME_SEC)
@@ -481,7 +484,7 @@ def main(
     model: str,
     power: str,
     lift_target_json: str | Path,
-    place_lower_z_m: float,
+    place_lower_delta_m: float,
     place_wait_sec: float,
     lower_ramp_time_sec: float,
     release_ramp_time_sec: float,
@@ -526,7 +529,7 @@ def main(
         dyn_model,
         dyn_state,
         lifted,
-        place_lower_z_m=float(place_lower_z_m),
+        place_lower_delta_m=float(place_lower_delta_m),
         place_wait_sec=float(place_wait_sec),
         lower_ramp_time_sec=float(lower_ramp_time_sec),
         release_ramp_time_sec=float(release_ramp_time_sec),
@@ -543,8 +546,8 @@ def run_cli(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.place_wait_sec < 0.0:
         raise SystemExit("--place-wait-sec must be non-negative")
-    if args.place_lower_z_m <= 0.0:
-        raise SystemExit("--place-lower-z-m must be positive")
+    if args.place_lower_delta_m <= 0.0:
+        raise SystemExit("--place-lower-delta-m must be positive")
     for attr in (
         "lower_ramp_time_sec",
         "release_ramp_time_sec",
@@ -561,7 +564,7 @@ def run_cli(argv: list[str] | None = None) -> int:
         model=args.model,
         power=args.power,
         lift_target_json=args.lift_target_json,
-        place_lower_z_m=float(args.place_lower_z_m),
+        place_lower_delta_m=float(args.place_lower_delta_m),
         place_wait_sec=float(args.place_wait_sec),
         lower_ramp_time_sec=float(args.lower_ramp_time_sec),
         release_ramp_time_sec=float(args.release_ramp_time_sec),

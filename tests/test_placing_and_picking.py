@@ -38,7 +38,7 @@ class PlacingAndPickingTests(unittest.TestCase):
 
         self.assertEqual(args.lift_target_json, pap.DEFAULT_LIFT_TARGET_JSON)
         self.assertAlmostEqual(args.place_wait_sec, 1.0)
-        self.assertAlmostEqual(args.place_lower_z_m, 0.9)
+        self.assertAlmostEqual(args.place_lower_delta_m, 0.08)
         self.assertFalse(hasattr(args, "initial_pick"))
         self.assertFalse(hasattr(args, "gripper_open"))
         self.assertFalse(hasattr(args, "visualize"))
@@ -52,10 +52,10 @@ class PlacingAndPickingTests(unittest.TestCase):
 
         targets = pap.build_place_regrasp_target_chain(lifted)
 
-        np.testing.assert_allclose(targets.lowered.right[:3, 3], [0.45, -0.24, 0.90])
-        np.testing.assert_allclose(targets.lowered.left[:3, 3], [0.45, +0.24, 0.90])
-        np.testing.assert_allclose(targets.released.right[:3, 3], [0.45, -0.34, 0.90])
-        np.testing.assert_allclose(targets.released.left[:3, 3], [0.45, +0.34, 0.90])
+        np.testing.assert_allclose(targets.lowered.right[:3, 3], [0.45, -0.24, 1.04])
+        np.testing.assert_allclose(targets.lowered.left[:3, 3], [0.45, +0.24, 1.04])
+        np.testing.assert_allclose(targets.released.right[:3, 3], [0.45, -0.34, 1.04])
+        np.testing.assert_allclose(targets.released.left[:3, 3], [0.45, +0.34, 1.04])
         np.testing.assert_allclose(targets.regrasped.right, targets.lowered.right)
         np.testing.assert_allclose(targets.regrasped.left, targets.lowered.left)
         np.testing.assert_allclose(targets.lifted.right, lifted.right)
@@ -69,8 +69,8 @@ class PlacingAndPickingTests(unittest.TestCase):
 
         targets = pap.build_place_regrasp_target_chain(lifted)
 
-        np.testing.assert_allclose(targets.released.right[:3, 3], [0.45, +0.34, 0.90])
-        np.testing.assert_allclose(targets.released.left[:3, 3], [0.45, -0.34, 0.90])
+        np.testing.assert_allclose(targets.released.right[:3, 3], [0.45, +0.34, 1.04])
+        np.testing.assert_allclose(targets.released.left[:3, 3], [0.45, -0.34, 1.04])
 
     def test_picking_box_5_writes_placing_target_record(self) -> None:
         right = transform(0.4, -0.2, 1.1)
@@ -148,17 +148,17 @@ class PlacingAndPickingTests(unittest.TestCase):
             [
                 ("cancel",),
                 ("sleep", 0.3),
-                ("stream", "1/5 place_lower", 1.1, 3.0, (0.45, -0.24, 0.9)),
-                ("wait", "1/5 place_lower", (0.45, -0.24, 0.9)),
+                ("stream", "1/5 place_lower", 1.1, 3.0, (0.45, -0.24, 1.04)),
+                ("wait", "1/5 place_lower", (0.45, -0.24, 1.04)),
                 ("cancel",),
                 ("sleep", 0.3),
-                ("stream", "2/5 release_open", 0.5, 3.0, (0.45, -0.34, 0.9)),
-                ("wait", "2/5 release_open", (0.45, -0.34, 0.9)),
+                ("stream", "2/5 release_open", 0.5, 3.0, (0.45, -0.34, 1.04)),
+                ("wait", "2/5 release_open", (0.45, -0.34, 1.04)),
                 ("sleep", 1.0),
                 ("cancel",),
                 ("sleep", 0.3),
-                ("stream", "4/5 regrasp_push", 0.6, 3.0, (0.45, -0.24, 0.9)),
-                ("wait", "4/5 regrasp_push", (0.45, -0.24, 0.9)),
+                ("stream", "4/5 regrasp_push", 0.6, 3.0, (0.45, -0.24, 1.04)),
+                ("wait", "4/5 regrasp_push", (0.45, -0.24, 1.04)),
                 ("cancel",),
                 ("sleep", 0.3),
                 ("stream", "5/5 regrasp_lift", 1.2, 100.0, (0.45, -0.24, 1.12)),
@@ -170,7 +170,7 @@ class PlacingAndPickingTests(unittest.TestCase):
         calls: list[tuple[str, object]] = []
         lifted = pap.TargetPair(
             right=transform(0.45, -0.24, 1.12),
-            left=transform(0.45, +0.24, 0.90),
+            left=transform(0.45, +0.24, 1.12),
         )
 
         class FakeStream:
@@ -275,7 +275,7 @@ class PlacingAndPickingTests(unittest.TestCase):
                         model="m",
                         power=".*",
                         lift_target_json=target_path,
-                        place_lower_z_m=0.9,
+                        place_lower_delta_m=0.08,
                         place_wait_sec=1.0,
                         lower_ramp_time_sec=1.0,
                         release_ramp_time_sec=0.5,
